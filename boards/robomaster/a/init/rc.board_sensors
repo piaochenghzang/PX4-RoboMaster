@@ -1,0 +1,17 @@
+#!/bin/sh
+#
+# RoboMaster A onboard sensors
+#
+
+# Onboard MPU6500 on internal SPI5.
+# Keil ACCEL_ALIGN=CW270_DEG_FLIP. The MPU6500 driver already converts
+# native +Y-left/+Z-up into PX4 axes, leaving ROTATION_YAW_270 here.
+mpu6500 -s -M -R 6 start
+
+# Onboard BMP280 on internal I2C2 (PF1 SCL / PF0 SDA).
+bmp280 -I -b 2 start
+
+# ADC battery voltage/current sensing
+board_adc start
+
+heater start

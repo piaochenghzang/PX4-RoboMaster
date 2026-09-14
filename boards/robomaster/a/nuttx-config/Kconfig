@@ -1,0 +1,6 @@
+#
+# For a description of the syntax of this configuration file,
+# see misc/tools/kconfig-language.txt.
+#
+# RoboMaster A currently has no dedicated timing-probe GPIOs. Do not expose
+# motor or LED pins as probes: enabling them would conflict with flight I/O.

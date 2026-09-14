@@ -1,6 +1,6 @@
 ############################################################################
 #
-#   Copyright (c) 2020-2021 PX4 Development Team. All rights reserved.
+#   Copyright (c) 2015 PX4 Development Team. All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions
@@ -31,20 +31,21 @@
 #
 ############################################################################
 
-px4_add_module(
-	MODULE drivers__imu__invensense__mpu6500
-	MAIN mpu6500
-	COMPILE_FLAGS
-	SRCS
-		MPU6500.cpp
-		MPU6500.hpp
-		MPU6500_IST8310.cpp
-		MPU6500_IST8310.hpp
-		mpu6500_main.cpp
-		IST8310_registers.hpp
-	DEPENDS
-		drivers_accelerometer
-		drivers_gyroscope
-		drivers_magnetometer
-		px4_work_queue
-	)
+add_library(drivers_board
+	can.c
+	i2c.cpp
+	init.c
+	led.c
+	spi.cpp
+	timer_config.cpp
+	usb.c
+)
+
+target_link_libraries(drivers_board
+	PRIVATE
+		arch_spi
+		drivers__led # drv_led_start
+		nuttx_arch # sdio
+		nuttx_drivers # sdio
+		px4_layer
+)

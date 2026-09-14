@@ -1,6 +1,6 @@
 /****************************************************************************
  *
- *   Copyright (c) 2020-2021 PX4 Development Team. All rights reserved.
+ *   Copyright (c) 2013 PX4 Development Team. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -31,62 +31,76 @@
  *
  ****************************************************************************/
 
-#include "MPU6500.hpp"
+/**
+ * @file led.c
+ *
+ * RoboMaster A LED backend.
+ */
 
-#include <px4_platform_common/getopt.h>
-#include <px4_platform_common/module.h>
+#include <px4_platform_common/px4_config.h>
 
-void MPU6500::print_usage()
+#include <stdbool.h>
+
+#include "stm32.h"
+#include "board_config.h"
+
+#include <arch/board/board.h>
+
+/*
+ * Ideally we'd be able to get these from arm_internal.h,
+ * but since we want to be able to disable the NuttX use
+ * of leds for system indication at will and there is no
+ * separate switch, we need to build independent of the
+ * CONFIG_ARCH_LEDS configuration switch.
+ */
+__BEGIN_DECLS
+extern void led_init(void);
+extern void led_on(int led);
+extern void led_off(int led);
+extern void led_toggle(int led);
+__END_DECLS
+
+
+
+static uint32_t g_ledmap[] = {
+	GPIO_LED_BLUE,    // Indexed by LED_BLUE
+	GPIO_LED_RED,     // Indexed by LED_RED, LED_AMBER
+	GPIO_LED_SAFETY,  // Indexed by LED_SAFETY
+	GPIO_LED_GREEN,   // Indexed by LED_GREEN
+};
+
+__EXPORT void led_init(void)
 {
-	PRINT_MODULE_USAGE_NAME("mpu9520", "driver");
-	PRINT_MODULE_USAGE_SUBCATEGORY("imu");
-	PRINT_MODULE_USAGE_COMMAND("start");
-	PRINT_MODULE_USAGE_PARAMS_I2C_SPI_DRIVER(false, true);
-	PRINT_MODULE_USAGE_PARAM_FLAG('M', "Enable IST8310 magnetometer", true);
-	PRINT_MODULE_USAGE_PARAM_INT('R', 0, 0, 35, "Rotation", true);
-	PRINT_MODULE_USAGE_DEFAULT_COMMANDS();
+	/* Configure LED GPIOs for output */
+	for (size_t l = 0; l < (sizeof(g_ledmap) / sizeof(g_ledmap[0])); l++) {
+		stm32_configgpio(g_ledmap[l]);
+	}
 }
 
-extern "C" int mpu6500_main(int argc, char *argv[])
+static void phy_set_led(int led, bool state)
 {
-	int ch;
-	using ThisDriver = MPU6500;
-	BusCLIArguments cli{false, true};
-	cli.default_spi_frequency = SPI_SPEED;
+	/* Pull Down to switch on */
+	stm32_gpiowrite(g_ledmap[led], !state);
+}
 
-	while ((ch = cli.getOpt(argc, argv, "MR:")) != EOF) {
-		switch (ch) {
-		case 'M':
-			cli.custom1 = 1;
-			break;
+static bool phy_get_led(int led)
+{
 
-		case 'R':
-			cli.rotation = (enum Rotation)atoi(cli.optArg());
-			break;
-		}
-	}
+	return !stm32_gpioread(g_ledmap[led]);
+}
 
-	const char *verb = cli.optArg();
+__EXPORT void led_on(int led)
+{
+	phy_set_led(led, true);
+}
 
-	if (!verb) {
-		ThisDriver::print_usage();
-		return -1;
-	}
+__EXPORT void led_off(int led)
+{
+	phy_set_led(led, false);
+}
 
-	BusInstanceIterator iterator(MODULE_NAME, cli, DRV_IMU_DEVTYPE_MPU6500);
+__EXPORT void led_toggle(int led)
+{
 
-	if (!strcmp(verb, "start")) {
-		return ThisDriver::module_start(cli, iterator);
-	}
-
-	if (!strcmp(verb, "stop")) {
-		return ThisDriver::module_stop(iterator);
-	}
-
-	if (!strcmp(verb, "status")) {
-		return ThisDriver::module_status(iterator);
-	}
-
-	ThisDriver::print_usage();
-	return -1;
+	phy_set_led(led, !phy_get_led(led));
 }

@@ -71,12 +71,36 @@ enum class Register : uint8_t {
 	ACCEL_CONFIG2      = 0x1D,
 
 	FIFO_EN            = 0x23,
+	I2C_MST_CTRL       = 0x24,
+	I2C_SLV0_ADDR      = 0x25,
+	I2C_SLV0_REG       = 0x26,
+	I2C_SLV0_CTRL      = 0x27,
+	I2C_SLV1_ADDR      = 0x28,
+	I2C_SLV1_REG       = 0x29,
+	I2C_SLV1_CTRL      = 0x2A,
+	I2C_SLV2_ADDR      = 0x2B,
+	I2C_SLV2_REG       = 0x2C,
+	I2C_SLV2_CTRL      = 0x2D,
+	I2C_SLV3_ADDR      = 0x2E,
+	I2C_SLV3_REG       = 0x2F,
+	I2C_SLV3_CTRL      = 0x30,
+	I2C_SLV4_ADDR      = 0x31,
+	I2C_SLV4_REG       = 0x32,
+	I2C_SLV4_DO        = 0x33,
+	I2C_SLV4_CTRL      = 0x34,
+	I2C_MST_STATUS     = 0x36,
 
 	INT_PIN_CFG        = 0x37,
 	INT_ENABLE         = 0x38,
 
 	TEMP_OUT_H         = 0x41,
 	TEMP_OUT_L         = 0x42,
+	EXT_SENS_DATA_00   = 0x49,
+	I2C_SLV0_DO        = 0x63,
+	I2C_SLV1_DO        = 0x64,
+	I2C_SLV2_DO        = 0x65,
+	I2C_SLV3_DO        = 0x66,
+	I2C_MST_DELAY_CTRL = 0x67,
 
 	SIGNAL_PATH_RESET  = 0x68,
 
@@ -102,6 +126,8 @@ enum class Register : uint8_t {
 enum CONFIG_BIT : uint8_t {
 	FIFO_MODE = Bit6, // when the FIFO is full, additional writes will not be written to FIFO
 
+	DLPF_CFG_BW_41HZ = Bit1 | Bit0, // 1 kHz internal sample rate
+	DLPF_CFG_MASK = Bit2 | Bit1 | Bit0,
 	DLPF_CFG_BYPASS_DLPF_8KHZ = 7, // Rate 8 kHz [2:0]
 };
 
@@ -129,6 +155,8 @@ enum ACCEL_CONFIG_BIT : uint8_t {
 // ACCEL_CONFIG2
 enum ACCEL_CONFIG2_BIT : uint8_t {
 	ACCEL_FCHOICE_B_BYPASS_DLPF = Bit3,
+	A_DLPFCFG_BW_41HZ = Bit1 | Bit0,
+	A_DLPFCFG_MASK = Bit2 | Bit1 | Bit0,
 };
 
 // FIFO_EN
@@ -140,9 +168,48 @@ enum FIFO_EN_BIT : uint8_t {
 	ACCEL     = Bit3,
 };
 
+// I2C_MST_CTRL
+enum I2C_MST_CTRL_BIT : uint8_t {
+	I2C_MST_P_NSR = Bit4,
+	I2C_MST_CLK_400_kHz = 13,
+};
+
+// I2C_SLV0_ADDR
+enum I2C_SLV0_ADDR_BIT : uint8_t {
+	I2C_SLV0_RNW = Bit7,
+};
+
+// I2C_SLV0_CTRL
+enum I2C_SLV0_CTRL_BIT : uint8_t {
+	I2C_SLV0_EN = Bit7,
+	I2C_SLV0_BYTE_SW = Bit6, // Swap bytes when reading both the low and high byte of a word
+	I2C_SLV0_REG_DIS = Bit5, // transaction does not write a register value (only read data)
+	I2C_SLV0_LENG = Bit3 | Bit2 | Bit1 | Bit0,
+};
+
+// I2C_SLV4_CTRL
+enum I2C_SLV4_CTRL_BIT : uint8_t {
+	I2C_SLV4_EN = Bit7,
+	I2C_MST_DLY = Bit4 | Bit3 | Bit2 | Bit1 | Bit0,
+	I2C_MST_DLY_4_SAMPLES = Bit1 | Bit0,
+	I2C_MST_DLY_32_SAMPLES = I2C_MST_DLY,
+};
+
+enum I2C_MST_STATUS_BIT : uint8_t {
+	I2C_SLV4_DONE = Bit6,
+	I2C_SLV4_NACK = Bit4,
+};
+
+
 // INT_PIN_CFG
 enum INT_PIN_CFG_BIT : uint8_t {
 	ACTL = Bit7,
+};
+
+// I2C_MST_DELAY_CTRL
+enum I2C_MST_DELAY_CTRL_BIT : uint8_t {
+	I2C_SLV0_DLY_EN = Bit0,
+	I2C_SLVX_DLY_EN = Bit4 | Bit3 | Bit2 | Bit1 | Bit0, // limit all slave access (1+I2C_MST_DLY),
 };
 
 // INT_ENABLE

@@ -1,0 +1,40 @@
+#!/bin/sh
+#
+# board specific defaults
+#------------------------------------------------------------------------------
+
+param set-default BAT1_V_DIV 13.653333333
+param set-default BAT1_A_PER_V 36.367515152
+
+# RoboMaster A does not provide PX4 system_power hardware status.
+param set-default CBRK_SUPPLY_CHK 894281
+
+# The dedicated DBUS connector has fixed hardware inversion and is used with
+# a standard SBUS receiver. Lock the decoder to SBUS instead of protocol scan.
+param set-default RC_INPUT_PROTO 2
+
+# USART6 (PG9 RX / PG14 TX) is TEL1 and is dedicated to the MicoAir MTF
+# optical-flow/range sensor. Configure the MTF itself for MAVLink_px4,
+# 115200 baud. A MAVLink receiver is required here; do not use thoneflow.
+param set-default MAV_0_CONFIG 101
+param set-default SER_TEL1_BAUD 115200
+param set-default MAV_0_MODE 7
+param set-default MAV_0_FLOW_CTRL 0
+param set-default MAV_0_FORWARD 1
+param set-default SENS_TFLOW_CFG 0
+
+# USART7 (PE7 RX / PE8 TX) is GPS1 and is connected to the MicoAir
+# MG-902 (u-blox M9). Keep baud rate on auto-detect because the module's
+# factory default is 9600 baud and the PX4 GPS driver configures UBX itself.
+param set-default GPS_1_CONFIG 201
+param set-default GPS_1_PROTOCOL 1
+param set-default SER_GPS1_BAUD 0
+
+# PX4 1.17 no longer applies per-channel RC dead zones, but QGC radio
+# calibration still requests RC6_DZ. Referencing it here also marks the
+# compatibility parameter as used so constrained-memory builds transmit it.
+param set-default RC6_DZ 10
+
+# This target runs on physical RoboMaster A hardware. A stale HITL value in
+# removable parameter storage must not suppress board sensor initialization.
+param set SYS_HITL 0

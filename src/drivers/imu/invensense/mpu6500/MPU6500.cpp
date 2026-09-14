@@ -33,6 +33,8 @@
 
 #include "MPU6500.hpp"
 
+#include "IST8310_registers.hpp"
+
 using namespace time_literals;
 
 static constexpr int16_t combine(uint8_t msb, uint8_t lsb)
@@ -52,6 +54,33 @@ MPU6500::MPU6500(const I2CSPIDriverConfig &config) :
 	}
 
 	ConfigureSampleRate(_px4_gyro.get_max_rate_hz());
+
+	const bool enable_magnetometer = config.custom1 == 1;
+
+	if (enable_magnetometer) {
+		// Keil MAG_ALIGN=CW_DEG maps raw (x, y, z) to (x, -y, z).
+		// MPU6500_IST8310 already flips native Z-up to Z-down, so the
+		// remaining PX4 rotation is a 180 degree roll.
+		_slave_ist8310_magnetometer = new IST8310::MPU6500_IST8310(*this, ROTATION_ROLL_180);
+
+		if (_slave_ist8310_magnetometer) {
+			for (auto &r : _register_cfg) {
+				if (r.reg == Register::I2C_SLV4_CTRL) {
+					r.set_bits = I2C_SLV4_CTRL_BIT::I2C_MST_DLY_32_SAMPLES;
+
+				} else if (r.reg == Register::I2C_MST_CTRL) {
+					// Match the DJI reference value 0x0D: 400 kHz, normal STOP/START.
+					r.set_bits = I2C_MST_CTRL_BIT::I2C_MST_CLK_400_kHz;
+
+				} else if (r.reg == Register::I2C_MST_DELAY_CTRL) {
+					r.set_bits = I2C_MST_DELAY_CTRL_BIT::I2C_SLV0_DLY_EN | Bit1;
+
+				} else if (r.reg == Register::USER_CTRL) {
+					r.set_bits |= USER_CTRL_BIT::I2C_MST_EN;
+				}
+			}
+		}
+	}
 }
 
 MPU6500::~MPU6500()
@@ -62,6 +91,8 @@ MPU6500::~MPU6500()
 	perf_free(_fifo_overflow_perf);
 	perf_free(_fifo_reset_perf);
 	perf_free(_drdy_missed_perf);
+
+	delete _slave_ist8310_magnetometer;
 }
 
 int MPU6500::init()
@@ -103,6 +134,10 @@ void MPU6500::print_status()
 	perf_print_counter(_fifo_overflow_perf);
 	perf_print_counter(_fifo_reset_perf);
 	perf_print_counter(_drdy_missed_perf);
+
+	if (_slave_ist8310_magnetometer) {
+		_slave_ist8310_magnetometer->PrintInfo();
+	}
 }
 
 bool MPU6500::StoreCheckedRegisterValue(Register reg)
@@ -172,9 +207,15 @@ void MPU6500::RunImpl()
 
 			// Wakeup and reset digital signal path
 			RegisterWrite(Register::PWR_MGMT_1, PWR_MGMT_1_BIT::CLKSEL_0);
-			RegisterWrite(Register::SIGNAL_PATH_RESET,
-				      SIGNAL_PATH_RESET_BIT::GYRO_RST | SIGNAL_PATH_RESET_BIT::ACCEL_RST | SIGNAL_PATH_RESET_BIT::TEMP_RST);
-			RegisterWrite(Register::USER_CTRL, USER_CTRL_BIT::SIG_COND_RST | USER_CTRL_BIT::I2C_IF_DIS);
+				RegisterWrite(Register::SIGNAL_PATH_RESET,
+					      SIGNAL_PATH_RESET_BIT::GYRO_RST | SIGNAL_PATH_RESET_BIT::ACCEL_RST | SIGNAL_PATH_RESET_BIT::TEMP_RST);
+				uint8_t user_ctrl = USER_CTRL_BIT::SIG_COND_RST | USER_CTRL_BIT::I2C_IF_DIS;
+
+				if (_slave_ist8310_magnetometer) {
+					user_ctrl |= USER_CTRL_BIT::I2C_MST_EN | USER_CTRL_BIT::I2C_MST_RST;
+				}
+
+				RegisterWrite(Register::USER_CTRL, user_ctrl);
 
 			// if reset succeeded then configure
 			_state = STATE::CONFIGURE;
@@ -195,8 +236,12 @@ void MPU6500::RunImpl()
 
 		break;
 
-	case STATE::CONFIGURE:
-		if (Configure()) {
+		case STATE::CONFIGURE:
+			if (Configure()) {
+				if (_slave_ist8310_magnetometer) {
+					_slave_ist8310_magnetometer->Reset();
+				}
+
 			// if configure succeeded then start reading from FIFO
 			_state = STATE::FIFO_READ;
 
@@ -272,7 +317,7 @@ void MPU6500::RunImpl()
 					FIFOReset();
 					perf_count(_fifo_overflow_perf);
 
-				} else if (samples >= SAMPLES_PER_TRANSFER) {
+				} else if (samples >= _fifo_gyro_samples) {
 					if (FIFORead(timestamp_sample, samples)) {
 						success = true;
 
@@ -514,7 +559,6 @@ bool MPU6500::FIFORead(const hrt_abstime &timestamp_sample, uint8_t samples)
 		return false;
 	}
 
-
 	ProcessGyro(timestamp_sample, buffer.f, samples);
 	return ProcessAccel(timestamp_sample, buffer.f, samples);
 }
@@ -554,26 +598,20 @@ bool MPU6500::ProcessAccel(const hrt_abstime &timestamp_sample, const FIFO::DATA
 	accel.samples = 0;
 	accel.dt = FIFO_SAMPLE_DT * SAMPLES_PER_TRANSFER;
 
-	bool bad_data = false;
-
-	// accel data is doubled in FIFO, but might be shifted
 	int accel_first_sample = 1;
 
 	if (samples >= 4) {
 		if (fifo_accel_equal(fifo[0], fifo[1]) && fifo_accel_equal(fifo[2], fifo[3])) {
-			// [A0, A1, A2, A3]
-			//  A0==A1, A2==A3
 			accel_first_sample = 1;
 
 		} else if (fifo_accel_equal(fifo[1], fifo[2])) {
-			// [A0, A1, A2, A3]
-			//  A0, A1==A2, A3
 			accel_first_sample = 0;
 
 		} else {
-			// no matching accel samples is an error
-			bad_data = true;
-			perf_count(_bad_transfer_perf);
+			// Some MPU6500 revisions deliver unique accel samples even with
+			// the 8 kHz gyro FIFO. Decimate those samples without treating
+			// valid data as a transfer failure.
+			accel_first_sample = 0;
 		}
 	}
 
@@ -597,7 +635,7 @@ bool MPU6500::ProcessAccel(const hrt_abstime &timestamp_sample, const FIFO::DATA
 		_px4_accel.updateFIFO(accel);
 	}
 
-	return !bad_data;
+	return true;
 }
 
 void MPU6500::ProcessGyro(const hrt_abstime &timestamp_sample, const FIFO::DATA fifo[], const uint8_t samples)
@@ -644,4 +682,76 @@ void MPU6500::UpdateTemperature()
 		_px4_accel.set_temperature(TEMP_degC);
 		_px4_gyro.set_temperature(TEMP_degC);
 	}
+}
+
+void MPU6500::I2CSlaveRegisterWrite(uint8_t slave_i2c_addr, uint8_t reg, uint8_t val)
+{
+	// Slave 4 performs a single transaction. This avoids continuously
+	// retriggering the IST8310 before its conversion has completed.
+	RegisterWrite(Register::I2C_SLV4_ADDR, slave_i2c_addr);
+	RegisterWrite(Register::I2C_SLV4_REG, reg);
+	RegisterWrite(Register::I2C_SLV4_DO, val);
+	RegisterWrite(Register::I2C_SLV4_CTRL, I2C_SLV4_CTRL_BIT::I2C_SLV4_EN);
+
+	for (int retry = 0; retry < 20; retry++) {
+		const uint8_t status = RegisterRead(Register::I2C_MST_STATUS);
+
+		if (status & I2C_MST_STATUS_BIT::I2C_SLV4_DONE) {
+			break;
+		}
+
+		px4_usleep(100);
+	}
+
+	// I2C_SLV4_CTRL is part of the periodically checked configuration.
+	// Restore the configured delay after the one-shot enable bit clears.
+	RegisterWrite(Register::I2C_SLV4_CTRL, I2C_SLV4_CTRL_BIT::I2C_MST_DLY_32_SAMPLES);
+}
+
+void MPU6500::I2CSlaveExternalSensorDataEnable(uint8_t slave_i2c_addr, uint8_t reg, uint8_t size)
+{
+	RegisterWrite(Register::I2C_SLV0_ADDR, slave_i2c_addr | I2C_SLV0_ADDR_BIT::I2C_SLV0_RNW);
+	RegisterWrite(Register::I2C_SLV0_REG, reg);
+	RegisterWrite(Register::I2C_SLV0_CTRL, size | I2C_SLV0_CTRL_BIT::I2C_SLV0_EN);
+}
+
+void MPU6500::I2CSlaveExternalSensorDataDisable()
+{
+	RegisterWrite(Register::I2C_SLV0_CTRL, 0);
+}
+
+void MPU6500::I2CSlaveAutoReadConfig(uint8_t slave_i2c_addr, uint8_t reg, uint8_t size)
+{
+	// Slave 1 periodically starts a single IST8310 conversion.
+	RegisterWrite(Register::I2C_SLV1_ADDR, slave_i2c_addr);
+	RegisterWrite(Register::I2C_SLV1_REG, static_cast<uint8_t>(IST8310::Register::CNTL1));
+	RegisterWrite(Register::I2C_SLV1_DO, IST8310::CNTL1_BIT::SINGLE_MEASUREMENT_MODE);
+
+	// Slave 0 reads the six axis-data bytes into EXT_SENS_DATA_00..05.
+	RegisterWrite(Register::I2C_SLV0_ADDR, slave_i2c_addr | I2C_SLV0_ADDR_BIT::I2C_SLV0_RNW);
+	RegisterWrite(Register::I2C_SLV0_REG, reg);
+	RegisterWrite(Register::I2C_SLV1_CTRL, I2C_SLV0_CTRL_BIT::I2C_SLV0_EN | 1);
+	RegisterWrite(Register::I2C_SLV0_CTRL,
+		      I2C_SLV0_CTRL_BIT::I2C_SLV0_EN | (size & I2C_SLV0_CTRL_BIT::I2C_SLV0_LENG));
+}
+
+bool MPU6500::I2CSlaveExternalSensorDataRead(uint8_t *buffer, uint8_t length)
+{
+	bool ret = false;
+
+	if (buffer != nullptr && length <= 24) {
+		// max EXT_SENS_DATA 24 bytes
+		uint8_t transfer_buffer[24 + 1] {};
+		transfer_buffer[0] = static_cast<uint8_t>(Register::EXT_SENS_DATA_00) | DIR_READ;
+		set_frequency(SPI_SPEED_SENSOR);
+
+		if (transfer(transfer_buffer, transfer_buffer, length + 1) == PX4_OK) {
+			ret = true;
+		}
+
+		// copy data after cmd back to return buffer
+		memcpy(buffer, &transfer_buffer[1], length);
+	}
+
+	return ret;
 }

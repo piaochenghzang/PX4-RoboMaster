@@ -1,0 +1,3 @@
+#!/bin/sh
+
+# USB CDC and MAVLink are managed by the standard cdcacm_autostart driver.
