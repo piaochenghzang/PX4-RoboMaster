@@ -42,7 +42,9 @@ px4_add_romfs_files(
 	1015_gazebo-classic_iris_depth_camera
 	1016_gazebo-classic_iris_downward_depth_camera
 	1017_gazebo-classic_iris_opt_flow_mockup
+	1018_gazebo-classic_iris_velodyne
 	1019_gazebo-classic_iris_dual_gps
+	1020_gazebo-classic_yhang550
 	1021_gazebo-classic_uuv_hippocampus
 	1022_gazebo-classic_uuv_bluerov2_heavy
 	1030_gazebo-classic_plane
@@ -88,6 +90,7 @@ px4_add_romfs_files(
 	4019_gz_x500_gimbal
 	4020_gz_tiltrotor
 	4021_gz_x500_flow
+	4500_gz_yhang550
 
 	6011_gazebo-classic_typhoon_h480
 	6011_gazebo-classic_typhoon_h480.post

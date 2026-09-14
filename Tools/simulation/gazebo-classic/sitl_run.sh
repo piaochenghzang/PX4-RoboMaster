@@ -52,10 +52,12 @@ else
 fi
 
 # To use gazebo_ros ROS2 plugins
-if [[ -n "$ROS_VERSION" ]] && [ "$ROS_VERSION" == "2" ]; then
-	ros_args="-s libgazebo_ros_init.so -s libgazebo_ros_factory.so"
+if [ "$ROS_VERSION" == "1" ]; then
+    ros_args="-s libgazebo_ros_api_plugin.so"
+elif [ "$ROS_VERSION" == "2" ]; then
+    ros_args="-s libgazebo_ros_init.so -s libgazebo_ros_factory.so"
 else
-	ros_args=""
+    ros_args=""
 fi
 
 if [ "$model" == "" ] || [ "$model" == "none" ]; then

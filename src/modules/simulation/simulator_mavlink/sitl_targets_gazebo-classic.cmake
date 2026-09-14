@@ -85,6 +85,8 @@ if(gazebo_FOUND)
 		iris_opt_flow
 		iris_opt_flow_mockup
 		iris_rplidar
+		iris_velodyne
+		yhang550
 		iris_vision
 		omnicopter
 		plane
