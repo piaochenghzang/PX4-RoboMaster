@@ -1,0 +1,5 @@
+menuconfig MODULES_ARM_CONTROL
+    bool "arm_control"
+    default n
+	---help---
+		Enable support for arm_control

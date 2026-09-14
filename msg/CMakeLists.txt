@@ -46,6 +46,10 @@ set(msg_files
 	AdcReport.msg
 	Airspeed.msg
 	AirspeedWind.msg
+	ArmCartesianSetpoint.msg
+	ArmControlStatus.msg
+	ArmJointCommand.msg
+	ArmJointStatus.msg
 	AutotuneAttitudeControlStatus.msg
 	BatteryInfo.msg
 	ButtonEvent.msg

@@ -1,0 +1,5 @@
+menuconfig DRIVERS_FTSERVO
+	bool "FTServo serial bus servo driver"
+	default n
+	---help---
+		Enable the FEETECH SMS/STS serial bus servo driver.
