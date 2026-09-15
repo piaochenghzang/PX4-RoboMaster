@@ -58,6 +58,7 @@
 
 #include "streams/ACTUATOR_OUTPUT_STATUS.hpp"
 #include "streams/ALTITUDE.hpp"
+#include "streams/ARM_JOINT_COMMAND.hpp"
 #include "streams/ATTITUDE.hpp"
 #include "streams/ATTITUDE_QUATERNION.hpp"
 #include "streams/ATTITUDE_TARGET.hpp"
@@ -522,6 +523,7 @@ static const StreamListItem streams_list[] = {
 #if defined(GLOBAL_POSITION_HPP)
 	create_stream_list_item<MavlinkStreamGLobalPosition>(),
 #endif // GLOBAL_POSITION_HPP
+create_stream_list_item<MavlinkStreamArmJointCommand>(),
 };
 
 const char *get_stream_name(const uint16_t msg_id)

@@ -63,6 +63,7 @@
 #include <uORB/topics/actuator_armed.h>
 #include <uORB/topics/actuator_outputs.h>
 #include <uORB/topics/airspeed.h>
+#include <uORB/topics/arm_joint_status.h>
 #include <uORB/topics/autotune_attitude_control_status.h>
 #include <uORB/topics/battery_status.h>
 #include <uORB/topics/camera_status.h>
@@ -158,6 +159,7 @@ private:
 	void handle_messages_in_gimbal_mode(mavlink_message_t &msg);
 
 	void handle_message_adsb_vehicle(mavlink_message_t *msg);
+	void handle_message_arm_joint_status(mavlink_message_t *msg);
 	void handle_message_att_pos_mocap(mavlink_message_t *msg);
 	void handle_message_battery_status(mavlink_message_t *msg);
 	void handle_message_cellular_status(mavlink_message_t *msg);
@@ -296,6 +298,7 @@ private:
 
 	// ORB publications
 	uORB::Publication<airspeed_s>				_airspeed_pub{ORB_ID(airspeed)};
+	uORB::Publication<arm_joint_status_s>       _arm_joint_status_pub{ORB_ID(arm_joint_status)};
 	uORB::Publication<battery_status_s>			_battery_pub{ORB_ID(battery_status)};
 	uORB::Publication<camera_status_s>			_camera_status_pub{ORB_ID(camera_status)};
 	uORB::Publication<cellular_status_s>			_cellular_status_pub{ORB_ID(cellular_status)};

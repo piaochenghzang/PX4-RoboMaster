@@ -324,6 +324,10 @@ MavlinkReceiver::handle_message(mavlink_message_t *msg)
 		handle_message_gimbal_device_attitude_status(msg);
 		break;
 
+	case MAVLINK_MSG_ID_ARM_JOINT_STATUS:
+		handle_message_arm_joint_status(msg);
+		break;
+
 #if defined(MAVLINK_MSG_ID_SET_VELOCITY_LIMITS) // For now only defined if development.xml is used
 
 	case MAVLINK_MSG_ID_SET_VELOCITY_LIMITS:
@@ -456,6 +460,22 @@ MavlinkReceiver::evaluate_target_ok(int command, int target_system, int target_c
 	}
 
 	return target_ok;
+}
+
+void MavlinkReceiver::handle_message_arm_joint_status(mavlink_message_t *msg)
+{
+    mavlink_arm_joint_status_t mavlink_status{};
+    mavlink_msg_arm_joint_status_decode(msg, &mavlink_status);
+
+    arm_joint_status_s status{};
+    status.timestamp = hrt_absolute_time();
+
+    for (int i = 0; i < 6; ++i) {
+        status.position[i] = mavlink_status.position[i];
+        status.velocity[i] = mavlink_status.velocity[i];
+    }
+
+    _arm_joint_status_pub.publish(status);
 }
 
 void
