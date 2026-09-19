@@ -44,6 +44,7 @@ px4_add_romfs_files(
 	1017_gazebo-classic_iris_opt_flow_mockup
 	1019_gazebo-classic_iris_dual_gps
 	1020_gazebo-classic_yhang550
+	1020_gazebo-classic_yhang550.post
 	1021_gazebo-classic_uuv_hippocampus
 	1022_gazebo-classic_uuv_bluerov2_heavy
 	1030_gazebo-classic_plane

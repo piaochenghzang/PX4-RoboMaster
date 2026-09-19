@@ -1,0 +1,5 @@
+#!/bin/sh
+
+# Start the SO101 controller after the simulator and uORB infrastructure are up.
+# The controller initializes its command state from arm_joint_status feedback.
+arm_control start
