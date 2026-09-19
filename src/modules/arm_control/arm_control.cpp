@@ -35,6 +35,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 
 ArmControl::ArmControl() :
     ModuleParams(nullptr),
@@ -239,6 +240,35 @@ int ArmControl::print_status()
 
 int ArmControl::custom_command(int argc, char *argv[])
 {
+    // Publish through uORB: never mutate work-queue IK state from the shell.
+    if (argc > 0 && !strcmp(argv[0], "target")) {
+        if (argc != 5 || !get_instance()) {
+            PX4_ERR("usage: arm_control target x_m y_m z_m gripper_rad (module must be running)");
+            return PX4_ERROR;
+        }
+        float values[4]{};
+        for (int i = 0; i < 4; ++i) {
+            char *end = nullptr;
+            values[i] = strtof(argv[i + 1], &end);
+            if (end == argv[i + 1] || *end != '\0' || !PX4_ISFINITE(values[i])) {
+                PX4_ERR("invalid finite numeric target");
+                return PX4_ERROR;
+            }
+        }
+        arm_cartesian_setpoint_s target{};
+        target.timestamp = hrt_absolute_time();
+        for (int i = 0; i < 3; ++i) { target.position[i] = values[i]; }
+        target.gripper = values[3];
+        target.valid = true;
+        // Keep the advertisement alive after this one-shot shell command returns.
+        static uORB::Publication<arm_cartesian_setpoint_s> pub{ORB_ID(arm_cartesian_setpoint)};
+        if (!pub.publish(target)) {
+            PX4_ERR("target publication failed");
+            return PX4_ERROR;
+        }
+        PX4_INFO("target queued; inspect arm_control_status for accepted target and arrival");
+        return PX4_OK;
+    }
     if (argc > 0 && !strcmp(argv[0], "test_fk")) {
         ArmControl *instance = get_instance();
 
@@ -320,6 +350,7 @@ $ arm_control test_cartesian_ik
     PRINT_MODULE_USAGE_COMMAND("start");
     PRINT_MODULE_USAGE_DEFAULT_COMMANDS();
     PRINT_MODULE_USAGE_COMMAND("test_fk");
+    PRINT_MODULE_USAGE_COMMAND_DESCR("target", "Queue x y z (base_link metres) and gripper (radians)");
     PRINT_MODULE_USAGE_COMMAND("test_jacobian");
     PRINT_MODULE_USAGE_COMMAND("test_position_ik");
     PRINT_MODULE_USAGE_COMMAND("test_warm_start");
