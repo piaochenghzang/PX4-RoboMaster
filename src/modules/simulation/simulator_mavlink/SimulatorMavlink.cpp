@@ -186,6 +186,39 @@ void SimulatorMavlink::send_controls()
 	}
 }
 
+void SimulatorMavlink::send_arm_joint_command()
+{
+    arm_joint_command_s cmd{};
+
+    if (!_arm_joint_command_sub.update(&cmd)) {
+        return;
+    }
+
+    // SO101 固定 6 关节
+    if (cmd.joint_count != 6) {
+        PX4_WARN("SO101 joint_count invalid: %u", cmd.joint_count);
+        return;
+    }
+
+    mavlink_arm_joint_command_t mav_cmd{};
+
+    for (int i = 0; i < 6; ++i) {
+        mav_cmd.position[i] = cmd.position[i];
+        mav_cmd.velocity[i] = cmd.velocity[i];
+    }
+
+    mavlink_message_t message{};
+
+    mavlink_msg_arm_joint_command_encode(
+        _param_mav_sys_id.get(),
+        _param_mav_comp_id.get(),
+        &message,
+        &mav_cmd
+    );
+
+    send_mavlink_message(message);
+}
+
 void SimulatorMavlink::update_sensors(const hrt_abstime &time, const mavlink_hil_sensor_t &sensors)
 {
 	// temperature only updated with baro
@@ -351,6 +384,9 @@ void SimulatorMavlink::update_sensors(const hrt_abstime &time, const mavlink_hil
 void SimulatorMavlink::handle_message(const mavlink_message_t *msg)
 {
 	switch (msg->msgid) {
+	case MAVLINK_MSG_ID_ARM_JOINT_STATUS:
+		handle_message_arm_joint_status(msg);
+		break;
 	case MAVLINK_MSG_ID_HIL_SENSOR:
 		handle_message_hil_sensor(msg);
 		break;
@@ -396,6 +432,29 @@ void SimulatorMavlink::handle_message(const mavlink_message_t *msg)
 		_rpm_pub.publish(rpm_uorb);
 		break;
 	}
+}
+
+void SimulatorMavlink::handle_message_arm_joint_status(const mavlink_message_t *msg)
+{
+    mavlink_arm_joint_status_t mav_status{};
+
+    mavlink_msg_arm_joint_status_decode(msg, &mav_status);
+
+    arm_joint_status_s status{};
+    status.timestamp = hrt_absolute_time();
+    status.joint_count = 6;
+
+    for (int i = 0; i < 6; ++i) {
+        if (!PX4_ISFINITE(mav_status.position[i]) || !PX4_ISFINITE(mav_status.velocity[i])) {
+            return;
+        }
+        status.current[i] = NAN; // Current is not measured by this protocol.
+        status.position[i] = mav_status.position[i];
+        status.velocity[i] = mav_status.velocity[i];
+        // status.current[i] = mav_status.current[i];
+    }
+
+    _arm_joint_status_pub.publish(status);
 }
 
 void SimulatorMavlink::handle_message_distance_sensor(const mavlink_message_t *msg)
@@ -1064,6 +1123,8 @@ void SimulatorMavlink::send()
 			px4_lockstep_wait_for_components();
 
 			send_controls();
+			// SO101 arm command
+			send_arm_joint_command();
 		}
 	}
 

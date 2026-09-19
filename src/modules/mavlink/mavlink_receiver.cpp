@@ -469,8 +469,13 @@ void MavlinkReceiver::handle_message_arm_joint_status(mavlink_message_t *msg)
 
     arm_joint_status_s status{};
     status.timestamp = hrt_absolute_time();
+    status.joint_count = 6;
 
     for (int i = 0; i < 6; ++i) {
+        if (!PX4_ISFINITE(mavlink_status.position[i]) || !PX4_ISFINITE(mavlink_status.velocity[i])) {
+            return;
+        }
+        status.current[i] = NAN; // Current is not measured by this protocol.
         status.position[i] = mavlink_status.position[i];
         status.velocity[i] = mavlink_status.velocity[i];
     }

@@ -56,6 +56,8 @@
 #include <uORB/Subscription.hpp>
 #include <uORB/SubscriptionInterval.hpp>
 #include <uORB/topics/actuator_outputs.h>
+#include <uORB/topics/arm_joint_command.h>
+#include <uORB/topics/arm_joint_status.h>
 #include <uORB/topics/battery_status.h>
 #include <uORB/topics/differential_pressure.h>
 #include <uORB/topics/distance_sensor.h>
@@ -200,7 +202,7 @@ private:
 	uORB::Publication<vehicle_odometry_s>		_mocap_odometry_pub{ORB_ID(vehicle_mocap_odometry)};
 
 	uORB::Publication<vehicle_command_ack_s>	_command_ack_pub{ORB_ID(vehicle_command_ack)};
-
+	uORB::Publication<arm_joint_status_s> _arm_joint_status_pub{ORB_ID(arm_joint_status)};
 	uORB::PublicationMulti<distance_sensor_s>	*_dist_pubs[ORB_MULTI_MAX_INSTANCES] {};
 	uint32_t _dist_sensor_ids[ORB_MULTI_MAX_INSTANCES] {};
 
@@ -222,6 +224,7 @@ private:
 	void run();
 
 	void handle_message(const mavlink_message_t *msg);
+	void handle_message_arm_joint_status(const mavlink_message_t *msg);
 	void handle_message_distance_sensor(const mavlink_message_t *msg);
 	void handle_message_hil_gps(const mavlink_message_t *msg);
 	void handle_message_hil_sensor(const mavlink_message_t *msg);
@@ -237,6 +240,7 @@ private:
 	void request_hil_state_quaternion();
 	void send();
 	void send_controls();
+	void send_arm_joint_command();
 	void send_heartbeat();
 	void send_esc_telemetry(mavlink_hil_actuator_controls_t hil_act_control);
 	void send_mavlink_message(const mavlink_message_t &aMsg);
@@ -269,6 +273,7 @@ private:
 	uORB::Subscription _vehicle_status_sub{ORB_ID(vehicle_status)};
 	uORB::Subscription _vehicle_command_sub{ORB_ID(vehicle_command)};
 	uORB::Subscription _battery_status_sub{ORB_ID(battery_status)};
+	uORB::Subscription _arm_joint_command_sub{ORB_ID(arm_joint_command)};
 
 	// hil map_ref data
 	MapProjection _global_local_proj_ref{};
