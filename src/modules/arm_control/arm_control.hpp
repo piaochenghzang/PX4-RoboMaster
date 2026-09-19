@@ -49,6 +49,7 @@
 #include <uORB/topics/arm_joint_status.h>
 
 #include <matrix/matrix/math.hpp>
+#include "ArrivalCheck.hpp"
 
 using namespace time_literals;
 
@@ -165,6 +166,8 @@ private:
     // State / status
     void updateControlState();
     void publishControlStatus();
+    ArrivalCheck _arrival;
+    uint32_t _target_sequence{0};
 
     // Development tests
     void testForwardKinematics();
@@ -182,6 +185,8 @@ private:
 
     // Runtime
     uint32_t _run_count{0};
+    uint32_t _feedback_count{0};
+    uint32_t _command_count{0};
     hrt_abstime _last_run{0};
     hrt_abstime _last_feedback_time{0};
 
@@ -200,11 +205,11 @@ private:
     // Joint limits
     JointLimit _joint_limits[MOTOR_COUNT] {
         {-1.57f, 1.57f, 1.0f, 2.0f},
-        {-1.20f, 1.20f, 1.0f, 2.0f},
+        {-1.20f, 1.20f, 0.8f, 2.0f},
         {-1.50f, 1.50f, 1.0f, 2.0f},
+        {-1.57f, 1.57f, 1.0f, 3.0f},
         {-1.57f, 1.57f, 1.5f, 3.0f},
-        {-1.57f, 1.57f, 1.5f, 3.0f},
-        {-1.00f, 1.00f, 1.0f, 2.0f},
+        {-0.174533f, 1.00f, 0.5f, 2.0f},
     };
 
     // SO101 kinematic model

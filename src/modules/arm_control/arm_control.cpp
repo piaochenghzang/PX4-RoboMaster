@@ -75,8 +75,13 @@ void ArmControl::Run()
         return;
     }
 
-    processCartesianSetpoint();
     updateControlState();
+    if (!_joint_feedback_valid) {
+        // Freeze trajectory advancement while feedback is unavailable.
+        publishControlStatus();
+        return;
+    }
+    processCartesianSetpoint();
     generateAndPublishJointCommand(dt);
 
     _command_ee_pose = extractPose(computeURDFFK(_command_position));
@@ -101,6 +106,7 @@ void ArmControl::pollJointFeedback()
     arm_joint_status_s status{};
 
     if (_arm_joint_status.update(&status) && updateJointFeedback(status)) {
+        ++_feedback_count;
         _last_feedback_time = hrt_absolute_time();
         _joint_feedback_valid = true;
     }
@@ -114,7 +120,7 @@ void ArmControl::processCartesianSetpoint()
         return;
     }
 
-    if (!setpoint.valid) {
+    if (!setpoint.valid || !PX4_ISFINITE(setpoint.gripper)) {
         PX4_WARN("Cartesian target rejected");
         return;
     }
@@ -143,6 +149,7 @@ void ArmControl::generateAndPublishJointCommand(float dt)
     }
 
     _arm_joint_command_pub.publish(msg);
+    ++_command_count;
 }
 
 bool ArmControl::updateJointFeedback(const arm_joint_status_s &status)
@@ -170,13 +177,14 @@ bool ArmControl::updateJointFeedback(const arm_joint_status_s &status)
     _measured_ee_pose = extractPose(computeURDFFK(measured_q));
 
     if (!_command_initialized) {
+        const float initial_q[MOTOR_COUNT]{-0.070f, -1.175f, 1.450f, 1.300f, -1.570f, 0.300f};
         for (int i = 0; i < MOTOR_COUNT; ++i) {
             _command_position[i] = _latest_joint_status.position[i];
             _command_velocity[i] = 0.0f;
-            _joint_target[i] = _latest_joint_status.position[i];
+            _joint_target[i] = constrainJointPosition(i, initial_q[i]);
         }
 
-        _ee_target_position = _measured_ee_pose.position;
+        _ee_target_position = extractPosition(computeURDFFK(_joint_target));
         _ee_target_valid = true;
         _command_ee_pose = _measured_ee_pose;
         _command_initialized = true;
@@ -212,6 +220,10 @@ int ArmControl::print_status()
     PX4_INFO("run count: %lu", static_cast<unsigned long>(_run_count));
     PX4_INFO("command initialized: %s", _command_initialized ? "yes" : "no");
     PX4_INFO("joint feedback: %s", _joint_feedback_valid ? "valid" : "invalid");
+    PX4_INFO("accepted feedback: %lu, published commands: %lu", (unsigned long)_feedback_count, (unsigned long)_command_count);
+    if (_last_feedback_time != 0) {
+        PX4_INFO("feedback age: %.3f s", (double)(hrt_elapsed_time(&_last_feedback_time) * 1e-6f));
+    }
 
     if (_command_initialized) {
         PX4_INFO("Command EE: x=%.4f y=%.4f z=%.4f", (double)_command_ee_pose.position(0), (double)_command_ee_pose.position(1), (double)_command_ee_pose.position(2));
@@ -777,6 +789,8 @@ bool ArmControl::updateIKTarget(const matrix::Vector3f &target_position)
     _has_last_ik_solution = true;
     _ee_target_position = safe_target;
     _ee_target_valid = true;
+    ++_target_sequence;
+    _arrival.reset();
     return true;
 }
 
@@ -930,6 +944,16 @@ void ArmControl::publishControlStatus()
     msg.feedback_valid = _joint_feedback_valid;
     msg.command_initialized = _command_initialized;
     msg.state = static_cast<uint8_t>(_control_state);
+    msg.target_sequence = _target_sequence;
+    msg.position_error = (_ee_target_position - _measured_ee_pose.position).norm();
+    msg.feedback_age = _last_feedback_time ? hrt_elapsed_time(&_last_feedback_time) * 1e-6f : INFINITY;
+    for (int i = 0; i < ARM_DOF; ++i) {
+        msg.max_joint_error = fmaxf(msg.max_joint_error, fabsf(_joint_target[i] - _latest_joint_status.position[i]));
+        msg.max_joint_speed = fmaxf(msg.max_joint_speed, fabsf(_latest_joint_status.velocity[i]));
+    }
+    msg.position_reached = _arrival.update(msg.timestamp,
+        _command_initialized && _ee_target_valid && _joint_feedback_valid && msg.feedback_age < 0.2f,
+        msg.position_error, msg.max_joint_error, msg.max_joint_speed);
 
     _arm_control_status_pub.publish(msg);
 }

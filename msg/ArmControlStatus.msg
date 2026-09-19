@@ -24,3 +24,12 @@ uint8 STATE_ACTIVE = 2
 uint8 STATE_FAULT = 3
 
 uint8 state
+
+# Position-only arrival at gripper_frame_link, relative to so101 base_link.
+# Five arm joints only: this does not certify orientation or gripper contact.
+uint32 target_sequence
+float32 position_error # m
+float32 max_joint_error # rad
+float32 max_joint_speed # rad/s
+float32 feedback_age # s
+bool position_reached
