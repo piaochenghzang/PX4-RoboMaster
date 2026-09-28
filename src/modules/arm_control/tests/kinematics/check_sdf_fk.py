@@ -5,7 +5,7 @@ import re
 import xml.etree.ElementTree as ET
 import numpy as np
 
-root = Path(__file__).resolve().parents[3]
+root = Path(__file__).resolve().parents[5]
 header = (root / "src/modules/arm_control/arm_control.hpp").read_text()
 source = (root / "src/modules/arm_control/arm_control.cpp").read_text()
 model = ET.parse(root / "Tools/simulation/gazebo-classic/sitl_gazebo-classic/models/so101/so101.sdf").getroot().find("model")

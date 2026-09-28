@@ -1,4 +1,4 @@
-// Test-only fixture actuation. Never attaches the payload to the gripper.
+// Isolated-gripper test actuation. Never attaches the payload to the gripper.
 #include <gazebo/gazebo.hh>
 #include <gazebo/physics/physics.hh>
 #include <gazebo/transport/transport.hh>

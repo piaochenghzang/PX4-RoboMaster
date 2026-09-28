@@ -1,4 +1,4 @@
-// Standalone Gazebo Transport probe, not linked into flight firmware.
+// Standalone isolated-gripper experiment probe, not linked into flight firmware.
 #ifdef SO101_CLOCK_PLUGIN
 
 #include <gazebo/gazebo.hh>

@@ -1,4 +1,4 @@
-#include "ArrivalCheck.hpp"
+#include "../../ArrivalCheck.hpp"
 #include <cassert>
 #include <limits>
 int main() {

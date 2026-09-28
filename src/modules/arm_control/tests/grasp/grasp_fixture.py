@@ -5,7 +5,7 @@ import copy
 import xml.etree.ElementTree as E
 import argparse
 
-ROOT = Path(__file__).resolve().parents[3]
+ROOT = Path(__file__).resolve().parents[5]
 MODELS = ROOT / 'Tools/simulation/gazebo-classic/sitl_gazebo-classic/models'
 
 def main():

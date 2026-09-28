@@ -16,7 +16,7 @@ import time
 import xml.etree.ElementTree as ET
 
 HERE = Path(__file__).resolve().parent
-ROOT = HERE.parents[2]
+ROOT = HERE.parents[4]
 ABORTS = {2: 'contact_precondition_failed', 3: 'support_removal_unconfirmed',
           4: 'invalid_probe_configuration', 5: 'startup_not_ready',
           6: 'sim_clock_stalled_or_missing', 7: 'sim_time_reversed',

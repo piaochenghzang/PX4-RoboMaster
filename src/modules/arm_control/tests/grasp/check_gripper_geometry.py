@@ -4,7 +4,7 @@ from pathlib import Path
 import struct
 import numpy as np
 
-ROOT = Path(__file__).resolve().parents[3]
+ROOT = Path(__file__).resolve().parents[5]
 ASSETS = ROOT / 'Tools/simulation/gazebo-classic/sitl_gazebo-classic/models/so101/assets'
 SPECS = [
     ('moving_jaw_so101_v1.stl', np.array([[1,0,0],[0,0,-1],[0,1,0]]), [0,-.0189,0]),
