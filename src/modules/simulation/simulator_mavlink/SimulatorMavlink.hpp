@@ -58,6 +58,8 @@
 #include <uORB/topics/actuator_outputs.h>
 #include <uORB/topics/arm_joint_command.h>
 #include <uORB/topics/arm_joint_status.h>
+#include <uORB/topics/arm_grasp_feedback.h>
+#include "../../arm_control/grasp/GraspFeedbackValidation.hpp"
 #include <uORB/topics/battery_status.h>
 #include <uORB/topics/differential_pressure.h>
 #include <uORB/topics/distance_sensor.h>
@@ -203,6 +205,8 @@ private:
 
 	uORB::Publication<vehicle_command_ack_s>	_command_ack_pub{ORB_ID(vehicle_command_ack)};
 	uORB::Publication<arm_joint_status_s> _arm_joint_status_pub{ORB_ID(arm_joint_status)};
+	uORB::Publication<arm_grasp_feedback_s> _arm_grasp_feedback_pub{ORB_ID(arm_grasp_feedback)};
+	so101_grasp::FeedbackValidation _arm_grasp_validator;
 	uORB::PublicationMulti<distance_sensor_s>	*_dist_pubs[ORB_MULTI_MAX_INSTANCES] {};
 	uint32_t _dist_sensor_ids[ORB_MULTI_MAX_INSTANCES] {};
 
@@ -225,6 +229,7 @@ private:
 
 	void handle_message(const mavlink_message_t *msg);
 	void handle_message_arm_joint_status(const mavlink_message_t *msg);
+	void handle_message_arm_grasp_feedback(const mavlink_message_t *msg);
 	void handle_message_distance_sensor(const mavlink_message_t *msg);
 	void handle_message_hil_gps(const mavlink_message_t *msg);
 	void handle_message_hil_sensor(const mavlink_message_t *msg);

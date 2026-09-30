@@ -48,6 +48,9 @@ set(msg_files
 	AirspeedWind.msg
 	ArmCartesianSetpoint.msg
 	ArmControlStatus.msg
+	ArmGraspFeedback.msg
+	ArmGraspRequest.msg
+	ArmGraspStatus.msg
 	ArmJointCommand.msg
 	ArmJointStatus.msg
 	AutotuneAttitudeControlStatus.msg

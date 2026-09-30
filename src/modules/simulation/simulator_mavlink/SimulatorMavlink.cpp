@@ -387,6 +387,9 @@ void SimulatorMavlink::handle_message(const mavlink_message_t *msg)
 	case MAVLINK_MSG_ID_ARM_JOINT_STATUS:
 		handle_message_arm_joint_status(msg);
 		break;
+	case MAVLINK_MSG_ID_ARM_GRASP_FEEDBACK:
+		handle_message_arm_grasp_feedback(msg);
+		break;
 	case MAVLINK_MSG_ID_HIL_SENSOR:
 		handle_message_hil_sensor(msg);
 		break;
@@ -455,6 +458,31 @@ void SimulatorMavlink::handle_message_arm_joint_status(const mavlink_message_t *
     }
 
     _arm_joint_status_pub.publish(status);
+}
+
+void SimulatorMavlink::handle_message_arm_grasp_feedback(const mavlink_message_t *msg)
+{
+    mavlink_arm_grasp_feedback_t v{};
+    mavlink_msg_arm_grasp_feedback_decode(msg, &v);
+    if (!_arm_grasp_validator.accept(v)) { return; }
+    arm_grasp_feedback_s out{};
+    out.timestamp = hrt_absolute_time();
+    // Gazebo and hrt share the lockstep world clock; preserve sample age.
+    out.timestamp_sample = v.sample_time_us;
+    out.sample_time_us = v.sample_time_us;
+    out.source_sequence = v.source_sequence; out.world_epoch = v.world_epoch;
+    out.target_id = v.target_id; out.profile_id = v.profile_id;
+    out.source_system = msg->sysid; out.source_component = msg->compid;
+    out.source = v.source; out.capabilities = v.capabilities;
+    out.contact_frames = v.contact_frames; out.sample_window_s = v.sample_window_s;
+    out.fixed_fraction = v.fixed_fraction; out.moving_fraction = v.moving_fraction;
+    out.bilateral_fraction = v.bilateral_fraction; out.support_fraction = v.support_fraction;
+    out.other_fraction = v.other_fraction; out.support_arm_fraction = v.support_arm_fraction;
+    out.fixed_normal_n = v.fixed_normal_n; out.moving_normal_n = v.moving_normal_n;
+    out.vertical_force_n = v.vertical_force_n; out.object_height_world = v.object_height_world;
+    out.body_support_clearance = v.body_support_clearance;
+    for (int i = 0; i < 3; ++i) { out.object_center_gripper[i] = v.object_center_gripper[i]; }
+    _arm_grasp_feedback_pub.publish(out);
 }
 
 void SimulatorMavlink::handle_message_distance_sensor(const mavlink_message_t *msg)
