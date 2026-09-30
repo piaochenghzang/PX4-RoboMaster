@@ -3,7 +3,8 @@
 
 First run --calibrate without an object, then --calibration <case>/calibration.json.
 Default object mode only measures/aligns. --grasp explicitly closes the jaws;
---grasp --retrieve additionally tests arm retrieval. No firmware state machine.
+--grasp --retrieve additionally tests arm retrieval. --fsm delegates motion to
+the firmware; an external observer independently verifies physical retention.
 The vehicle is fixed to world for this bench test. No object attachment/teleport.
 Phase durations use simulation time; wall time is only a deadlock watchdog.
 """
@@ -22,6 +23,8 @@ import subprocess as sp
 import time
 import xml.etree.ElementTree as ET
 import numpy as np
+from auto_grasp_case import run_auto_case
+from mavlink_fault_proxy import FaultProxy
 
 HERE=Path(__file__).resolve().parent
 ROOT=HERE.parents[4]
@@ -125,10 +128,19 @@ def stop(p):
         except sp.TimeoutExpired:
             p.kill();p.wait(timeout=5)
 
-def build_world(folder,env,calibration,iterations=40,cube_mm=20,gripper_p=None,solver='quick',patch_radius_mm=0):
+def build_world(folder,env,calibration,iterations=40,cube_mm=20,gripper_p=None,solver='quick',patch_radius_mm=0,grasp_feedback=False,gui=False):
     # Expand the same production model used by normal SITL, not a two-link fixture.
     expanded=sp.check_output(['gz','sdf','-p',str(MODELS/'yhang550/yhang550.sdf')],env=env,text=True,timeout=30)
     model=ET.fromstring(expanded).find('model')
+    if grasp_feedback:
+        bridge=model.find("plugin[@name='mavlink_interface']")
+        if bridge is None: raise RuntimeError('MAVLink interface missing')
+        ET.SubElement(bridge,'enableArmGraspFeedback').text='true'
+        jaws=model.findall("plugin[@name='gripper_controller']")
+        if len(jaws)!=1: raise RuntimeError('cannot uniquely identify gripper watchdog')
+        policy=jaws[0].find('commandTimeoutPolicy')
+        if policy is None: policy=ET.SubElement(jaws[0],'commandTimeoutPolicy')
+        policy.text='last_target' # Explicit bench opt-in; arm watchdogs unchanged.
     if gripper_p is not None:
         controllers=model.findall("plugin[@name='gripper_controller']")
         if len(controllers)!=1 or controllers[0].find('p') is None:
@@ -148,6 +160,11 @@ def build_world(folder,env,calibration,iterations=40,cube_mm=20,gripper_p=None,s
     tree=ET.parse(ROOT/'Tools/simulation/gazebo-classic/sitl_gazebo-classic/worlds/empty.world')
     tree.getroot().set('version','1.7')
     world=tree.find('world')
+    if gui:
+        view=ET.SubElement(world,'gui',fullscreen='false')
+        camera=ET.SubElement(view,'camera',name='grasp_demo_camera')
+        ET.SubElement(camera,'pose').text='1.4 -1.5 1.5 0 0.193 2.322'
+        ET.SubElement(camera,'view_controller').text='orbit'
     world.find('physics/ode/solver/iters').text=str(iterations) # bench-only contact setting
     world.find('physics/ode/solver/type').text=solver
     world.append(model)
@@ -192,6 +209,7 @@ def main():
     mode.add_argument('--calibration',type=Path)
     p.add_argument('--port',type=int,default=11356)
     p.add_argument('--gui',action='store_true')
+    p.add_argument('--gui-wait',action='store_true',help='With --gui, wait for Enter after feedback readiness before requesting grasp; physics remains running')
     p.add_argument('--align-only',action='store_true',help='Measure and align fingers to the fixed cube; stop before closing')
     p.add_argument('--grasp',action='store_true',help='Explicitly enable closing and bilateral-contact verification')
     p.add_argument('--retrieve',action='store_true',help='With --grasp, explicitly enable arm retrieval after contact')
@@ -206,7 +224,26 @@ def main():
     p.add_argument('--solver',choices=['quick','world'],default='quick',help='Bench-only ODE solver; iterations apply only to quick')
     p.add_argument('--patch-radius-mm',type=float,default=0.,help='Bench-only finite torsional finger-pad radius, coefficient 0.8; 0 preserves the baseline')
     p.add_argument('--arrival-mm',type=float,default=12.,help='Demo-only actual EE tolerance; strict PX4 arrival is logged separately')
+    p.add_argument('--fsm',action='store_true',help='Firmware-owned grasp, with independent physical verification')
+    p.add_argument('--fsm-test',choices=['normal','ownership','feedback_only','cancel_approach','cancel_carry','missing_object','drop_grasp','drop_joint','drop_command'],default='normal')
+    p.add_argument('--exit-observe-seconds',type=float,default=30.,help='Fault/cancel post-exit observation in simulation seconds (2..120)')
+    p.add_argument('--restore-feedback-after',type=float,help='Test-only: restore filtered feedback this many sim seconds after FAULT; verify no automatic resume')
     args=p.parse_args()
+    if args.gui_wait and not args.gui: p.error('gui-wait requires gui')
+    if args.gui and not (os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY')):
+        p.error('GUI needs the Ubuntu20 display environment; run from your graphical WSL terminal')
+    if args.fsm_test!='normal' and not args.fsm: p.error('fsm-test requires fsm')
+    if not math.isfinite(args.exit_observe_seconds) or not 2 <= args.exit_observe_seconds <= 120:
+        p.error('exit-observe-seconds must be 2..120')
+    if args.restore_feedback_after is not None and (args.fsm_test not in ['drop_joint','drop_grasp']
+        or not math.isfinite(args.restore_feedback_after) or not .5 <= args.restore_feedback_after <= args.exit_observe_seconds-2):
+        p.error('restore-feedback-after requires drop_joint/drop_grasp and .5..exit-observe-seconds-2')
+    if args.fsm and (not args.calibration or not args.grasp or not args.retrieve
+                     or args.retrieve_route!='stow' or args.hold_seconds>120
+                     or args.gripper_p!=.045 or args.patch_radius_mm!=4 or args.cube_mm!=20
+                     or args.side_clear_mm!=70 or args.lift_mm!=35 or args.arrival_mm!=15
+                     or args.iterations!=40 or args.solver!='quick'):
+        p.error('fsm requires bench_cube20: calibration, grasp/retrieve stow, P .045, patch 4, cube 20, side-clear 70, lift 35, arrival 15, quick 40, hold <=120')
     if not math.isfinite(args.arrival_mm) or not 1 <= args.arrival_mm <= 15: p.error('arrival-mm must be 1..15')
     if not 1024 <= args.port <= 65535: p.error('port must be 1024..65535')
     if args.retrieve and not args.grasp: p.error('retrieve requires grasp')
@@ -229,7 +266,7 @@ def main():
     if np.linalg.norm(body_pose[3:])>1e-9: p.error('rotated body collision proxy needs an updated clearance calculation')
     folder=ROOT/'build/full_arm_grasp'/args.name
     if folder.exists(): p.error('existing case; choose a new name to preserve its evidence')
-    for port in [args.port,4560]:
+    for port in [args.port,4560]+([4562] if args.fsm_test.startswith('drop_') else []):
         with socket.socket() as sock:
             sock.settimeout(.2)
             if sock.connect_ex(('127.0.0.1',port))==0: p.error(f'port {port} occupied; stop your simulation first')
@@ -250,16 +287,42 @@ def main():
     with (folder/'build.log').open('w') as log:
         for source,output,extra in [('full_arm_probe.cpp','observer',[]),('grasp_probe.cpp','libgrasp_clock.so',['-DSO101_CLOCK_PLUGIN','-shared','-fPIC'])]:
             sp.run(['g++','-std=c++17',str(HERE/source),'-o',str(folder/output),*extra,*flags,'-pthread'],check=True,stdout=log,stderr=sp.STDOUT,timeout=120)
-    build_world(folder,env,calibration,args.iterations,args.cube_mm,args.gripper_p,args.solver,args.patch_radius_mm)
+    build_world(folder,env,calibration,args.iterations,args.cube_mm,args.gripper_p,args.solver,args.patch_radius_mm,args.fsm,args.gui)
+    if args.fsm_test=='missing_object':
+        scene=ET.parse(folder/'scene.world');world=scene.find('world')
+        world.remove(world.find("model[@name='test_cube']"))
+        scene.write(folder/'scene.world',encoding='unicode',xml_declaration=True)
+    proxy=None
+    if args.fsm_test.startswith('drop_'):
+        scene=ET.parse(folder/'scene.world')
+        scene.find("world/model[@name='yhang550']/plugin[@name='mavlink_interface']/mavlink_tcp_port").text='4562'
+        scene.write(folder/'scene.world',encoding='unicode',xml_declaration=True)
     source_paths=[HERE/'run_full_arm_grasp.py',HERE/'full_arm_probe.cpp',HERE/'grasp_probe.cpp',folder/'scene.world',BUILD/'bin/px4',
                   MODELS/'so101/so101.sdf',MODELS/'yhang550/yhang550.sdf',MODELS/'yhang550_base/yhang550_base.sdf',MODELS/'test_cube/model.sdf',
                   Path('/home/pcz/super_ws/devel/lib/libso101_joint_position_controller.so'),BUILD/'build_gazebo-classic/libgazebo_mavlink_interface.so']
+    source_paths += [Path('/home/pcz/super_ws/src/so101_gazebo/src/joint_position_controller.cpp'),
+                     Path('/home/pcz/super_ws/src/so101_gazebo/src/command_watchdog.hpp')]
+    if args.fsm:
+        source_paths += [HERE/'auto_grasp_case.py',HERE/'mavlink_fault_proxy.py',HERE.parents[1]/'grasp/GraspStateMachine.cpp',
+                         HERE.parents[1]/'grasp/GraspStateMachine.hpp',HERE.parents[1]/'grasp/GraspAdapter.cpp',
+                         ROOT/'src/modules/mavlink/mavlink_receiver.cpp',
+                         ROOT/'src/modules/simulation/simulator_mavlink/SimulatorMavlink.cpp',
+                         ROOT/'src/modules/simulation/simulator_mavlink/SimulatorMavlink.hpp',
+                         ROOT/'src/modules/mavlink/mavlink/message_definitions/v1.0/so101.xml',
+                         ROOT/'Tools/simulation/gazebo-classic/sitl_gazebo-classic/src/so101/grasp_feedback_collector.cpp']
     manifest=dict(mode='calibration' if args.calibrate else ('retrieve' if args.retrieve else ('contact' if args.grasp else 'alignment')),pickup_base=PICKUP.tolist(),inspection_base=INSPECTION.tolist(),retract_base=RETRACT.tolist(),vehicle_fixed=True,object_attached=False,clock='simulation',seed=123,arrival_tolerance_m=args.arrival_mm*.001,retrieve_route=args.retrieve_route,hold_seconds=args.hold_seconds,lift_mm=args.lift_mm,side_clear_mm=args.side_clear_mm,motion_step_m=.003,solver_iterations=args.iterations,solver=args.solver,acceptance=args.acceptance,cube_mm=args.cube_mm,gripper_p_override=args.gripper_p,pad_torsional_radius_m=args.patch_radius_mm*.001,pad_torsional_coefficient=.8 if args.patch_radius_mm>0 else None,
                   sha256={str(f):hashlib.sha256(f.read_bytes()).hexdigest() for f in source_paths})
+    (folder/'manifest.json').write_text(json.dumps(manifest,indent=2))
+    manifest.update(firmware_state_machine=args.fsm,fsm_test=args.fsm_test,
+                    exit_observe_seconds=args.exit_observe_seconds,
+                    restore_feedback_after=args.restore_feedback_after,
+                    gripper_timeout_policy='last_target' if args.fsm else 'measured_position',
+                    gui=args.gui,gui_wait=args.gui_wait)
     (folder/'manifest.json').write_text(json.dumps(manifest,indent=2))
     server=px4=observer=gui=None
     result=dict(success=False,flight_validated=False)
     wall_start=time.monotonic();last_sim=-1;last_progress=wall_start
+    operator_wait_s=0.
     events=[];status_log=[]
     hold_start=None
     files=[]
@@ -272,9 +335,10 @@ def main():
         return proc.stdout
     def sample():
         nonlocal last_sim,last_progress
-        if time.monotonic()-wall_start>600: raise RuntimeError('wall watchdog timeout')
+        if time.monotonic()-wall_start-operator_wait_s>600: raise RuntimeError('wall watchdog timeout')
         if server.poll() is not None or px4.poll() is not None: raise RuntimeError('simulation process exited')
         if observer is not None and observer.poll() is not None: raise RuntimeError('pose/contact observer exited')
+        if proxy is not None and proxy.error: raise RuntimeError('test bridge error: '+proxy.error)
         data=rows(folder/'poses.csv')
         r=data[-1] if data else None
         if r and r['sim_s']>last_sim:
@@ -292,8 +356,8 @@ def main():
         return r
     def event(name,row,**details):
         e=dict(event=name,sim_s=row['sim_s'],**details);events.append(e);print(json.dumps(e),flush=True)
-    def status():
-        text=client('listener','arm_control_status','1');values={}
+    def status(topic='arm_control_status'):
+        text=client('listener',topic,'1');values={}
         for line in text.splitlines():
             match=re.match(r'\s+(\w+):\s+(.+)',line)
             if not match: continue
@@ -303,7 +367,7 @@ def main():
             else:
                 try: values[key]=float(value.split()[0])
                 except ValueError: pass
-        values['gazebo_sim_s']=last_sim;status_log.append(values)
+        values['gazebo_sim_s']=last_sim;values['topic']=topic;status_log.append(values)
         return values
     def healthy(s):
         if not s.get('feedback_valid') or s.get('feedback_age',math.inf)>.2:
@@ -382,6 +446,8 @@ def main():
             if sample()['sim_s']-start>120: raise RuntimeError('measured alignment sim-time limit')
         raise RuntimeError('measured alignment iteration limit')
     try:
+        if args.fsm_test.startswith('drop_'):
+            proxy=FaultProxy();proxy.start()
         server=sp.Popen(['gzserver','--verbose','--seed','123',str(folder/'scene.world')],env=env,stdout=logfile('gazebo.log'),stderr=sp.STDOUT)
         px4=sp.Popen([str(BUILD/'bin/px4'),'-d',str(BUILD/'etc')],cwd=folder/'rootfs',env=env,stdout=logfile('px4.log'),stderr=sp.STDOUT)
         observer=sp.Popen([str(folder/'observer')],env=env,stdout=logfile('poses.csv'),stderr=logfile('observer.log'))
@@ -396,6 +462,17 @@ def main():
                 except RuntimeError: pass
             time.sleep(.1)
         event('feedback_ready',ready)
+        if args.gui_wait:
+            wait_start=time.monotonic()
+            print('GUI ready to inspect. Physics is running; automatic grasp has NOT started. Press Enter to begin, Ctrl+C to exit.',flush=True)
+            input()
+            operator_wait_s+=time.monotonic()-wait_start;last_progress=time.monotonic()
+            if gui.poll() is not None: raise RuntimeError('Gazebo GUI exited; see gui.log')
+            event('operator_started_demo',sample(),operator_wait_wall_s=operator_wait_s)
+        if args.fsm:
+            result.update(run_auto_case(args,folder,client,sample,status,event,wait_sim,rows,cube_local,contact_summary,retention_checks,proxy))
+            if not result['success']: raise RuntimeError('automatic grasp independent verification failed')
+            return
         move(INSPECTION,.6,'inspection')
         if args.calibrate:
             move(PICKUP,.6,'pickup')
@@ -514,15 +591,18 @@ def main():
                           min_hold_lift_m=min_lift,settling_shift_m=float(np.linalg.norm(local_settled-local0)),
                           late_relative_drift_m=late_drift,max_hold_drift_m=max_drift,contact=contact)
             event('retention_complete',end,**result)
-    except (RuntimeError,sp.SubprocessError) as exc:
-        result.update(execution_status='aborted',reason=str(exc));print(str(exc),flush=True)
+    except (RuntimeError,sp.SubprocessError,KeyboardInterrupt,EOFError) as exc:
+        result.update(execution_status='aborted',reason=str(exc) or 'operator_interrupted');print(str(exc),flush=True)
     finally:
+        if proxy is not None: proxy.begin_shutdown()
         if px4 is not None and px4.poll() is None:
             try: client('shutdown')
             except (RuntimeError,sp.SubprocessError): pass
         for proc in [px4,observer,gui,server]: stop(proc)
+        if proxy is not None:
+            proxy.close();result['fault_injection']=proxy.report()
         for f in files: f.close()
-        result.update(events=events,elapsed_wall_s=time.monotonic()-wall_start)
+        result.update(events=events,elapsed_wall_s=time.monotonic()-wall_start,operator_wait_wall_s=operator_wait_s)
         telemetry=rows(folder/'poses.csv')
         if telemetry:
             result['telemetry_sim_time_monotonic']=all(b['sim_s']>a['sim_s'] for a,b in zip(telemetry,telemetry[1:]))

@@ -47,6 +47,10 @@
 #include <uORB/topics/arm_control_status.h>
 #include <uORB/topics/arm_joint_command.h>
 #include <uORB/topics/arm_joint_status.h>
+#include <uORB/topics/arm_grasp_feedback.h>
+#include <uORB/topics/arm_grasp_request.h>
+#include <uORB/topics/arm_grasp_status.h>
+#include "grasp/GraspStateMachine.hpp"
 
 #include <matrix/matrix/math.hpp>
 #include "ArrivalCheck.hpp"
@@ -131,6 +135,11 @@ private:
     void Run() override;
     float updateDt();
     void pollJointFeedback();
+    void pollGraspFeedback();
+    so101_grasp::Input graspInput() const;
+    void processGraspRequests(const so101_grasp::Input &input);
+    void executeGraspAction(const so101_grasp::Action &action, const so101_grasp::Input &input);
+    void publishGraspStatus();
     void processCartesianSetpoint();
     void generateAndPublishJointCommand(float dt);
 
@@ -182,6 +191,12 @@ private:
     uORB::Publication<arm_control_status_s> _arm_control_status_pub{ORB_ID(arm_control_status)};
     uORB::Subscription _arm_joint_status{ORB_ID(arm_joint_status)};
     uORB::Subscription _arm_cartesian_setpoint{ORB_ID(arm_cartesian_setpoint)};
+    uORB::Subscription _arm_grasp_feedback{ORB_ID(arm_grasp_feedback)};
+    uORB::Subscription _arm_grasp_request{ORB_ID(arm_grasp_request)};
+    uORB::Publication<arm_grasp_status_s> _arm_grasp_status_pub{ORB_ID(arm_grasp_status)};
+    arm_grasp_feedback_s _grasp_feedback{};
+    so101_grasp::GraspStateMachine _grasp;
+    bool _grasp_hold_pending{false};
 
     // Runtime
     uint32_t _run_count{0};

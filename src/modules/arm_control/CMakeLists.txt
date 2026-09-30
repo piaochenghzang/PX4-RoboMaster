@@ -40,6 +40,8 @@ px4_add_module(
 	SRCS
 		arm_control.cpp
 		arm_control.hpp
+		grasp/GraspStateMachine.cpp
+		grasp/GraspAdapter.cpp
 	DEPENDS
 		px4_work_queue
 )

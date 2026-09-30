@@ -8,9 +8,53 @@ from tempfile import TemporaryDirectory
 import xml.etree.ElementTree as ET
 import numpy as np
 from run_full_arm_grasp import box_bounds,build_world,contact_summary,cube_local,grasp_reference,rotation,retention_checks,set_pad_patch
+from mavlink_fault_proxy import FrameStream
+from auto_grasp_case import exit_retention_checks
 
 
 class FullArmChecks(unittest.TestCase):
+    def test_fault_bridge_preserves_fragmented_frames_and_signatures(self):
+        # Synthetic framing only, not synthetic contact evidence.
+        frames=[bytes([0xfe,2,0,1,200,90])+b'ab'+b'CC',
+                bytes([0xfd,3,0,0,1,1,200])+int(42002).to_bytes(3,'little')+b'xyz'+b'CC',
+                bytes([0xfd,1,1,0,2,1,200])+int(42001).to_bytes(3,'little')+b'j'+b'CC'+b'S'*13]
+        stream=FrameStream();received=[]
+        for byte in b''.join(frames): received.extend(stream.feed(bytes([byte])))
+        self.assertEqual(received,list(zip([90,42002,42001],frames)))
+        self.assertFalse(stream.buffer)
+
+    def test_fault_bridge_refuses_unframed_data(self):
+        with self.assertRaises(RuntimeError): FrameStream().feed(b'not MAVLink')
+
+    def test_grasp_feedback_is_explicitly_opt_in(self):
+        expanded=('<sdf version="1.7"><model name="yhang550"><plugin name="mavlink_interface" filename="bridge.so"/>'
+                  '<plugin name="gripper_controller" filename="servo.so"/>'
+                  '<plugin name="wrist_controller" filename="servo.so"/></model></sdf>')
+        with TemporaryDirectory() as name:
+            for enabled in [False,True]:
+                with patch('run_full_arm_grasp.sp.check_output',return_value=expanded):
+                    build_world(Path(name),{},None,grasp_feedback=enabled)
+                bridge=ET.parse(Path(name)/'scene.world').find('world/model/plugin')
+                self.assertEqual(bridge.find('enableArmGraspFeedback') is not None,enabled)
+                model=ET.parse(Path(name)/'scene.world').find('world/model')
+                jaw=model.find("plugin[@name='gripper_controller']/commandTimeoutPolicy")
+                self.assertEqual(jaw.text if jaw is not None else None,'last_target' if enabled else None)
+                self.assertIsNone(model.find("plugin[@name='wrist_controller']/commandTimeoutPolicy"))
+
+    def test_fault_exit_requires_force_and_no_unloading_or_drop(self):
+        # Only verifies the checker, not physical grasp evidence.
+        initial=dict(sim_s=0,cx=0,cy=0,cz=1,gx=0,gy=0,gz=1,gw=1,gqx=0,gqy=0,gqz=0)
+        row=dict(initial,sim_s=30,contact_frames=100,bilateral_fraction=1,
+                 cube_support_fraction=0,cube_other_fraction=0,support_arm_fraction=0,
+                 fixed_normal_N=.15,moving_normal_N=.15,jaw_angle=.06,jaw_speed=0,jaw_torque_Nm=-.0095)
+        self.assertTrue(exit_retention_checks([row],initial,cube_local,contact_summary)['retained'])
+        for change in [dict(moving_normal_N=0),dict(cz=.05),dict(cx=.05),
+                       dict(cube_support_fraction=.1),dict(jaw_torque_Nm=.02),dict(jaw_angle=float('nan')),
+                       dict(moving_normal_N=float('nan'))]:
+            self.assertFalse(exit_retention_checks([dict(row,**change)],initial,cube_local,contact_summary)['retained'])
+        brief_loss=[dict(row,sim_s=i*.1,bilateral_fraction=0 if i<7 else 1) for i in range(100)]
+        self.assertFalse(exit_retention_checks(brief_loss,initial,cube_local,contact_summary)['retained'])
+
     def test_contacts_are_weighted_by_received_physics_frames(self):
         values=[
             dict(contact_frames=1,bilateral_fraction=0,cube_support_fraction=1),
@@ -19,6 +63,16 @@ class FullArmChecks(unittest.TestCase):
         summary=contact_summary(values)
         self.assertAlmostEqual(summary['bilateral_fraction'],.99)
         self.assertAlmostEqual(summary['cube_support_fraction'],.01)
+
+    def test_gui_camera_does_not_change_physics_or_add_actuation(self):
+        expanded='<sdf version="1.7"><model name="yhang550"/></sdf>'
+        with TemporaryDirectory() as name:
+            with patch('run_full_arm_grasp.sp.check_output',return_value=expanded):
+                build_world(Path(name),{},None,gui=True)
+            world=ET.parse(Path(name)/'scene.world').find('world')
+            self.assertEqual(world.find('gui/camera/pose').text,'1.4 -1.5 1.5 0 0.193 2.322')
+            self.assertEqual(world.find('physics/max_step_size').text,'0.001')
+            self.assertIsNotNone(world.find("model[@name='yhang550']/joint[@name='bench_anchor']"))
 
     def test_empty_contact_window_cannot_verify_contact(self):
         self.assertEqual(contact_summary([])['bilateral_fraction'],0)

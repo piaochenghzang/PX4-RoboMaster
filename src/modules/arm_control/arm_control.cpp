@@ -69,6 +69,12 @@ void ArmControl::Run()
     ++_run_count;
 
     pollJointFeedback();
+    pollGraspFeedback();
+    updateControlState();
+    const auto grasp_input=graspInput();
+    processGraspRequests(grasp_input);
+    executeGraspAction(_grasp.step(grasp_input),grasp_input);
+    publishGraspStatus();
 
     if (!_command_initialized) {
         updateControlState();
@@ -77,7 +83,7 @@ void ArmControl::Run()
     }
 
     updateControlState();
-    if (!_joint_feedback_valid) {
+    if (!_joint_feedback_valid || (_grasp.owns() && grasp_input.joint_age>=.2f)) {
         // Freeze trajectory advancement while feedback is unavailable.
         publishControlStatus();
         return;
@@ -120,6 +126,7 @@ void ArmControl::processCartesianSetpoint()
     if (!_arm_cartesian_setpoint.update(&setpoint)) {
         return;
     }
+    if (_grasp.owns()) { PX4_WARN("manual target rejected: grasp ownership locked"); return; }
 
     if (!setpoint.valid || !PX4_ISFINITE(setpoint.gripper)) {
         PX4_WARN("Cartesian target rejected");
@@ -240,8 +247,53 @@ int ArmControl::print_status()
 
 int ArmControl::custom_command(int argc, char *argv[])
 {
+    if (argc>0 && !strcmp(argv[0],"grasp_status")) {
+        uORB::Subscription sub{ORB_ID(arm_grasp_status)};
+        arm_grasp_status_s s{};
+        if (!get_instance() || !sub.copy(&s)) { PX4_ERR("grasp status unavailable"); return PX4_ERROR; }
+        PX4_INFO("grasp phase=%u result=%u fault=%u failed_phase=%u payload=%u locked=%d",
+            s.phase,s.result,s.fault_reason,s.failed_phase,s.payload_state,s.ownership_locked);
+        PX4_INFO("historical completion=%d, bilateral=%.3f, normal=%.4f/%.4f N, lift=%.4f m",
+            s.completed_success,(double)s.bilateral_fraction,(double)s.fixed_normal_n,(double)s.moving_normal_n,(double)s.actual_lift);
+        return PX4_OK;
+    }
+    if (argc>0 && (!strcmp(argv[0],"grasp_start") || !strcmp(argv[0],"grasp_cancel") || !strcmp(argv[0],"grasp_reset"))) {
+        if (!get_instance()) { PX4_ERR("arm_control must be running"); return PX4_ERROR; }
+        arm_grasp_request_s request{};
+        request.timestamp=hrt_absolute_time(); request.request_id=request.timestamp;
+        request.profile_id=1; request.target_id=1; request.hold_duration_s=30.f;
+        if (!strcmp(argv[0],"grasp_start")) {
+            if (argc!=3 || strcmp(argv[1],"bench_cube20")) {
+                PX4_ERR("usage: arm_control grasp_start bench_cube20 hold_seconds"); return PX4_ERROR;
+            }
+            char *end=nullptr; request.hold_duration_s=strtof(argv[2],&end);
+            if (end==argv[2] || *end!='\0' || !PX4_ISFINITE(request.hold_duration_s)
+                || request.hold_duration_s<5.f || request.hold_duration_s>120.f) {
+                PX4_ERR("hold seconds must be finite, 5..120"); return PX4_ERROR;
+            }
+            request.action=arm_grasp_request_s::START;
+        } else {
+            if (argc!=1) return PX4_ERROR;
+            request.action=!strcmp(argv[0],"grasp_cancel") ? arm_grasp_request_s::CANCEL : arm_grasp_request_s::RESET;
+        }
+        static uORB::Publication<arm_grasp_request_s> pub{ORB_ID(arm_grasp_request)};
+        if (!pub.publish(request)) return PX4_ERROR;
+        PX4_INFO("grasp request queued; inspect arm_grasp_status for acceptance");
+        return PX4_OK;
+    }
+    if (argc>0 && (!strcmp(argv[0],"test_warm_start") || !strcmp(argv[0],"test_cartesian_ik"))) {
+        uORB::Subscription sub{ORB_ID(arm_grasp_status)}; arm_grasp_status_s s{};
+        if (sub.copy(&s) && s.ownership_locked) {
+            PX4_ERR("mutating IK test rejected: grasp BUSY/locked"); return PX4_ERROR;
+        }
+    }
     // Publish through uORB: never mutate work-queue IK state from the shell.
     if (argc > 0 && !strcmp(argv[0], "target")) {
+        uORB::Subscription grasp_sub{ORB_ID(arm_grasp_status)};
+        arm_grasp_status_s grasp_status{};
+        if (grasp_sub.copy(&grasp_status) && grasp_status.ownership_locked) {
+            PX4_ERR("target rejected: grasp BUSY/locked; cancel does not release a payload"); return PX4_ERROR;
+        }
         if (argc != 5 || !get_instance()) {
             PX4_ERR("usage: arm_control target x_m y_m z_m gripper_rad (module must be running)");
             return PX4_ERROR;
@@ -351,6 +403,10 @@ $ arm_control test_cartesian_ik
     PRINT_MODULE_USAGE_DEFAULT_COMMANDS();
     PRINT_MODULE_USAGE_COMMAND("test_fk");
     PRINT_MODULE_USAGE_COMMAND_DESCR("target", "Queue x y z (base_link metres) and gripper (radians)");
+    PRINT_MODULE_USAGE_COMMAND_DESCR("grasp_start", "Queue fixed-bench grasp: bench_cube20 hold_seconds");
+    PRINT_MODULE_USAGE_COMMAND("grasp_cancel");
+    PRINT_MODULE_USAGE_COMMAND("grasp_reset");
+    PRINT_MODULE_USAGE_COMMAND("grasp_status");
     PRINT_MODULE_USAGE_COMMAND("test_jacobian");
     PRINT_MODULE_USAGE_COMMAND("test_position_ik");
     PRINT_MODULE_USAGE_COMMAND("test_warm_start");
@@ -870,6 +926,18 @@ bool ArmControl::sanitizeCartesianTarget(const matrix::Vector3f &raw_target, mat
         return false;
     }
 
+    // Folded startup FK can be just outside min_z. The fixed bench APPROACH
+    // may recover inward using the same step/IK/joint limits; manual targets
+    // and every later grasp phase retain the ordinary workspace checks.
+    if (_grasp.phase==so101_grasp::Phase::Approach && _grasp_feedback.capabilities==31
+        && so101_grasp::monotonicRecovery(
+            {_ee_target_position(0),_ee_target_position(1),_ee_target_position(2)},
+            {raw_target(0),raw_target(1),raw_target(2)},
+            {_cartesian_limit.min_x,_cartesian_limit.min_y,_cartesian_limit.min_z},
+            {_cartesian_limit.max_x,_cartesian_limit.max_y,_cartesian_limit.max_z},
+            _cartesian_limit.max_step)) {
+        safe_target=raw_target; return true;
+    }
     matrix::Vector3f target_bounded{};
     target_bounded(0) = math::constrain(raw_target(0), _cartesian_limit.min_x, _cartesian_limit.max_x);
     target_bounded(1) = math::constrain(raw_target(1), _cartesian_limit.min_y, _cartesian_limit.max_y);
