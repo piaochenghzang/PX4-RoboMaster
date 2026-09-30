@@ -3,6 +3,8 @@
 本文件合并原 INTERFACE、KINEMATICS、ELBOW_TRACKING、TARGET_SWITCH、
 GRASP 五份专项记录。后续修改和实验只维护本文；原记录可从 Git 历史恢复。
 以下历史章节描述各阶段当时的结果，“未提交”和“下一步”不代表当前状态。
+最新增量见文末「第九步：夹爪失联保持与界面复现」；本轮修改了 Ubuntu20
+的下位 ROS 插件，但 ROS 仓库仍不提交。历史章节的“未修改 ROS”仅描述当时状态。
 
 ## 目录与职责（2026-09-28）
 
@@ -511,3 +513,553 @@ ROS 库不提交；生成的场景、二进制、CSV 与结果 JSON 留在忽略
 提交前复核：13 项抓取离线测试通过，102 个位姿的 SDF/FK 对比通过，
 夹指几何读取正常，到位判定 C++ 测试通过，Git 格式检查通过。
 正式 Gazebo 模型子仓库保持干净；本次不改变该子模块指针或固件核心控制流程。
+
+## 第八步：自动抓取、夹持反馈与失败退出
+
+第 1–10 小节保留 2026-09-28 经用户校核的 v0.1 设计基线。
+用户随后授权实现与测试；第 11 小节记录实际实现、物理结果及与设计的差异，
+以该小节为当前完成状态。所有实验只访问 Ubuntu-20.04；ROS 库未修改。
+
+### 1. 第一版范围与已有能力
+
+第一版沿用固定机身、固定倾斜支撑、20 mm / 10 g 方块的已验证 bench 场景，
+目标是一次请求完成接近、对齐、双侧夹持、侧向离台、抬升、回收与保持。
+默认保持 30 s，长测 120 s；允许有限滑移，不增加 P 或力矩上限。
+使用显式 bench_cube20_v1 配置：P=0.045、cmdMax=0.01 N·m、
+两指抗扭半径 4 mm / 系数 0.8、quick/40、1 ms 步长。
+这些仍是专用测试场景设置，不全局修改正常飞行世界的物理参数。
+
+第一版不接受任意世界坐标抓取，不做全姿态 IK、飞行控制、点云、SUPER、
+自动放置或自动重抓。后续先增加坐标转换与抓取姿态/路径选择，再开放任意目标。
+ALIGN 使用 Gazebo 物体真值，属于显式的 simulation-assisted alignment；
+不宣称由实机传感器或点云完成定位。以后定位输入可以替换，不能隐式沿用真值。
+
+已核查可复用：arm_control 10 Hz 控制循环、五关节位置 IK、
+关节位置/速度/加速度约束、目标序号、关节反馈有效性及 FK 实测末端位置。
+现有 ArmControlState 的 Ready/Active/Fault 是底层控制状态，
+不改成抓取阶段枚举；另设抓取状态和结果，避免改变既有语义。
+现有 ArmJointStatus.current 未测量，接收端填 NaN，不能用它确认夹持。
+
+### 2. 三层职责与单一命令所有者
+
+```text
+grasp_start / cancel / reset
+             ↓
+GraspStateMachine：阶段、条件、超时、结果（不直接发 MAVLink）
+             ↓
+ArmControl：目标校核 → 现有 IK → 现有关节轨迹 → arm_joint_command
+             ↓
+原 MAVLink/Gazebo 控制链 → 六关节控制器
+
+Gazebo contacts + 实际 link/object pose
+             ↓
+只读 GraspFeedbackCollector → ARM_GRASP_FEEDBACK → PX4 接收校验
+             ↓
+arm_grasp_feedback → 状态机；原关节反馈仍走 arm_joint_status
+```
+
+状态机设计成可离线测试的 C++ 类：step(now, inputs) 返回有限的行动请求，
+不持有 Gazebo/ROS 对象、不睡眠、不直接控制关节。
+ArmControl 负责执行行动，并回传 accepted_target、target_sequence 和拒绝原因。
+ACTIVE 抓取及带物保持/故障锁定期间，普通 arm_control target 请求返回 BUSY，
+不静默抢占。重复 START 不重置阶段和计时器；CANCEL 可打断所有运行阶段。
+只有一个执行器发布 arm_joint_command，测试脚本不再并行发送逐步运动目标。
+
+拟在 Run 中依次：读取关节/抓取反馈和请求 → 计算健康与到位指标 →
+状态机推进或安全退出 → 接受唯一来源的目标 → 更新现有关节轨迹 → 发布两种状态。
+请求处理不能放在当前“未初始化/关节无效就提前 return”之后，
+否则正好在故障时无法响应 CANCEL/STATUS。每周期动作与 IK 调用必须有界，
+长路径检查分批执行，不能在 work queue 内阻塞等待。沿用 uORB 异步接口，
+参考 [PX4 uORB 说明](https://docs.px4.io/main/en/middleware/uorb)。
+
+### 3. 建议的状态与迁移条件
+
+```text
+IDLE → PRECHECK → APPROACH → ALIGN → CLOSE → VERIFY
+                                              ↓
+DONE ← HOLD ← SETTLE ← RETRACT ← LIFT ← EXIT_SUPPORT
+
+任意运行阶段 → ABORTED（取消）/ FAULT（失败），锁定，不自动重新执行
+```
+
+| 状态 | 动作与完成条件 | 暂定阶段超时（仿真时间） |
+| --- | --- | --- |
+| PRECHECK | 检查场景配置、目标身份、固定机身、反馈能力；预检路径边界/IK，要求关节及抓取反馈连续健康 0.5 s | 5 s |
+| APPROACH | 夹爪打开 0.6 rad，到已测附近点 base=(0.17,0.035,0.05) m；满足 bench_near 并停稳 | 35 s |
+| ALIGN | 实测物体中心相对夹指参考点；每次最多修正 3 mm，增益 0.6，修正间隔至少 1 s；误差连续三次 ≤3 mm、速度合格 | 120 s |
+| CLOSE | 固定五关节目标，夹爪目标 -0.15 rad，经现有限速；至少观察 2 s，再检查夹爪停稳和双侧接触候选条件 | 12 s |
+| VERIFY | 再连续 1 s 确认同一目标的双侧接触、两侧法向力与数据新鲜；保存抓取初始相对位置和高度 | 3 s |
+| EXIT_SUPPORT | 沿当前 bench 的 base +Y 退出 70 mm；带物小步移动，停稳后观察 1 s；物体确实离台、夹爪本体侧向净空 ≥3 mm | 60 s |
+| LIFT | 从离台点沿 base -Z 抬升目标 35 mm；物体实际抬高 ≥25 mm、无支撑且运动停稳 | 60 s |
+| RETRACT | 保持侧向距离，先到 (0.12, cleared_y, lifted_z)，再到 (0.12,0.015,0.03) m；两段分别确认接受和停稳 | 每段 60 s |
+| SETTLE | 停稳并保持 2 s；仍高于初始至少 25 mm，无支撑/非夹指干涉；单独记录携物阶段相对位移 | 5 s |
+| HOLD | 连续保持 30 s 或 120 s，持续检查载荷与反馈；结束时验收本阶段接触比例和保持高度 | 请求时长，不超过 120 s |
+| DONE | 锁存完成结果，继续带物保持和健康监视，不自动松开；后续载荷丢失仍报告新的故障 | 无自动松爪计时 |
+| ABORTED / FAULT | 取消所有未执行的路径目标，保持或停止下发，锁存原因，等待明确处置 | 不自动退出 |
+
+阶段超时取实际 now-stage_enter_time，不用限幅后的轨迹 dt 累加。
+SITL 需核对 hrt 与仿真时钟推进的一致性；暂停时阶段时间不推进，
+时间倒退/世界重置视为 CLOCK_RESET，清除接触窗口并锁定退出。
+外部测试器另设墙钟无进展保护；主动暂停或时钟卡住只记 STALLED，
+不能把它当成物理 NaN，也不能伪造一条 PX4 已执行的退出事件。
+
+新增 LIFT 实际抬高 ≥25 mm 的门槛已用两份既有成功 CSV 对照：
+lift_arrived 时相对闭合确认高度分别抬高 29.349 / 29.344 mm，
+方块—台面接触比例均为零。该检查是旧日志核对，不是状态机已经通过的测试。
+
+### 4. 到位、对齐、夹持必须分别判定
+
+- strict_position_reached：原 ArrivalCheck 不变，即末端 ≤5 mm、
+  五关节差 ≤0.03 rad、速度 ≤0.05 rad/s、反馈新鲜并持续 0.5 s。
+- bench_near：仅在已确认的 bench 配置内允许末端 ≤15 mm、
+  五关节差 ≤0.08 rad、速度 ≤0.05 rad/s、持续 0.5 s。
+  状态中明确记录此条件及 strict_position_reached，不冒充严格到位。
+- aligned：夹指参考点与物体中心 ≤3 mm，连续三次观测，间隔至少 0.6 s，
+  目标身份/位姿有效、五关节速度 ≤0.05 rad/s；不能只看 IK 求解误差。
+- clamped：最近 1 s 的同目标双侧接触帧比例 ≥90%，
+  两侧平均法向力各 >0.01 N、夹爪速度绝对值 <0.02 rad/s、数据新鲜，
+  并满足 VERIFY 的连续确认。允许物体此时仍由台面支撑。
+- payload_free：离台且实际抬高达标；这才允许设置载荷状态为 HELD。
+  CLOSE 的目标角 -0.15 rad 不要求实际达到：有物体时实际角约 +0.06 rad
+  可以正常夹持；空爪到达闭合角也不能判为抓取成功。
+
+HOLD 结束的 demo 验收：整段按物理帧加权的双侧接触 ≥90%，
+两侧平均法向力各 >0.01 N、支撑接触 ≤0.1%、最低物体高度仍高于抓取初值，
+全程没有持续接触丢失/明显分离/非夹指干涉，结束时反馈仍健康。
+不合格返回 RETENTION_CHECK_FAILED；严格漂移 ≤5 mm 仅作独立诊断，
+不改变 demo 的成功结果。进入 SETTLE/HOLD 的 ≥25 mm 抬高要求仍不可跳过。
+payload_state=LOST 须由有效物体位姿/明确分离证据确认，
+只有接触失联时使用 UNKNOWN，不凭失联猜测物体已经掉落。
+
+坐标约定：所有运动点在 SO101 base_link、单位 m；参考点在 gripper_link：
+(0.0025,-0.000218,-0.088) m。现有 FK 末端是 gripper_frame_link，
+必须使用模型固定工具变换还原 gripper_link，再计算
+e_base = R_base_gripper_link * (object_center_gripper - reference_gripper)。
+不用测试脚本针对倒挂固定机身的世界 [1,-1,-1] 换号写法泛化任意安装。
+关节 FK 和仿真实际坐标需独立交叉核对；机身一旦解锁，此 bench 配置立即失效。
+
+携物目标推进沿用每 0.5 s 最多 3 mm；只在前一目标已接受、反馈健康、
+实测误差处于 bench 包络且碰撞保护通过时推进。接近与微调也核对
+accepted_target，要求与请求小步点差 ≤0.2 mm；工作空间裁剪不算成功接受。
+不能只看到 target_sequence 增加就继续，也不能每步等待严格停稳造成无限停顿。
+
+### 5. 新增接口草案（名称/字段待最终生成校核）
+
+保留 ARM_JOINT_COMMAND(42000)、ARM_JOINT_STATUS(42001) 的现有布局，
+不往 current 填力矩或接触力。新增 ARM_GRASP_FEEDBACK，拟消息编号 42002；
+本地检查未见同号 message，最终需验证 so101.xml 的完整 include 图并运行生成器。
+本地 ardupilotmega 中 42002 是 MAV_CMD 枚举值，不是 message ID；
+也不把项目自用编号称为全局注册号。修改方言应单独提交子模块，
+遵循 [MAVLink 消息定义与生成规则](https://mavlink.io/en/guide/define_xml_element.html)。
+
+| uORB 接口 | 建议字段及语义 |
+| --- | --- |
+| ArmGraspRequest.msg | 非零 request_id、action=START/CANCEL/RESET、profile_id、target_id、hold_duration_s；第一版只接受 bench_cube20_v1，不开放任意 XYZ |
+| ArmGraspFeedback.msg | 本地接收 timestamp、源 sample_time_us、source_sequence、world_epoch、profile_id、target_id、source=SIM_GROUND_TRUTH、有效能力位；contact_frames、sample_window_s、两侧/双侧/台面/非夹指/台面—机械臂接触比例；两侧法向力、世界 Z 向支持力；object_center_gripper[3]、object_height_world、gripper_body_support_clearance_m、bench_valid |
+| ArmGraspStatus.msg | active_request_id、最近请求 ID/接受或拒绝原因、phase、phase_elapsed_s、result=NONE/RUNNING/SUCCEEDED/CANCELED/FAILED、fault_reason、payload_state=EMPTY/CONTACT_CANDIDATE/CLAMPED/HELD/LOST/UNKNOWN、target_sequence、strict_position_reached、bench_near、alignment_error、feedback_age、接触/力诊断、initial_motion_shift、hold_drift、actual_lift |
+
+建议命令外观：arm_control grasp_start bench_cube20 30、
+arm_control grasp_cancel、arm_control grasp_status、arm_control grasp_reset。
+这些子命令现已实现；执行命令返回“queued”不等于状态机已经接受。
+START 必须确认当前请求已接受；单一请求者一次只保留一项未确认请求。
+运行时再次 START 返回 BUSY，不能覆盖 active_request_id。
+CANCEL 和结果均带请求身份；回放同一 request_id 不重新启动。
+RESET 不发运动命令，也不松爪；载荷 HELD/CLAMPED/UNKNOWN 时不能直接
+放开手动命令所有权，需要后续明确的人工接管/支撑确认。
+本版不提供自动松爪接口；不能将 reset 设计成“恢复初始姿态”。
+
+有效性位至少区分 CONTACT_VALID、FORCE_VALID、OBJECT_POSE_VALID、
+CLEARANCE_VALID、BENCH_VALID；无能力/无测量与真实零值不同。
+没有物体时正常发布新心跳：object pose 无效、接触帧仍可有有效的零接触计数。
+物体消失也不能只停止发消息，否则会把“对象丢失”误诊为链路超时。
+只有必需且标记有效的字段才做有限性检查；未测电流 NaN 不触发此物理故障。
+第一版必须具备上述五项能力，否则拒绝自动抓取，不能降级为仅靠角度猜夹持。
+
+### 6. 只读夹持反馈如何进入 PX4
+
+建议在现有 GazeboMavlinkInterface 内挂接独立 GraspFeedbackCollector，
+读取联系人和模型实际位姿，经既有 send_mavlink_message 路径发新反馈。
+不新增 UDP 端口，不增加第二个关节命令发布器，不依赖 ROS，
+也不需要为了本功能额外建立 Gazebo 自定义 protobuf 传输链。
+collector 只读，不能 SetPosition/SetForce/绑定物体、移动台面或暂停物理。
+默认禁用，由专用场景明确配置目标 model/ID、支撑 model 和指面 collision。
+目标身份与接触对按解析后的准确 scoped 名称匹配，避免任意同名夹指/第二个物体
+满足条件。两个指面接触不同物体不能记为 bilateral。
+
+采样按物理帧去重，两个指面同一帧接触才记双侧；建议每 0.1 s 仿真时间
+发布一次新窗口。状态机再按 contact_frames 加权聚合 1 s，不能按消息数平均。
+空窗口、重复帧、倒序帧不得补成接触；contact_frames=0 时接触能力无效。
+力转换使用时间匹配的目标 link 姿态；若无法匹配则标记 FORCE_INVALID，
+Z 向力仅作诊断，不强制其与 0.0981 N 精确相等。
+支持碰撞和本体干涉需单独分类，不从“夹指接触比例高”推断已经离台。
+净空仍限定 bench 的退出方向和碰撞盒，不能声称完整碰撞规划器。
+
+collector 保留样本时间、源序号与 world_epoch。桥接只发送新样本，
+接收端只用新的源序号刷新接收龄期，重复旧包不能延长生命。
+需核验 SITL 源时钟与 PX4 时钟对应关系，记录采样龄期与接收龄期两者；
+未知同步/窗口时间过长不得标成 fresh。实现时覆盖序号回绕、世界重置、
+乱序和延迟缓存回放测试，不能只以“刚收到 MAVLink”为新鲜依据。
+关节反馈龄期 <0.2 s 才推进；0.2..0.3 s 暂停推进，超过 0.3 s 锁定失败。
+抓取反馈采样/接收龄期超过 0.3 s 同样锁定失败；阈值需实测 10 Hz 调度裕量。
+源身份、目标/配置身份变化或已验证时基倒退在运行中立即退出。
+
+### 7. 失败退出与持物责任
+
+| 情况 | 结果/原因 | 默认动作 |
+| --- | --- | --- |
+| 未初始化、场景不符、不可达/越界目标、缺必要反馈能力 | START_REJECTED，保持 IDLE | 不进入运动，不用裁剪后的另一位置替代原请求 |
+| 请求动作进行中的 IK 拒绝/目标被裁剪 | FAILED / IK_REJECTED | 停止该路径，锁定故障 |
+| 近点、对齐、开合或回收阶段超时 | FAILED / PHASE_TIMEOUT（保留具体阶段） | 不跳过完成条件，不进入后续阶段 |
+| 空抓、单侧接触，VERIFY 到期仍不合格 | FAILED / GRASP_NOT_CONFIRMED | 保持现有臂姿和夹爪命令，不自动松开或重抓 |
+| 携物相对抓取参考点分离 >45 mm | FAILED / PAYLOAD_SEPARATED | 停止臂运动，不追逐掉落物 |
+| 携物双侧比例 <50% 持续 >0.5 s | FAILED / CONTACT_LOST | 锁定退出，不以一次短暂丢帧直接判掉落 |
+| 非夹指/台面—臂接触比例 >20%，或抬升后再次接触支撑 >1% | FAILED / OBSTRUCTED 或 SUPPORT_RECONTACT | 停止推进，不能穿越台面继续收臂 |
+| CANCEL | CANCELED | 停止未执行路径，不自动回到初始关节姿态 |
+| 抓取反馈丢失而关节反馈仍健康 | FAILED / GRASP_FEEDBACK_STALE，payload=UNKNOWN | 有界停止五关节运动，保持原夹爪闭合目标和限幅，继续控制 |
+| 关节反馈超时/有效字段出现 NaN/Inf | FAILED / JOINT_FEEDBACK_STALE 或 NONFINITE_STATE | 停止轨迹推进和新运动命令，不基于旧反馈继续 IK；交由既有下位超时策略，观测结果 |
+| 时间/世界重置、目标/源身份变化 | FAILED / CLOCK_RESET 或 SOURCE_CHANGED | 清除窗口/未执行动作，须人工核对后重启新请求 |
+
+关节健康时停止动作需清除尚未执行的小步及轨迹残余速度，
+采用有界减速/当前实测位置附近保持，防止只是“停止状态机”而旧目标仍继续走完。
+保留夹爪闭合偏置：若改成实际接触角作为目标，可能卸掉夹持力。
+关节反馈不健康时，不保证持物安全；下位命令超时保持当前位置可能降低夹持力，
+必须实际验证。故障试验需接物托盘和固定机身，不能将其包装成飞行安全保证。
+grasp_cancel 不等于 arm_control stop；后者结束模块，不能承诺持续夹持。
+
+没有自动复位、自动重抓、盲目撤退或空中松爪。载荷状态不可确认时是 UNKNOWN，
+不是 EMPTY。成功结果锁存仅表示该请求完成了指定保持时间；DONE 后仍监测载荷，
+历史 completed_success 与当前 payload_state 分别呈现，不能继续显示“当前抓取成功”
+而忽略后来丢失。初始携物位移与保持漂移分别记录，demo 小滑移不触发精度失败。
+
+### 8. 拟改文件与实施顺序
+
+```text
+src/modules/arm_control/
+  grasp/GraspStateMachine.hpp/.cpp     纯状态与阶段/请求管理
+  grasp/GraspChecks.hpp               窗口判据、健康与持物判断
+  grasp/GraspProfile.hpp              有版本的 bench 配置与路径
+  arm_control.cpp/.hpp                只增加适配、所有权、命令和反馈接入
+  CMakeLists.txt                     登记实现源文件
+  tests/grasp/test_grasp_state_machine.cpp
+  tests/grasp/run_full_arm_grasp.py    新增 FSM 模式，不再外部逐阶段发目标
+  tests/grasp/full_arm_probe.cpp      保留独立、只读的验收观察器
+msg/ArmGraspRequest.msg / ArmGraspFeedback.msg / ArmGraspStatus.msg
+msg/CMakeLists.txt                    注册消息
+src/modules/mavlink/mavlink_receiver.cpp/.h  新反馈解码/校验/发布
+```
+
+另需修改 MAVLink 方言子仓库的 so101.xml；Gazebo 子仓库内新增
+include/so101/grasp_feedback_collector.h、src/so101/grasp_feedback_collector.cpp，
+并接入 gazebo_mavlink_interface.cpp/.h 与其 CMakeLists.txt。
+专用场景生成器显式开启 collector 和 bench 物理配置；正式模型默认不启用自动抓取。
+不修改 ROS 仓库。提交应先处理并推送 MAVLink/Gazebo 子仓库，再提交 PX4 指针，
+避免再出现父仓库引用尚未上传的消息定义；本设计阶段不执行这些操作。
+
+建议分三步实现并各自验收：
+1. 只读反馈链：无任何自动动作，核对身份、窗口、坐标、力和超时，
+   与独立 probe 对照；不让单一 collector 既控制又独自证明成功。
+2. 纯状态机与离线故障测试：用输入序列测试迁移、计时、所有权和退出，
+   完成后只做 APPROACH/ALIGN 的不闭合仿真试运行。
+3. 完整闭合/离台/回收/保持与真实故障注入；暂不改无人机飞行逻辑。
+
+### 9. 验证清单与通过条件
+
+| 测试 | 必须看到的结果 |
+| --- | --- |
+| 单次正常请求，30 s / 120 s | 独立 observer 确认真实双侧抓住、物体离台抬高、回收保持，未绑定，无非夹指干涉/NaN；结果含每个迁移与阈值来源 |
+| 正例新启动重复至少三次 | 独立场景恢复后每次都完成，不覆盖旧日志；明确这是新启动重复，不冒充同场景连续抓取/放置循环 |
+| 空物体/偏置到单侧接触 | 不出现 HELD/SUCCEEDED；分别拒绝启动或在 VERIFY 合理失败，无后续抬升 |
+| 不可达/超界目标 | 明确拒绝，不偷偷移动到裁剪后的位置；现有手动功能不受影响 |
+| 停掉抓取反馈、关节反馈分别测试 | 区分两种超时；锁存原因和阶段，不自动恢复，不丢失 CANCEL 响应 |
+| 重复/乱序/缓存旧包、world reset | 不能刷新生命或凑足双侧接触条件；运行中的源/时基变化退出 |
+| 运行中 START/普通 target，阶段中 CANCEL | START/target 返回 BUSY，无双命令竞争；CANCEL 停止残余路径且不松爪 |
+| 带物后短暂接触丢帧/持续失联/物体脱落 | 短暂缺口按去抖处理，持续丢失或明显分离退出；未把 UNKNOWN 误记 EMPTY |
+| 到位门槛未满足、力测量无效或 NaN | 不靠固定等待跳过，不伪造成功，不因为未测电流而误报物理 NaN |
+| HOLD 完成后再失去物体 | 保留历史完成事件，同时更新当前载荷和故障，不能静默失去监视 |
+
+离线测试可以用合成消息检验逻辑；真实抓取成功必须由物理仿真和独立 observer
+验收，禁止注入“接触为真”来证明抓取。故障注入放在测试器的桥接过滤层，
+明确标记实验参数，不在正式消息中留可远程伪造成功的测试开关。
+结果仍写 build/full_arm_grasp/<unique_case>/，包括源码/库/场景/配置哈希、
+时钟关系、请求与阶段事件、反馈能力/龄期、力和位姿、退出后至少 2 s 观测。
+墙钟保护清理只限测试器自己启动的进程，不删除物体去制造“已离台”。
+
+### 10. 请优先校核的三项选择
+
+1. 第一版只做 bench_cube20_v1，不先开放任意 XYZ；确认其取舍是否符合近期 demo。
+2. 允许第一版 ALIGN 使用明确标记的 Gazebo 真值；以后再替换为点云/目标估计输入。
+3. 取消/失败保持、锁定且不自动重抓或回收；载荷不明时不允许 reset 直接释放命令所有权。
+
+这些边界已由用户批准。参数阈值继续以物理实测为准，
+不因为状态机首次跑不通就放宽正式到位判据或调大夹持力矩。
+
+### 11. 实现与验收记录（2026-09-29）
+
+#### 实现位置与反馈语义
+
+- `grasp/GraspStateMachine.hpp/.cpp`：无阻塞、无动态分配的状态机、接触窗口、
+  阶段计时、所有权和锁存退出；`grasp/GraspAdapter.cpp` 负责 uORB/现有 IK 适配。
+- `grasp/GraspFeedbackValidation.hpp`：能力位、有限性、比例、时间窗口、
+  源序号/时间去重与 epoch 校验。草案中的 GraspChecks/GraspProfile 尚未单独建文件。
+- 新增 `ArmGraspRequest/Feedback/Status.msg`；状态包含 active/last request ID、
+  接受/拒绝原因、当前阶段、失败发生阶段、载荷状态、历史完成与实际抬高。
+- MAVLink 子仓库新增 `ARM_GRASP_FEEDBACK(42002)`，原 42000/42001 布局不变。
+  Gazebo 的 `so101/grasp_feedback_collector` 只读真实接触/位姿，不绑定物体。
+- 同时接入普通 `mavlink_receiver` 和 **实际 SITL TCP 入口**
+  `simulation/simulator_mavlink/SimulatorMavlink`。第一轮没有新反馈，是后者漏接；
+  不是模型或 PID 故障。仍使用 development 方言，不改为另一种头文件。
+- 修复 MAVLink 构建依赖：被 development 包含的 so101.xml 改变时也重新生成头文件，
+  避免旧生成物掩盖新增消息。MAVLink/Gazebo 子仓库均保留未提交改动。
+- `tests/grasp/auto_grasp_case.py` 仅发送 START/CANCEL，观察器独立验收真实物理结果。
+  `mavlink_fault_proxy.py` 只过滤完整指定消息，保留原 CRC/其余消息/执行器命令。
+  日志明确区分源采样时刻与外部观察延迟、运行错误与清理时连接关闭。
+
+反馈由同一个目标的双侧接触、两侧法向力、实际物体相对位置和实际抬高组成，
+不以空爪角度到位或“命令发出”确认抓取；电流仍未测量，继续是 NaN。
+SOURCE=SIM_GROUND_TRUTH 显式标记仿真真值，不是实机电流。
+只有实际抬高达标后载荷才为 HELD，完成指定 HOLD 后才 SUCCEEDED。
+DONE 继续监视，`completed_success` 是历史记录，不等于当前载荷安全。
+本版 profile 只允许 SITL；不能在硬件上使用 Gazebo 真值启动自动抓取。
+
+collector 默认关闭，仅专用生成场景设 enableArmGraspFeedback=true。
+实际校验固定锚点/安装、20 mm/10 g 目标、P/I/D/力矩上限、指面抗扭参数、
+ODE quick/40/1 ms。目标或支撑被同名新实例替换也不能沿用原目标身份。
+生产 SDF、飞行世界和 ROS 库均未修改。
+
+#### 发现并修正的问题
+
+1. 折叠初始 FK 的 Z≈−5 mm，原工作空间 min_z=20 mm；接近小步被裁剪，
+   按“不能把裁剪当接受”的要求退出 IK_REJECTED。
+   增加仅对已验证 bench APPROACH 的 **单调向内回归**：
+   最大步长仍 20 mm，只减少初值到合法区间的距离，不允许越界向外走。
+   普通目标、其他抓取阶段、IK/关节/速度限制和正式严格到位阈值不变。
+2. EXIT_SUPPORT 的额外 1 s 改为从实测到位后起算，而不是从进入阶段起算。
+   ALIGN 三次合格观察在速度/位置不合格时重新计数。
+3. 接近 CANCEL 现在在首个运动目标已接受后触发，避免只测试“尚未运动就取消”。
+   取消与抓取反馈超时均确认五关节目标不继续推进；夹爪保留原命令偏置。
+4. 测试过滤层启用 TCP_NODELAY，避免代理的小包缓冲拖慢 lockstep。
+   首轮慢速代理试验人工中止、未注入故障，保留日志且不计通过。
+
+#### 当前已有物理结果
+
+结果目录统一为 `build/full_arm_grasp/<case>/`：
+每轮有 scene.world、manifest.json、poses.csv、px4_status.json、summary.json 及运行日志；
+唯一编号不覆盖失败试验。环境固定 seed=123，未移动/删除支撑、未绑定方块。
+
+| 已完成案例 | 验收结果 |
+| --- | --- |
+| fsm_feedback_20260929_02 | 5 s 内 48 个新窗口，五项能力齐全；源采样/接收/仿真时钟一致 |
+| fsm_grasp_20260929_02 | 请求保持 30 s，独立观察约 32.15 s；双侧 100%，最低抬高 37.52 mm，最终相对漂移 2.07 mm，支持力均值 0.09634 N |
+| fsm_grasp_20260929_03 | 独立观察约 31.94 s，最低抬高 38.38 mm，最终漂移 1.56 mm；运行中 START=BUSY，手动目标/改动 IK 的调试命令被拒绝，带物 RESET 不释放所有权 |
+| fsm_grasp_20260929_04 | 独立观察约 32.05 s，最低抬高 38.35 mm，最终漂移 1.56 mm；与前两轮分别重新启动场景，均完成完整抓取 |
+| fsm_grasp_120s_20260929_01 | 请求保持 120 s，独立观察约 122.11 s；最低抬高 33.63 mm，最终漂移 6.35 mm；demo 持物通过，不冒充严格精度通过 |
+| fsm_cancel_approach_20260929_02 | 首个目标接受后取消；ABORTED 锁定，后续 2 s 五关节目标变化为 0；非带物阶段原开爪目标可以继续完成 |
+| fsm_cancel_carry_20260929_01 | 携物阶段取消；后续 2 s 目标变化为 0，夹爪角变化约 −0.000055 rad，仍双侧夹持，不自动松爪/回收 |
+| fsm_drop_grasp_20260929_02 | 过滤 42002，外部观察约 0.32 s 后 GRASP_STALE，failed_phase=LIFT，payload=UNKNOWN；后续 2 s 仍双侧夹持 |
+| fsm_drop_joint_20260929_01 | 过滤 42001，外部观察约 0.533 s 后 JOINT_STALE；停止新增指令，UNKNOWN 锁定；**下位超时后物体掉落，持物安全不通过** |
+| fsm_drop_joint_20260929_02 | 源 HIL 时钟锚点后首次可见故障 0.384 s，外部观察 0.427 s；failed_phase=LIFT，新关节指令时间戳不再前进；退出后物体分离 1.083 m，exit_payload_retained=false |
+| fsm_drop_grasp_20260929_03 | 源首个被过滤窗口后首次可见故障 0.232 s（该窗口之前已有一个正常 0.1 s 间隔），故障时真实反馈龄期 0.340 s；外部观察 0.320 s；退出后仍双侧夹持，exit_payload_retained=true |
+| fsm_missing_object_20260929_01 | START 明确拒绝，保持 IDLE，不出现 HELD/SUCCEEDED，也不进入自动运动 |
+
+最后两轮复测独立核对 FK 与实际 link/物体坐标，最大差约 0.28 mm，
+远小于 3 mm 验收限值。源锚点与外部观察延迟不是同一个指标，不能混为控制超时门槛。
+上述正常/取消试验物体与机械臂均有限值，无 NaN、非夹指或支撑—臂干涉。
+关节中断掉落时曾出现短暂非夹指接触（最大约 9.35%），同样保留，不隐藏故障物理后果。
+故障案例的 summary.success 只表示**预期退出行为验证成功**，不是抓取/持物成功；
+grasp_validated=false，新增 exit_payload_retained 单独呈现实际退出后是否仍夹住。
+正常抓取真实到位正例及示范保持已跑通，不代表飞行、任意物体/姿态或重复放置循环。
+
+#### 必须保留的限制与下一项修复
+
+**关节反馈中断导致掉落：**PX4 在失联时停止轨迹/新命令；
+当前下位插件 1 s command timeout 将夹爪目标改为实际角度，卸掉闭合偏置，
+两侧法向力归零，独立 CSV 看到方块落到地面。这是实测，不是仅凭参数推断。
+本次不改 ROS 库，也不能把“退出正确”包装成“失联时保证持物”。
+后续需要单独设计/验证夹爪持物模式与下位看门狗策略，再进入飞行携物 demo。
+
+紧急停止现在是健康关节反馈下重新取实测五关节位置并清掉残余轨迹速度，
+保留夹爪命令；不是草案中的完整有界减速轨迹。失联时不使用旧反馈做 IK，
+没有自动松爪、重抓、撤回或解除所有权。持物/未知状态不能直接 RESET。
+全路径预检、完整碰撞规划、硬件夹持传感、世界重置/旧包的真实链路注入等尚未完成；
+新增 42002 的旧包/非有限值/时钟倒退、状态机完成后丢物等逻辑目前由离线合成输入覆盖。
+旧 42001 没有测量源时间/序号，仍只使用本地接收/读取龄期；
+不能把 42002 的去重能力推广成“关节测量旧包也已防回放”。
+本次只编译验证 SITL，未进行硬件版编译或实机验证。
+到位严格标志是原控制周期诊断，bench 阶段检查独立使用本周期实际 FK 和新鲜反馈。
+
+复现基准命令（端口/现有 PX4 被占用时脚本拒绝启动，不会结束你的仿真）：
+
+```bash
+python3 src/modules/arm_control/tests/grasp/run_full_arm_grasp.py <unique_case> \
+  --calibration build/full_arm_grasp/full_calibration_05/calibration.json \
+  --grasp --retrieve --retrieve-route stow --gripper-p .045 \
+  --patch-radius-mm 4 --arrival-mm 15 --fsm --hold-seconds 30
+# --fsm-test feedback_only / ownership / cancel_approach / cancel_carry
+#            drop_grasp / drop_joint / missing_object
+```
+
+本次暂未 Git 提交/推送；只写这一份合并说明，不增设多份修改记录。
+离线最终回归：16 项抓取脚本检查、16 项 C++ 逻辑/反馈检查、到位判定检查通过；
+102 个姿态的 SDF/FK 比较最大位置差 3.533 μm，通过。PX4 与 Gazebo 插件编译通过。
+所有本次测试自行启动的 PX4/Gazebo/代理/观察器均已清理，三仓库 Git 格式检查通过。
+
+## 第九步：夹爪失联保持与界面复现（2026-09-29）
+
+### 修改范围与保持语义
+
+本轮针对第八步发现的“42001 中断 → PX4 停发新命令 → 下位 1 s 超时卸力”修复，
+不提高 P、力矩上限，不改 IK、严格到位门槛或上层故障锁存。
+仅访问 Ubuntu-20.04，没有访问 Ubuntu22，没有 Git 提交/推送。
+
+| 位置 | 本轮作用 |
+| --- | --- |
+| `/home/pcz/super_ws/src/so101_gazebo/src/joint_position_controller.cpp` | 加入显式 timeout policy；区分待处理目标与已施加目标，诊断误差对应实际生效目标；校验有限 PID/正力矩上限；Reset 在更新线程清理旧目标/积分 |
+| 同 ROS 包 `src/command_watchdog.hpp`、`tests/test_command_watchdog.cpp`、CMake | 独立、sim-time 看门狗与断言测试；Release 也执行断言；暂停不计超时，新命令才重新启用，时钟倒退/Reset 清除旧 episode |
+| `tests/grasp/run_full_arm_grasp.py` | 专用 FSM 场景显式启用夹爪 last_target，其余关节配置不变；保存插件源码/库哈希；延长退出观测；GUI 等待入口与默认视角 |
+| `tests/grasp/auto_grasp_case.py` | 退出行为与真实持物分开验收；独立检查双侧/力/位姿/非夹指干涉/力矩上限；长失联、恢复链路与命令丢失场景 |
+| `tests/grasp/mavlink_fault_proxy.py` | 可过滤 42000，仍不修改帧内容/CRC，原 HIL/其余反馈正常转发；明确区分过滤命令与修改命令内容 |
+| Gazebo 子仓库 `src/so101/grasp_feedback_collector.cpp` | bench 能力校验同时要求显式 last_target 配置，避免场景配置悄悄回退 |
+
+控制插件默认仍是 `measured_position`：1 s 无 Gazebo 指令后，五关节目标取实测角。
+只有关节名为 gripper 且 SDF 显式设置以下字段才允许保留最后目标：
+
+```xml
+<commandTimeoutPolicy>last_target</commandTimeoutPolicy>
+```
+
+目前该字段**只由专用 FSM 抓取场景生成器添加**，生产 so101.sdf 没改，
+因此原 calibration 模型哈希仍有效。直接启动原普通 yhang550 场景不会自动启用此策略。
+要部署到正式飞行场景，需显式配置夹爪并按实际参数另做验收，不能把 bench 结果冒充飞行验证。
+
+`last_target` 保留的是最后收到、经关节限位校核、已实际施加的角度目标，
+不是保持某个固定力矩，更不是自动判断“已经抓到”。闭合偏置 -0.15 rad 仍由
+原 PID 与 0.01 N·m 上限约束，实际有物体时可以停在 +0.06 rad 附近。
+若最后命令是开爪，则仍是开爪目标，不会因失联自行闭合。
+不会自动卸力，也不会因超时自己追加闭合动作；恢复后的新有效命令可以改变目标。
+软件保持依赖 Gazebo 物理与控制器继续运行，不能承诺掉电、进程崩溃或物理 NaN 后持物。
+
+World/Model Reset 或仿真时间倒退会清除旧 command episode、待执行目标和该关节 PID
+历史，以当前实测角重新设目标；**Reset 不保留旧夹持偏置**，不是带物安全操作。
+这一项当前是编译/纯逻辑覆盖，尚未做整机真实 world-reset 注入，不能称物理验收通过。
+42000/42001 原接口没有端到端命令确认或完整源去重；Reset 后到达的旧链路缓存指令
+不能靠此看门狗识别。后续飞行版本仍需命令身份/确认与显式人工处置策略。
+
+### 验收方式与已知边界
+
+本轮专用退出验收至少观察 30 s，长测 120 s，不再只看退出后 2 s 的最后一帧。
+持物要求：帧加权双侧接触 ≥90%、两侧法向力均 >0.01 N、无支撑接触，
+相对抓取初值分离 ≤45 mm、持续双侧丢失不超过 0.5 s、无明显非夹指/台面—臂干涉，
+实际关节力矩绝对值 ≤0.010001 N·m（仅数值容差），所有测量有限。
+`exit_control_verified` 与 `exit_retention.retained` 必须同时满足才报告此负例通过。
+PX4 在关节失联时仍是 FAULT / JOINT_STALE / UNKNOWN，保持所有权，不伪造 HELD。
+
+五个臂关节转为实测角保持后，因重力与 PD 跟踪偏差会产生额外下沉；
+这不是夹爪滑移，也不宣称末端位置保持精度通过。记录实际世界高度变化与相对位移，
+用真实夹指接触/相对关系判断有没有掉物，正式严格到位阈值没有放宽。
+
+首轮 `fsm_linkhold_joint30_20260929_01` 日志保留为失败：
+双侧比例 100%、相对分离 3.38 mm、峰值力矩 0.00955 N·m，未掉物；
+但新增的“相对闭合初值世界高度不得下降 10 mm”条件被实际约 14.90 mm 下沉触发。
+后续删除这个混淆末端绝对位置与夹持的额外条件，保留高度作为独立诊断，
+重新启动新案例验证，不覆盖或改写首轮失败结果。
+
+直接过滤 42000 与过滤反馈不同：关节/抓取反馈仍健康，上层并没有命令 ACK
+来直接识别这条链路丢指令。该案例验证下位看门狗与实际持物，
+**不证明命令送达/端到端失联检测通过**，结果中 command_delivery_validated=false。
+
+### 本轮物理结果
+
+结果仍保存 `build/full_arm_grasp/<unique_case>/`，不绑定/移动方块或支撑。
+
+| 案例 | 真实结果 |
+| --- | --- |
+| fsm_linkhold_joint30_20260929_02 | JOINT_STALE/UNKNOWN 锁存、停止新命令；退出观测 30.19 s，双侧 100%，相对分离 3.46 mm，峰值力矩 0.00949 N·m；独立持物通过 |
+| fsm_linkhold_joint120_20260929_01 | 同样的关节反馈中断持续约 120.05 s，过滤 6027 个 42001；双侧 100%，相对分离 4.18 mm，峰值 0.00948 N·m，未掉落 |
+| fsm_linkhold_grasp30_20260929_01 | 过滤 42002，GRASP_STALE/UNKNOWN；退出观测 30.19 s，双侧 100%，相对分离 3.45 mm，峰值 0.00948 N·m；停止路径，不松爪 |
+| fsm_linkhold_cancel30_20260929_01 | 携物阶段 CANCEL 后 ABORTED 锁定，五关节目标不再推进；观测 30.09 s，双侧 100%，相对分离 3.30 mm，峰值 0.00939 N·m |
+| fsm_linkhold_normal30_20260929_01 | 完整自动抓取/实际抬高/回收/保持通过；独立保持 32.15 s，最低抬高 37.96 mm，最终相对漂移 1.74 mm，strict 诊断通过，峰值 0.00953 N·m |
+| fsm_linkhold_command120_20260929_01 | HOLD 后过滤 1220 个 42000，下位 1 s 看门狗真实触发；独立保持 122.01 s，双侧 100%，最低抬高 31.24 mm，最终漂移 8.41 mm，峰值 0.00949 N·m；demo 通过、strict 不通过，不能称命令送达验证通过 |
+| fsm_linkhold_restore_20260929_01 | JOINT_STALE 后停止新指令，故障后约 5.02 s 恢复真实关节反馈；余下约 25.07 s 仍 FAULT/UNKNOWN/所有权锁定，target_sequence 保持 40，不自动重启路径；全退出窗口双侧 100%，相对分离 3.37 mm，峰值 0.00957 N·m |
+
+以上七轮均无支撑/非夹指/支撑—臂干涉，物体/夹爪测量有限，CSV 仿真时间单调。
+每一轮仍是独立重启场景，不冒充同场景连续抓取/放置循环。
+早期案例的原 summary 不重写；用最终包含有限测力/持续接触检查的独立验收器
+重新读取保存的 CSV，仍通过（不向仿真注入接触数据）。
+下位日志明确五关节 `holding measured position`、夹爪
+`retaining bounded last target=-0.15`，证明实际使用了不同的超时策略。
+
+世界高度下沉诊断仍保留：普通关节失联约 14.88 / 15.56 mm，
+抓取反馈失联约 14.75 mm，携物取消约 17.99 mm，
+关节恢复后再按实测角重设五关节目标，累计下沉约 28.21 mm。
+这提示后续要做有界停止与重力保持，而不能把这轮“夹爪不掉物”
+当成整臂绝对位置安全已经解决；同样不能误把世界下沉值写成夹指相对滑移。
+
+关节长失联负例与恢复负例均没有新成功事件，payload 仍 UNKNOWN。
+120 s 命令中断案例的 DONE 只表示物理保持条件满足；其 command_delivery_validated=false。
+如果需要飞行中直接报告“命令通路断了”，仍需端到端 ACK/源身份协议，不靠角度未变化猜测。
+
+离线最终回归：18 项 Python 检查、16 项 C++ 状态机/反馈逻辑、严格 ArrivalCheck、
+ROS 包登记的看门狗 CTest 均通过；看门狗 Release 使用 -UNDEBUG，断言未被跳过。
+102 个 SDF/FK 姿态对照仍通过，最大位置差 3.533 μm。
+更新后的 ROS 控制库与 Gazebo 接口库编译通过；GUI 场景 `gz sdf -k` 通过。
+没有代开 GUI，因此窗口显示/交互要由下面的个人复现确认。
+
+### 你亲自运行带界面仿真
+
+本轮不替你打开 GUI。稍后在**能正常显示 Gazebo 的 Ubuntu20 终端**中运行：
+
+```bash
+cd /home/pcz/PX4-RoboMaster
+python3 src/modules/arm_control/tests/grasp/run_full_arm_grasp.py gui_grasp_review_01 \
+  --calibration build/full_arm_grasp/full_calibration_05/calibration.json \
+  --grasp --retrieve --retrieve-route stow --gripper-p .045 \
+  --patch-radius-mm 4 --arrival-mm 15 --fsm --hold-seconds 120 \
+  --gui --gui-wait
+```
+
+已有 PX4/端口占用时脚本会拒绝启动，不会结束你的仿真。
+若案例目录已存在，换一个新编号，不能覆盖之前的实验。
+默认视角对准机身和机械臂。看到终端 `Press Enter to begin` 后，
+可以先在窗口调整/放大视角，再回终端按回车，才发自动抓取 START。
+等待期间物理与初始姿态保持仍在运行，并不是暂停物理；不会自动开始抓取。
+观察顺序：打开夹爪 → 靠近/微调 → 双侧闭合 → 侧向离台 → 抬高 → 收臂 → 保持。
+该演示机身锚定 world，**不会起飞**，没有点云/SUPER参与。
+无需另开 roscore/MAVROS，沿用 PX4—MAVLink—Gazebo 独立数据链。
+完成验收后脚本关闭自己启动的 GUI/后台进程；中途 Ctrl+C 同样清理。
+如果没有 DISPLAY/WAYLAND_DISPLAY，则提前报错；沿用你已有的 Ubuntu20 图形配置，
+不自动改显卡/显示服务，也不启动 Ubuntu22。
+
+### 按原路线的下一阶段
+
+先完成这一轮保持/反馈恢复回归与个人 GUI 复现，再进入飞行集成设计：
+1. 将 bench 的固定安装/真值对齐约束与飞行姿态/目标坐标输入分开，制定新 profile；
+   机身一解锁 bench 能力即失效，不能简单删 anchor 后继续用 bench START。
+2. 先测起飞与空载折叠臂保持，再做已夹持物体的低速飞行/扰动与返航保持。
+   这两项通过后再将“飞到抓取位 → 整臂抓取 → 回收 → 返航”串接。
+3. 明确命令送达/反馈丢失、人工接管/安全放置与带物故障责任；不做空中自动松爪。
+4. 最后接入点云目标估计、SUPER 接近规划与抓取姿态/全路径碰撞检查。
+
+此处是后续路线，不表示飞行或世界重置已经测试成功。上述“未提交”描述的是本轮实验结束时的状态；后续阶段提交见下节。
+本轮自行启动的 PX4/Gazebo/代理/观察器均已退出，4560/4562/11356 无监听；
+最终四仓库格式检查通过；当时尚未提交/推送，未结束其他用户进程。
+
+## 十、2026-09-30 阶段提交与飞行集成边界
+
+用户已在带界面仿真中目视确认方块被夹爪夹住。这是固定机身 bench 抓取演示的结果，
+不等同于飞行携物验证。提交前再次检查：18 项 Python 回归、16 项 C++ 状态机用例
+通过，相关仓库差异格式检查通过。
+
+按依赖顺序将本阶段实现分段提交：
+
+1. MAVLink 子模块：`e5daeeef`，SO101 抓取反馈消息定义。
+2. Gazebo Classic 子模块：`045351a`，接触反馈采集和发布。
+3. PX4 主仓库：`8d32e26c65`，反馈传输与子模块引用；
+   `459912e37a`，固定目标自动抓取状态机及故障退出测试。
+
+ROS 工作区 `/home/pcz/super_ws/src/so101_gazebo` 的控制插件改动按约定暂不提交；
+因此仅克隆上述三个 fork 仍不能重现完整的下位夹爪失联保持行为。
+后续如需跨机器复现，应单独处理该 ROS 工作区依赖。
+
+下一阶段先做飞行 profile：解除 bench 机身固定约束后，明确世界/机身/臂坐标系、
+目标输入和接管时序；从空载折叠臂起飞与悬停开始，确认动力学和关节保持稳定后，
+再做低速携物与返航。不要把当前 bench 抓取成功写成飞行抓取已通过。
