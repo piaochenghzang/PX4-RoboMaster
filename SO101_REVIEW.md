@@ -1054,7 +1054,8 @@ python3 src/modules/arm_control/tests/grasp/run_full_arm_grasp.py gui_grasp_revi
 1. MAVLink 子模块：`e5daeeef`，SO101 抓取反馈消息定义。
 2. Gazebo Classic 子模块：`045351a`，接触反馈采集和发布。
 3. PX4 主仓库：`8d32e26c65`，反馈传输与子模块引用；
-   `459912e37a`，固定目标自动抓取状态机及故障退出测试。
+   `459912e37a`，固定目标自动抓取状态机及故障退出测试；
+   `bc1fdaaad4`，整合说明文档。
 
 ROS 工作区 `/home/pcz/super_ws/src/so101_gazebo` 的控制插件改动按约定暂不提交；
 因此仅克隆上述三个 fork 仍不能重现完整的下位夹爪失联保持行为。
@@ -1063,3 +1064,498 @@ ROS 工作区 `/home/pcz/super_ws/src/so101_gazebo` 的控制插件改动按约�
 下一阶段先做飞行 profile：解除 bench 机身固定约束后，明确世界/机身/臂坐标系、
 目标输入和接管时序；从空载折叠臂起飞与悬停开始，确认动力学和关节保持稳定后，
 再做低速携物与返航。不要把当前 bench 抓取成功写成飞行抓取已通过。
+
+## 十一、2026-09-30 空载折叠臂起飞与定高基线
+
+新增 `src/modules/arm_control/tests/flight/run_empty_arm_hover.py`：
+使用生产 `yhang550` 模型，不加 bench 固定关节或方块；只启动 PX4、Gazebo、
+MAVROS 与 `super_flight_manager_node`，不发送 SUPER 目标。
+起飞前要求六关节相对折叠目标的最大误差 <0.05 rad、
+最大关节速度 <0.05 rad/s，连续保持至少 2 s 仿真时间。
+飞行中若折叠误差超过 0.10 rad 即中止，最终通过阈值为 0.05 rad。
+脚本拒绝已有 ROS/Gazebo/PX4 会话，不调用
+`start_super_sim.sh` 的全局 `pkill` 清理；失稳超过 25°、
+横向漂移超过 1.5 m 或 12 s 未爬升时提前退出。
+每轮独立目录记录 ROS 遥测、Gazebo/PX4 日志和结果摘要。
+
+模型 SDF 质量字段合计：机身与旋翼约 2.079 kg、雷达 0.200 kg、
+SO101 约 0.632 kg，共约 2.911 kg（未计嵌入模型中的其他小质量）。
+四电机的 SDF 标称上限为每台 1000 rad/s、力常数 8.54858e-6；
+理想静态总推力约 34.2 N，相对上述重量约 28.5 N，余量有限。
+这只是模型容量估算，不代表飞控输出一定等于该推力。
+
+第一次宽松起飞门槛下未能爬升，随后横滚和横向漂移快速增大。
+该轮 PX4 ULog 在 20–30 s 请求的竖直推力持续达到上限，
+2 号电机输出达到 1.0，分配器报告无法满足推力请求。
+起飞前实测角曾有约 0.08 rad 的最大折叠误差；实际解锁时已降到约
+0.01 rad，因此**不能仅凭此轮证明关节未收缩是唯一根因**。
+该轮已按确切进程号关闭，不将其当作 PID 调参依据。
+
+收紧“实测关节到位并静止”门槛后，三轮独立起飞与 1.5 m 定高均通过。
+每轮悬停 20 s；下表高度/倾角统计取稳定判定后的最后 15 s，排除前 5 s 过渡：
+
+| 案例 | 后 15 s 平均高度绝对误差 | 后 15 s 最大高度误差 | 后 15 s 最大倾角 |
+| --- | ---: | ---: | ---: |
+| folded_hover_foldguard_20260930_01 | 2.10 cm | 6.51 cm | 2.30° |
+| folded_hover_foldguard_20260930_02 | 0.95 cm | 3.03 cm | 2.05° |
+| folded_hover_foldguard_20260930_03 | 2.47 cm | 4.17 cm | 2.39° |
+
+三轮起飞前/悬停时最大折叠角误差约 0.011 rad。
+首轮成功案例的悬停阶段，四电机平均输出约 0.78–0.84，
+无电机达到 0.95，推力分配可满足请求；悬停推力估计收敛到约 0.80。
+因此当前空载定高不支持直接改 PID，但推力余量仍应限制后续载物和倾斜飞行。
+这些数据只证明空载折叠臂起飞/定高，**没有验证规划到点、目标切换、
+携物飞行、返航或自动抓取时机**。
+
+下一步单独运行 SUPER 目标到达与 `FINAL_HOVER` 切换，
+同时记录 SUPER 输出、MAVROS 转发设定点、实际高度、悬停推力和电机饱和。
+目前 `super_navigation.launch` 设 `goal_tolerance=0.50 m`；
+飞行管理器在轨迹超时且速度满足门槛时，直接将 hold 目标切到请求的目标坐标。
+这可能允许接近目标但仍有高度误差时发生目标阶跃，需要用过渡试验证实，
+不能把该现象预先归因于 PID。
+
+## 十二、2026-09-30 SUPER 轨迹结束与定点悬停高度验证
+
+本轮使用用户指定的 `/home/pcz/super_ws/src/super_px4_bridge/launch/super_navigation.launch`
+启动真实传感器适配器、SUPER、MAVROS 转发器和飞行管理器。
+没有伪造规划指令；仍为空载、折叠臂、自由飞行的生产 `yhang550` 模型。
+没有修改或提交 ROS 工作区源码、正式 launch/YAML、PID 或生产 SDF。
+
+### 验证脚本改动
+
+扩展第十一节的 `run_empty_arm_hover.py`，不另增说明文档：
+
+- `--super-goal DX DY Z`：稳定悬停后向 `/planning/user_goal` 发送真实目标；
+  XY 为相对当前本地位置的偏移，Z 为本地绝对高度，默认取 ENU 方向。
+- `--goal-body-frame`：将 XY 偏移按实测偏航旋转后再发送，减少初始大幅转向。
+- `--super-hold-yaw`：仅在案例目录保存 launch/YAML 实验副本，开启
+  `fsm.click_yaw_en` 与 `super_planner.goal_yaw_en`，目标朝向取发送时实测朝向。
+  **这不是正式配置修改，也不表示全轨迹偏航已具有硬限速。**
+- `setpoints.csv` 逐条保存规划器 `/planning/pos_cmd`、内部转发
+  `/super/setpoint_raw/local`、最终 `/mavros/setpoint_raw/local` 的位置、
+  速度、加速度、偏航、mask 和仿真时间；`events.jsonl` 保存状态切换与目标发送。
+  原有遥测、日志、ULog 和摘要仍保存在各案例目录。
+- 对比最后一个有效速度的跟踪指令与第一个忽略速度的终点悬停指令；
+  高度差 <=0.01 m 才通过连续性检查。飞行完成但存在阶跃的案例仍记为失败，
+  不把“最终能稳住”误当作“切换没有问题”。
+- 新增 SUPER 阶段本地高度低于 0.5 m 自动中止；保留原有倾角、横向漂移、
+  折叠关节误差和时钟停滞检查。清理只针对本轮启动的进程组。
+
+### 已定位的两类问题
+
+1. **规划目标与悬停目标不是同一坐标。**
+   `px4_sim.yaml` 固定 `fsm.click_height=1.5`；
+   `super_planner/src/super_core/fsm.cpp:184` 先覆盖请求 Z，再寻找非占据体素。
+   本轮 0.3 m 地图将该目标移动到体素中心，实际规划 Z 是 **1.65 m**。
+   管理器 `super_flight_manager.cpp:486` 结束时却将 hold XYZ 设回原始请求，
+   两者没有终点协调或平滑过渡。请求 1.50/1.80 m 分别产生 -0.15/+0.15 m 阶跃。
+   只关闭固定 click_height 仍不足以消除体素终点偏移。
+2. **正式配置的偏航末端变化与推力饱和相关。**
+   未启用目标偏航约束的两轮均未进入正常 `FINAL_HOVER`：
+   一轮下降触地使关节误差超限，另一轮终止于 `FAILSAFE_HOVER`。
+   第二轮相邻规划指令的绕角差/时间差最大约 39.27 rad/s（这是指令变化率，
+   不是实测机体角速度），电机输出达到 1.0，目标发送后前 4 s 的推力请求
+   可满足比例仅约 45%。`yaw_traj_opt.cpp:186` 的过速分支只打印警告，
+   `return false` 被注释，配置 `yaw_dot_max=1.0` 不是硬上限。
+   仅在实验副本开启目标偏航约束后，第三轮最大指令变化率约 0.40 rad/s，
+   同一前 4 s 窗口电机最大输出约 0.927，推力分配全部满足请求。
+   这支持先处理指令与推力余量，不能据此宣称所有飞行失稳只有一个根因。
+
+### 实际飞行结果
+
+案例目录统一为 `build/empty_arm_hover/<案例>/`。前三个成功走到终点的对照
+均启用**实验副本**目标偏航约束、沿发送时机身朝向偏移 0.3 m；其余配置不变。
+高度与倾角统计取 `FINAL_HOVER` 后 20 s 中的最后 15 s。
+
+| 案例后缀 | 请求 Z | 规划结束 → 悬停 Z | 后 15 s 平均/最大高度误差 | 后 15 s 最大倾角 | 结果 |
+| --- | ---: | --- | --- | ---: | --- |
+| `goal_yaw15_20260930_03` | 1.50 m | 1.65 → 1.50 m | 2.34 / 4.50 cm | 2.36° | 飞行完成，连续性失败 |
+| `goal_yaw18_20260930_04` | 1.80 m | 1.65 → 1.80 m | 0.80 / 2.00 cm | 1.64° | 飞行完成，连续性失败 |
+| `goal_yaw165_20260930_05` | 1.65 m | 1.65 → 1.65 m | 0.84 / 1.98 cm | 1.94° | 高度切换与悬停通过 |
+
+完整前缀为 `super_handover_`。原始配置失败案例：
+`super_handover_height15_20260930_01`（ENU X 偏移 0.7 m），
+`super_handover_forward15_20260930_02`（机身前方偏移 0.3 m）。
+第三轮切换后前 5 s 实测本地高度范围约 1.447–1.611 m。
+第五轮关节最大折叠误差约 0.0113 rad，未出现 NaN。
+全部高度误差以 MAVROS 本地高度为基准；Gazebo 世界高度另行记录，
+两者存在本地原点偏移，不直接相减判断飞控误差。
+
+### 复现与下一步边界
+
+关闭已有仿真后，在 Ubuntu20 中运行，例如重现高度连续正例：
+
+```bash
+source /opt/ros/noetic/setup.bash
+source /home/pcz/super_ws/devel/setup.bash
+cd /home/pcz/PX4-RoboMaster
+python3 src/modules/arm_control/tests/flight/run_empty_arm_hover.py \
+  super_handover_review_01 --super-goal 0.3 0 1.65 \
+  --goal-body-frame --super-hold-yaw
+```
+
+案例名必须新建，脚本拒绝覆盖结果，也不会停止已有用户会话。
+去掉 `--super-hold-yaw` 才使用正式 launch 原配置，不应直接把对照正例视为
+正式配置已修好。1.65 m 只是本轮固定高度/地图下的诊断对齐点，**不是通用修复值**。
+
+结论：本轮不调 PID。下一步应协调“请求目标—规划实际终点—终点悬停目标”，
+明确三维目标是否允许被覆盖/移动；悬停接管应先保持有效终点，若仍需回到请求点，
+用有界过渡并做安全检查，不直接阶跃。与此同时补足偏航指令连续性与硬限速，
+再复测不同高度、不同方向和连续目标切换。当前通过的是一轮短程空载高度切换，
+不是厘米级三维到位、长时间重复性、避障、携物或飞行抓取的验收。
+
+## 十三、2026-09-30 实际终点协调、连续接管与偏航限速
+
+本节修复第十二节定位的问题，使用正式 `super_navigation.launch` 复测；
+未使用诊断配置副本，未改 PID、质量/惯性、推力模型或 SDF 碰撞。
+
+### 修改位置与行为
+
+- ROS `super_px4_bridge/include/super_px4_bridge/command_transition.h`：
+  纯数学的平滑跟踪接管、五次终点停止轨迹、终点/轨迹时间判据、偏航限速器。
+  配套 `tests/test_command_transition.cpp` 检查起终点位置/速度/加速度、
+  过大目标投影、运动中断流、NaN、未到轨迹结束时间、跨 ±π 与暂停恢复，
+  并检查 1500 个偏航速度/内部加速度限幅步骤。`CMakeLists.txt` 接入测试。
+- ROS `super_px4_bridge/src/super_flight_manager.cpp`：
+  `WAIT_TRAJECTORY → TRACK_SUPER` 从此前实际发布的悬停指令起始，
+  1 s 连续混合到实时规划指令。持续输出仍为位置+速度，禁用加速度前馈。
+  最终 MAVROS 输出统一使用偏航限制 0.35 rad/s、内部加速度限制 0.50 rad/s²；
+  不直接透传规划器快速偏航阶跃。
+- 正常结束新增 `SETTLE_HOVER`：根据最后有效规划位置冻结实际终点，
+  经过 1 s 五次连续停止过渡；实际位置距离终点 <=0.20 m 且平移速度
+  <=0.25 m/s 持续 1 s，才进入 `FINAL_HOVER`。
+  最后指令必须已到达 `/planning_cmd/poly_traj` 提交的轨迹结束时间，
+  且终端速度 <=0.05 m/s、终点到原请求偏移 <=0.35 m、当前到终点 <=0.50 m。
+  这避免靠“速度小、离目标不远”把初始静止或中途断流误认为到点。
+  接管静止判定总超时为 6 s；不满足终止条件或未能稳定均进入 `FAILSAFE_HOVER`。
+- `/planning/resolved_goal`：latched 的 world `PoseStamped`，在稳定后发布
+  接受的终点，让后续任务区分请求目标与地图投影目标。
+  消费者必须按目标时间戳忽略上一目标 latched 消息；姿态字段是指令朝向，
+  当前成功判据未包含实测偏航精确到位。
+- ROS `super_mavros_bridge.cpp` 保留原始规划时间戳；管理器拒绝非有限、
+  错误坐标/mask、过期/逆序/旧目标指令，不再给旧包重打新时间戳。
+- 正式飞行配置移到 ROS `super_px4_bridge/config/px4_sim.yaml`，
+  launch 使用包内 `config_path`。设置 `click_height=-10` 保留三维请求高度，
+  同时启用 click/goal yaw 约束。外部 SUPER 原本的本地 YAML 已恢复到本轮前状态，
+  不依赖提交该未跟踪文件；用户原有 SUPER CMake 修改保持不变。
+- 现有 PX4 `run_empty_arm_hover.py` 增加解析终点记录、三维切换差值、
+  连续目标、偏航目标偏移、最终输出限速判定和中途断流注入。
+  通过 ROS 查找实际包路径；`PX4_DIR` / `ROS_WS` 指定工作区。
+  每轮记录 launch/YAML 快照。测试副本也纳入新的 ROS 仓库。
+
+正常任务时实际保持解析终点，**不把原始请求坐标强制改写到飞控目标**。
+异常断流的当前实测位置悬停是安全退出，不承诺该故障路径位置指令平滑。
+停止输出的判断仍基于 ROS 接收/源时间戳与已提交轨迹边界；未增加 MAVLink 协议字段。
+
+### 复测结果
+
+完整轨迹结束判据加入后，正式包内配置下两类正常任务和断流任务均通过：
+
+| 案例 | 请求/解析高度 | 正常接管 XYZ 跳变 | 高度统计 | 结果 |
+| --- | --- | ---: | --- | --- |
+| `super_handover_guard_sequence_20260930_08` 第一目标 | 1.80 / 1.95 m | 0 m | 稳定悬停后第 5–10 s 平均/最大误差 2.36/3.02 cm | 通过，随后发送第二目标 |
+| 同案例第二目标 | 1.20 / 1.35 m | 0 m | 终点悬停 20 s，后 15 s 平均/最大误差 1.35/2.57 cm | 通过 |
+| `super_handover_fixed_lateral_20260930_10` | 1.50 / 1.65 m；ENU X 偏移 0.7 m | 0 m | 终点悬停 20 s，后 15 s 平均/最大误差 1.08/2.12 cm | 通过，原先失稳路径未再触地 |
+| `super_handover_stream_loss_20260930_09` | 中途停止本轮转发节点 | 不适用（故障退出） | 故障悬停后约 5 s 速度 0.058 m/s、高度到 hold 误差约 0.95 mm | 进入 FAILSAFE，不误报 FINAL |
+
+第 08 轮两次跟踪入口的位置指令差也均为 0，初始速度指令为 0；
+整轮最终偏航指令变化率最大约 0.350002 rad/s（Float32 量化误差，
+测试允许 0.001 rad/s 数值容差），不是实测机体角速度限幅结论。
+该轮最后 15 s 最大倾角约 0.86°、最大折叠误差约 0.0114 rad。
+第 10 轮最后 15 s 最大倾角约 2.53°，未出现 NaN。
+两项 CTest（SO101 命令看门狗、SUPER 指令过渡）均通过；
+发布副本的独立 C++ 编译与上述回归也通过。
+第 06/07 轮是加入完整轨迹时间保护前的中间版本验证，也保留原始日志，
+不替代第 08–10 轮的最终验证。
+
+带偏航变化的升高窗口仍有短时单电机输出达到 1.0，约 91% 推力请求可完全满足。
+因此本轮解决的是接管/指令一致性，不宣称推力余量或载物能力已解决。
+所有高度误差相对接受的解析终点；**没有把 15 cm 地图投影偏移消除为精确到点**。
+
+### ROS 仓库与回退边界
+
+用户创建 `git@github.com:piaochenghzang/so101-px4-ros.git`，指定 `main`。
+2026-09-30 已按两段提交推送到该仓库：
+
+- `94344c8`：SO101 ROS 控制插件、看门狗/状态反馈及手动桥接基线。
+- `3227f21`：SUPER 终点悬停协调、平滑接管与偏航限速，含飞行验证脚本、依赖锁定和 README。
+
+远端 `main` 已核对为 `3227f217c1532aa5427c2095df0b815dd5ab2a36`，
+发布仓库工作区干净。WSL SSH 主机校验未配置，本次通过已有 Windows Git
+认证使用同仓库 HTTPS 临时推送地址；持久 `origin` 仍保留用户提供的 SSH 地址。
+没有重新初始化 PX4 主仓库，也没有提交/推送其本轮说明与测试脚本改动。
+
+三个 ROS 包与验证脚本整理到 `/home/pcz/so101-px4-ros` 发布副本，
+保留 `/home/pcz/super_ws` 原包位置、原 `so101_gazebo` 未提交索引和 SUPER 仓库。
+本次需回退的原文件备份在 PX4 `build/super_handover_backup_20260930/`，
+不会上传备份、build/devel、ULog、bag 或实验结果。
+新 ROS 仓库只有一个 README，记录安装/复现依赖和边界；详细飞行分析仍集中于本文件。
+SUPER 依赖固定为 `2ad3419c127a617c6d7df6925e81a14175a9c096`，
+无需把整个 SUPER 复制为另一套代码。
+
+下一阶段应先确认粗导航到解析终点后的坐标转换、机体/臂/物体相对位姿和
+抓取精确接近判据，再接自动抓取流程。当前 0.3 m 地图及 0.20 m 飞行位置判据
+不满足直接抓取对齐；也未验收障碍物环境中的接管混合轨迹安全性、长时间重复性、
+携物飞行或真实偏航到位。现阶段没有证据要求直接修改 PID。
+
+## 十四、2026-10-01 飞行抓取分阶段细化方案（待校核，尚未实现）
+
+本轮按用户要求先细化方案：只核对源码、展开 SDF、运行现有运动学/到位回归，
+不启动仿真、不发关节/飞行命令、不修改 PID、SDF 或抓取状态机。
+下一步先建设只读坐标与相对位姿核对，再逐步加入动作；不把设计门槛记为已验收。
+
+### 已确认的约束
+
+- 正式 `yhang550.sdf` 的 SO101 include 安装姿态为 `0 0 -0.05 3.1415926 0 0`。
+  安装变换最终以展开 SDF 和实际 base link 位姿交叉校核；不将子模型原文件的
+  model pose、include pose、机身局部原点或估计器原点简单叠加。
+- PX4 位置 IK 控制 `gripper_frame_link`，不是两指夹持中心，也不保证任意末端姿态。
+  当前 20 mm 方块的已验证参考点在 `gripper_link`：
+  `(0.0025, -0.000218, -0.088)` m；它是本碰撞代理的抓取参考，不是通用 TCP。
+  方块尺寸、指垫几何、开合角或抓取方向变化后必须重新核对。
+- `super_sensor_adapter.cpp` 将 MAVROS odometry 的 frame 名改为 `world`，
+  但没有做 Gazebo world 到 MAVROS local 的原点标定。因此相同 frame 字符串
+  不能证明两个坐标数值可混用；雷达外参及点云/odom 时间对齐也纳入只读核对。
+- 本机 MAVROS 为 1.20.1。其 odometry 位置/姿态使用 ENU / ROS base_link 约定，
+  twist 使用机体坐标；raw local setpoint 插件在发 MAVLink 前做 ENU→NED 变换。
+  不因消息枚举名 `FRAME_LOCAL_NED` 在 ROS 输入端再次手工换轴。
+  依据：[local_position 源码](https://github.com/mavlink/mavros/blob/1.20.1/mavros/src/plugins/local_position.cpp)、
+  [setpoint_raw 源码](https://github.com/mavlink/mavros/blob/1.20.1/mavros/src/plugins/setpoint_raw.cpp)。
+- 现有反馈采集器的 bench 有效性明确要求 `bench_anchor`、固定基座位置和近零机身速度。
+  原 profile 不能通过删除 anchor 或绕过 bench_valid 泛化成飞行 profile。
+- 本轮 102 组配置 FK 对照最大位置差 3.533 μm，旋转矩阵差 0.000025006；
+  原 ArrivalCheck 边界回归通过。这只是现有定义一致，不是飞行对齐通过。
+
+### 1. 坐标合同与目标含义
+
+固定符号：G=Gazebo 真值世界；L=MAVROS 局部 ENU（目前 SUPER 称 world）；
+B=无人机机体 FLU；A=SO101 base_link；H=gripper_link；E=gripper_frame_link；
+O=物体坐标系。`T_X_Y` 将 Y 坐标中的点转换到 X。
+
+统一计算链：
+
+`T_L_H = T_L_B * T_B_A * T_A_H(q_measured)`
+
+`p_A_object = inverse(T_L_B * T_B_A) * p_L_object`
+
+`p_H_object = inverse(T_L_H) * p_L_object`
+
+全程使用实测机身四元数和关节反馈，不能只用偏航、指令关节角或固定倒挂换号。
+真值物体输入必须显式经 `T_L_G` 转换；该变换用时间对齐的机体真值/估计位姿
+检查原点与朝向，不直接假定 identity。重置、估计器原点变化后标定作废。
+对象输入保留 target_id、来源、frame_id、源时间戳和 world_epoch；无变换则拒绝。
+
+IK 目标若从抓取参考点构造，必须同时明确一个可实现的 H 姿态：
+`p_A_E_des = p_A_object + R_A_H_des * (p_H_E - reference_H)`。
+仅有物体 XYZ 不足以唯一确定五关节抓取姿态；第一轮限定已验证的方块、
+接近侧和姿态族，不开放任意六自由度抓取。实测姿态不符合夹持几何则不闭爪。
+
+粗导航目标是机体位置，不是物体中心。例如预抓取姿态 q_pre 下：
+`p_L_B_des = p_L_object - R_L_B_des * (p_B_A + R_B_A * p_A_reference(q_pre))`。
+再加入经过净空校核的预接近偏移；解析导航终点只证明到达粗接近区，
+不能替代物体位置、精确机体目标或夹持参考点。地图投影后必须重算可达性。
+
+### 2. 分阶段执行与退出门槛
+
+| 阶段 | 本阶段做什么 | 通过后才进入下一步 |
+| --- | --- | --- |
+| A：只读坐标核对 | 采集机体/基座/夹爪/物体实测位姿，计算完整变换；输出 FK 与实际 link 残差、局部/真值原点差、参考点误差与时间差，不发布运动指令 | 不同位置、偏航及小倾角下变换闭环正确；时间、身份、重置负例被拒绝；不靠指令角证明正确 |
+| B：空载精接近 | 夹爪保持打开，机身定点；固定可达方块仅作观察目标，先验证预抓取与小步接近，不闭爪、不取物 | 请求/实际 IK 接受目标一致，姿态/净空符合模板，实际参考点对齐持续满足；取消或失联不继续接近 |
+| C：新飞行 profile | 保留旧 bench 回归；增加与固定世界位置无关的物体身份、接触、支持面与实际位姿能力校验 | 真正解除固定机身后，反馈健康和拒绝案例通过；没有删除旧安全检查冒充新能力 |
+| D：悬停抓取与回收 | 一次固定目标：闭爪→双侧夹持→离台→小幅抬高→回收→保持；暂不同时飞行换点 | 双侧接触、两侧力、离台和持续保持均有实际证据；无自动空中松爪，失败原因明确 |
+| E：已夹持低速携物 | 先短距离平移、轻微升降与停止，再返航；逐项验证推力裕度和不掉落 | 无持续饱和/高度失守、目标丢失或异常分离，取消/链路故障能安全锁存 |
+| F：完整 demo | 固定物体输入→粗导航→精接近→抓取→回收→返航 | 分阶段事件、目标身份和故障日志完整；再替换为点云目标估计 |
+
+每阶段先记录正例，再记录负例；控制路径优先分工为“机身保持、机械臂微调”，
+不同时让两个位置环追同一个夹持误差。若机械臂余量不足，先退回预接近位，
+收臂后单独重定位机体，再重新评估；不能在物体接触时静默重规划机体。
+现有每条 IK 请求最多 20 mm 的限制保留；近物体小步先沿用 bench 已验证的
+不超过 3 mm / 0.5 s 节奏，核对实际 accepted_target，不把裁剪当接受。
+
+### 3. 接近、闭爪与抓取成功分开判定
+
+以下是第一轮候选门槛，需用阶段 A/B 的采样、噪声和漂移结果校核，
+不是放宽既有严格到位，也不是当前已通过的飞行验收：
+
+- 输入健康：关节反馈年龄 <0.2 s；机身/物体位姿年龄拟 <0.1 s；
+  参与变换的源时间差拟 <=20 ms，按共同时间插值或拒绝，不用接收时间伪造同步。
+  非有限、无效四元数、旧目标、旧 epoch、重复/逆序帧均不得推进连续计时。
+- 机身稳定：平移速度拟 <=0.05 m/s、角速度 <=0.10 rad/s、
+  滚转/俯仰绝对值 <=3°、实测偏航到设定朝向差 <=3°，连续 1 s。
+  这些条件只是稳定门槛；不能因偏航误差 3° 就认为毫米级夹持已经对齐。
+- 机械臂到位：原严格 ArrivalCheck 保留，末端 <=5 mm、前五关节差 <=0.03 rad、
+  速度 <=0.05 rad/s，连续 0.5 s，夹爪另判。
+- 可闭爪：实测 `p_H_object-reference_H` 范数拟 <=3 mm，持续至少 0.5 s，
+  期间每个有效样本满足门槛；姿态属于已验证夹持模板、物体落在开口有效区域，
+  接近路径与机体/支架/非夹指净空合格。候选姿态容差需按几何测定，不凭空指定。
+  普通 0.20 m FINAL_HOVER 或 IK 解误差小均不能给出 CLOSE 许可。
+- 夹住：沿用同目标双侧接触窗口 >=90%、两侧法向力各 >0.01 N、
+  夹爪速度 <0.02 rad/s 及反馈健康；实际闭合角未到目标不代表失败，空爪角到位不代表成功。
+- 抓起并保持：实际离台且抬高 >=25 mm；持续双侧接触、无支持接触/明显分离，
+  保留小滑移为诊断，不为了漂移指标牺牲“能抓起、不掉落”的 demo 目标。
+
+计时使用 sim-time；新目标、坏样本、失联或时钟重置立即清除到位积累。
+超时不得自动闭爪；无接触时退出接近并保持安全位置，有载荷时保持有界夹爪目标，
+接触反馈失联记 UNKNOWN，不猜测为空载，不自动 RESET/松爪/重新抓取。
+墙钟无进展保护只报告 STALLED，不能伪造物理失败或成功。
+
+### 4. 下一小步的文件与验证边界
+
+优先在 ROS bridge 包中增加可单测的坐标/判据函数和只读观察入口，
+配套一个可定位实际 ROS 包的实验脚本；安装外参、参考点和候选阈值集中配置。
+先用显式标记的 Gazebo 真值作为对象来源，后续再替换点云估计。
+只读入口不能发 `/mavros/setpoint_raw/local`、关节命令或抓取 START。
+这一步不新增 MAVLink 消息，不改 arm_control 行为，不绕过 bench_valid。
+涉及状态机或飞行权限的新接口到阶段 C 再单独设计/审阅。
+
+必测：变换正反往返、不同偏航/倾角、倒挂安装、非零局部原点、FK 实测残差；
+错轴/错 frame、缺 link、NaN、旧目标 latched 消息、不同源时刻与世界重置。
+暂拟同步真值/FK 残差 <=2 mm 为诊断门槛；超差先区分模型定义、时间错位和
+状态估计误差，不扩大对齐容差掩盖问题。纯数学容差另设，不拿毫米门槛检验数学函数。
+之后才运行无闭合的固定目标悬停接近，记录精接近正例及“不准闭爪”的负例。
+
+仍保持单一集中说明；ROS 发布副本与实际 `/home/pcz/super_ws` 包分开，
+实现时需核对同步差异。本轮没有新的 Git 提交/推送；上次发布的 main 保持干净。
+
+## 十五、2026-10-01 只读坐标观察入口与被动几何核对
+
+按审核后的范围实现观察，不接管飞行、不发关节/闭爪/抓取 START，不修改 PID、
+生产 SDF、现有 SO101 控制插件、MAVLink 或 arm_control/bench 抓取行为。
+本阶段完成的是只读入口及被动几何核对；真实 MAVROS 配准、飞行姿态下的动态反馈
+和任意非零关节姿态的 live 验证尚未验收，不能直接进入 CLOSE。
+
+### 修改清单与只读边界
+
+实际源码位于 `/home/pcz/super_ws/src/super_px4_bridge`，本轮同步到 ROS Git 发布副本：
+
+- `msg/CoordinateTruth.msg`、`src/coordinate_truth_plugin.cpp`：新增 ROS 诊断快照和
+  Gazebo WorldPlugin；在同一 `WorldUpdateEnd` 读取真实 link WorldPose 与关节角/速度，
+  时间戳取 world SimTime，不将 ROS 接收时间当采样时间。只向 `/grasp_audit/truth` 发布。
+  包含 source_instance、world_epoch、实体 ID；时间回退、WorldReset 或实体变化使 epoch 作废。
+  static 模型的关节读数明确无效；不设置关节角、位姿、速度、力矩或 PID。
+- `scripts/grasp_audit/geometry.py`：独立坐标数学、真实角度 FK、安装/工具/雷达链残差、
+  物体在臂基座与夹爪坐标中的位置。全四元数姿态，不采用固定倒挂换号。
+  源时间插值要求两侧样本包围，最大偏离 20 ms，不外推、不重打时间戳。
+- `scripts/observe_grasp_frames.py`：只订阅诊断真值、MAVROS odom、ROS joint_states、
+  导航请求/解析终点和 clock，写 JSONL；没有 Publisher 或 ServiceProxy。
+  拒绝错误 frame、缺 link、坏四元数/NaN、重复/过期/未来包、旧目标及身份/时钟变化。
+  预留 40 ms 接收窗口取得 odom 两侧源时间样本。
+- `config/grasp_frame_audit.yaml`：集中安装变换、PX4 FK 常量、20 mm 方块参考点及诊断门槛。
+  FK 常量与原 PX4/SDF 链一致性测试交叉核对，不放宽 2 mm 几何残差门槛。
+- `scripts/run_readonly_frame_audit.py`：隔离被动场景，独占 11357/11457；发现原仿真则拒绝启动。
+  在新的 build 目录生成正式模型展开副本，移除控制/传感插件、sensor 和 collision，
+  world 重力为零，车辆保持 dynamic 以读取真实 ODE 关节；方块为 static 观察目标。
+  不启动 PX4、MAVROS 或 SUPER，不调用 spawn/set/reset 等模型操作，不发送动作。
+  只清理自己启动的 roscore、gzserver、观察器进程组，记录 ROS 图和库哈希。
+- `tests/test_grasp_frames.py`、`tests/test_frame_observer.py`：11 项数学/拒绝边界测试与
+  7 项无 master 的回调测试。构建接入新诊断消息、采样器、Python 安装和 CTest，
+  现有飞行节点与看门狗回归保持通过。
+
+`close_permitted` 在所有记录中始终为 false。
+`aligned_geometry_only` 只表示几何距离符合诊断门槛，不包含姿态模板、净空、
+机身稳定、严格到位或真实接触许可，不得供状态机直接启动闭爪。
+无对象时输出 TARGET_MISSING；无 MAVROS 时输出 ODOM_NOT_BRACKETED / local_valid=false，
+不假设 Gazebo world 与 ROS local 的原点相同。
+
+### 局部坐标与旧关节话题的测量边界
+
+有真实 MAVROS 数据时，对同一源时刻的机体真值/估计构造 G→L 配准候选，
+连续 10 个一致样本后冻结一份实际观测变换；之后只记录残差，不每帧重新拟合以消除误差。
+这是仿真诊断配准，不是独立标定或现实感知能力。身份变化/重置清空配准。
+`local_valid` 表示可完成已配准转换；`local_precision_consistent` 另检查残差是否达到
+毫米门槛，二者不等价。配置不一致、时间错位或输入失联不产生抓取许可。
+
+旧 `/so101/joint_states` 在 UpdateBegin 用 ROS clock 打时间戳，未在本轮修改。
+与物理步读数的对照明确标注 APPROXIMATE_ROS_CLOCK，记录时间差和角差；
+主要 FK 验证使用同一物理步真实关节读数，不把旧话题最近一包当精确同步角度。
+雷达项用实际雷达 link 加配置 sensor offset 校核名义测量原点，
+不表示点云/odom 实际同步、扫描畸变或目标检测准确度已经验证。
+物体坐标是测试方块的 model 原点（该方块为中心），不是任意物体自动估计的抓取点。
+
+### 测试夹具发现与修正
+
+初次采用整机 static 场景：零偏航似乎通过，一次偏航测试得到约 17.47 mm 超差。
+追溯原始角度后发现 static Joint::Position 缓存中出现 `5e-310` 等非实际编码器数值。
+[Gazebo Classic Joint::Position 源码](https://github.com/gazebosim/gazebo-classic/blob/gazebo11/gazebo/physics/Joint.cc)
+对 static 模型返回 staticPosition 缓存，而不是物理引擎读数；其初始化/使用路径
+不能保证未调用设置操作的 static 夹具有可用角度。采样器因此拒绝 static 关节读数，
+没有用 SetPosition 初始化来让它通过，也没有把这种测试夹具问题套回历史夹爪 NaN 原因。
+早期 `readonly_*` 场景不计入最终 FK 验收；保留日志供追溯。
+
+最终使用 dynamic、零重力、无接触和无控制插件的被动场景，既无动作指令，
+又保留真实 ODE 关节测量。以下每轮观察约 4 秒 sim-time：
+
+| 案例，位于 PX4 build/frame_audit | 有效样本 | 验证结果 |
+| --- | ---: | --- |
+| `passive_baseline_20261001_04` | 195 | 零偏航坐标链一致 |
+| `passive_yawed_20261001_04` | 194 | 非零位置与偏航 1.2 rad 下坐标链一致 |
+| `passive_tilted_20261001_04` | 190 | roll=0.08、pitch=-0.05、yaw=-0.7 rad 下坐标链一致 |
+| `passive_missing_target_20261001_04` | 195 | 缺对象明确报缺失，无对齐/闭爪许可 |
+| `passive_wrong_mount_20261001_04` | 195 | 仅诊断配置故意改错安装 roll；chain_valid=false、观察器返回 2，被测试器认定正确拒绝 |
+
+上述各组真实 FK 最大位置差约 4.21 μm，姿态角差约 1.81e-5 rad；
+正确安装/雷达链的位置残差在浮点数舍入范围。2 mm 门槛没有放宽。
+偏航与倾角是不同初始场景，不是在运行中发送移动或关节指令。
+零重力被动测试不证明重力负载、接触、折叠保持、飞行稳定或抓取。
+最终增加不回退时间的 WorldReset 保护和被动位移检查后，
+`passive_final_20261001_05` 倾角场景再次通过，195 个有效样本，
+机体位置漂移和关节角漂移均为 0；FK 残差保持上述水平。
+四项 CTest（看门狗、指令过渡、11 项坐标数学、7 项观察回调）全部通过；
+Git 发布副本独立运行两组 Python 测试也通过，并与 live 包内容一致。
+本轮自行启动的 roscore/gzserver/观察器均已退出，没有用户进程被结束。
+
+纯数学测试覆盖 100 组非零关节角/完整姿态、变换往返、错轴/错安装、
+缺 link、坏四元数、NaN、目标缺失、旧 latched 目标、时间插值、身份/时钟重置。
+回调测试核对非零局部原点、错 frame、错时刻、过期/重复/未来真值、配准清除，
+并断言观察器不创建 Publisher/ServiceProxy。非零局部原点属于合成回归，
+没有发布伪造 MAVROS 数据冒充实测；真实 local_frame_tested=false。
+
+### 复现与下一小步
+
+```bash
+source /opt/ros/noetic/setup.bash
+source /home/pcz/super_ws/devel/setup.bash
+cd /home/pcz/super_ws
+catkin_make -j4 so101_coordinate_truth
+cd build
+ctest --output-on-failure -R 'grasp_frame|super_command_transition|so101_command_watchdog'
+rosrun super_px4_bridge run_readonly_frame_audit.py --name my_frame_audit_01 --case tilted --duration 4
+```
+
+案例名称需未使用；结果在 `/home/pcz/PX4-RoboMaster/build/frame_audit/`，
+`PX4_DIR` / `ROS_WS` 可指定仓库/工作区。脚本通过 rospkg 找到实际包。
+原正常仿真中只读观察要求 world 内显式加载以下插件，不加载控制器或改变模型：
+
+```xml
+<plugin name="coordinate_truth" filename="libso101_coordinate_truth.so">
+  <vehicleName>yhang550</vehicleName>
+  <targetName>test_cube</targetName>
+</plugin>
+```
+
+须有 gazebo_ros API、use_sim_time=true 和 devel/lib 插件路径。
+本轮没有修改生产 world/start_super_sim.sh 来自动加载它。
+world 中插件已加载后，观察器可独立运行：
+
+```bash
+rosrun super_px4_bridge observe_grasp_frames.py --output /tmp/my_grasp_frames_01.jsonl --duration 20
+```
+
+输出文件不能已存在。没有源或时钟无进展时有界结束为 STALLED/WALL_TIMEOUT，
+不是把卡住当物理 NaN。真实方块未生成时不替用户 spawn，不编造 object_pose。
+下一小步仍是实际仿真中的只读 MAVROS/真值配准与不同实际关节姿态核对；
+需在可用原场景下采样，不自动发送动作来制造正例。通过后再设计空载精接近。
+上一轮结束时新增源码保留为可审阅的未提交改动。
+
+### 本轮按授权归档提交（2026-10-01）
+
+ROS 发布仓库 `/home/pcz/so101-px4-ros` 已将上述只读采样器、观察器、
+被动验证和回归测试合为一个可独立构建的提交：
+`05f3c2c5c5d4681ff66faa5381b8359714f02bcc`
+（`feat: add read-only grasp coordinate audit and passive validation`）。
+提交前 live 包与发布副本一致，diff --check 通过，相关 CTest 4/4 通过。
+本集中说明同时归档此前阶段 11–15 的说明更新，不包含新的飞行控制修改。
+PX4 中此前未跟踪的 `src/modules/arm_control/tests/flight/` 保留，
+不混入本次只读功能提交。此次仅本地提交，未推送。
+后续正常仿真只启动未解锁 PX4/Gazebo/MAVROS，保留原有初始关节保持，
+不启动自动起飞/导航管理器，不发送运动或闭爪命令；实际核对结果另行记录。
