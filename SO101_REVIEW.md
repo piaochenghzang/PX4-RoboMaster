@@ -1735,3 +1735,291 @@ ROS 本地仓库已提交 `78c9628de0abd61402081edf2016b7b184c9b17e`
 提交前 CTest 再次 4/4 通过。本说明同时归档阶段 16–17 的实测与修改记录，
 与 ROS 修复分开提交；未混入此前未跟踪的 flight 测试副本，未推送。
 后续只读传感器/EKF 检查另行记录，不修改上述已验收的观察器或控制参数。
+
+## 阶段 18：传感器/EKF 状态与原点重置只读核对（2026-10-07）
+
+上一部分已按授权分段本地提交：ROS `78c9628de0abd61402081edf2016b7b184c9b17e`，
+PX4 集中说明 `9653ccd31fa3ab1d318592c8b92230731a559cd1`；均未推送。
+此阶段只读分析阶段 17 已保存的完整 ULog、原始 MAVROS 数据和当前仓库源码，
+没有必要重新启动仿真，没有参数写入、运动/闭爪命令或生产源码改动。
+只访问 Ubuntu-20.04。新增分析工具与结果位于
+`build/frame_audit/ekf_readonly_20261007_01/analyze.py` / `result.json`，
+保存源 ULog SHA256、字段清单、重置时间线、传感器/融合统计和所读源码指纹。
+
+### 1. 原点重置与连续漂移已分开
+
+稳定窗口 36.544–76.409 s 的 4984 条 vehicle_local_position 中：
+xy/z/vxy/vz/heading reset counter 分别一直为 `3/2/2/1/1`；
+ref_timestamp=`1185000 us`、参考经纬度和高度均未变化。
+主 EKF 为 instance 0，selector 在窗口内未切换；实际日志记录的是
+estimator_odometry（多实例 EKF 输出），不是 vehicle_odometry。
+其 3987 条窗口数据 reset_counter 一直为 9，没有重置事件。
+不能把没有记录 vehicle_odometry 误判为没有估计里程计输出。
+
+日志开始后可见的启动事件：
+
+| 仿真时刻 | 事件 | 主 EKF estimator_odometry 计数变化 |
+|---|---|---|
+| 1.337 s | 全球参考首次建立，XY/Z 计数改变 | 4 → 6 |
+| 1.633 s | XY/水平速度计数改变 | 6 → 8 |
+| 9.593 s | 航向计数改变 | 8 → 9 |
+
+这些均发生在正式窗口之前。首次参考建立前 ref_lat/lon/alt 是未初始化值，
+分析结果明确用 null 记录，不将其当作 Gazebo 求解器 NaN。
+delta_z=-488.3616 m 是当次启动高度参考变换的残留记录；没有计数改变时，
+不能仅凭单帧仍包含这一 delta 就断言刚发生了同样跳变。
+结论：本次稳定窗口的位置/姿态误差是连续估计变化，不能用反复原点 reset 解释。
+
+### 2. 找到 at_rest=false 的直接机制线索
+
+事件型 sensor_selection 在 0.609 s 选中 accel/gyro device 1310988，窗口内无切换；
+对应 vehicle_imu_status instance 0 的 device ID 相同，传感器速率字段均为 250 Hz。
+land_detector 的窗口快照 landed=true、ground_contact=true、水平/垂直/旋转
+movement=false，但 at_rest=false；EKF 的 cs_vehicle_at_rest 同样为 false。
+这些状态来自不同判据，不是互相矛盾的同一个运动标志。
+
+`LandDetector.cpp:246` 的静止判据检查陀螺振动指标 >0.02，或加速度振动指标 >1.2；
+每次超限刷新最后运动时刻，超过 1 s 未再超限才能恢复静止。
+`VehicleIMU.cpp:742` / `:751` 表明指标是相邻传感器向量差的模长再低通，
+不是实际位移，也不能直接当成机械振动幅度。
+
+| 指标 | 本窗口已记录快照 | 对比静止门限 |
+|---|---:|---|
+| gyro_vibration_metric 中位/最大 | 0.021747 / 0.023872 | 39/40 个快照 >0.02 |
+| accel_vibration_metric 中位/最大 | 0.36550 / 0.42874 | 均 <1.2 |
+| 加速度 clipping、传感器错误计数 | 0 | 未见饱和/错误证据 |
+
+日志对此话题按 1000 ms 间隔记录，39/40 是快照比例，不是全部运行周期的比例。
+仍足以与陀螺指标频繁触发静止抑制的代码机制相互支持，不能据此精确重建每个
+高频触发时刻，也不能认定它是全部漂移的唯一根因。
+sensor_combined 陀螺各轴标准差约 0.0165–0.0169 rad/s；加速度约
+0.302/0.393/0.279 m/s²。当前 SDF 没有显式覆盖 IMU 噪声参数，源码默认 gyro
+noise density=0.0008726646、accel=0.00637，随机游走/turn-on bias sigma 为 0。
+默认噪声与接触/关节/imu_link 高频运动各自的贡献还没有做单因素隔离，
+源码默认值也不冒充本轮直接读取的插件内部运行参数。
+
+静止状态不成立会阻止 ZeroGyroUpdate 进入静止陀螺偏置观测；
+但不能声称仅修复 at_rest 就必然启用零速度约束：ZeroVelocityUpdate 还要求
+没有有效垂直速度辅助或倾角尚未对齐。本次 GNSS 速度融合有效、倾角已对齐，
+因此需要分别检查这些约束，不应直接放宽静止门限强行让状态通过。
+
+### 3. 融合及传感器链不是毫米级真值定位
+
+GNSS 位置/速度、GNSS 高度、气压高度、磁航向融合标志有效；外部视觉
+位置/速度/高度/偏航融合标志均为 false。日志参数 EKF2_HGT_REF=1（GPS），
+EKF2_GPS_CTRL=7、EKF2_BARO_CTRL=1、EKF2_EV_CTRL=0。
+SDF 的 send_odometry=1 只是 Gazebo→PX4 里程计报文封装方向的选择，
+不等于已经有外部里程计生产者，更不等于 EKF 开启了外部视觉融合。
+PX4→MAVROS 的估计 ODOMETRY 输出是另一条方向相反的链。
+
+本窗口 filter_fault_flags、GPS 检查失败标志、time_slip 均为 0；
+已记录的 heading/velocity/position/height test ratio 最大约
+0.0436/0.1448/0.0232/0.0208，未见这一窗口内大创新拒绝证据。
+但 EKF 的 eph 约 0.443–0.505 m、epv 约 0.277–0.304 m，valid=true
+不能解释为毫米精度。GNSS 实测经纬度在该窗口量化值不变，气压高度标准差
+约 0.0493 m；磁偏置 X 估计从约 +0.00744 G 变为 -0.01885 G。
+磁偏置变化与航向变化是后续只读核查线索，不是已经证明的唯一因果关系。
+
+本轮再次用这份 ULog 与同次 MAVROS 原始记录进行 1194 个源时间配对，
+支持时差最大 4 ms。NED→ENU 后位置差中位 0.294 mm、最大 1.428 mm；
+偏航差最大 0.001265 rad。这继续支持大误差已经存在于 PX4 估计，
+而非 ROS 转发引入数十厘米轴错配。没有关闭噪声或注入真值来消除误差。
+
+### 4. 在线重置元数据下一步边界
+
+源码确认：EKF2 的主 estimator_odometry reset_counter 为姿态、位置和速度
+重置计数合成；EKF2Selector 转发时另维护自身计数，故主 EKF 与最终 MAVLink
+计数不保证数值相等，应检测同一输出流的变化、回绕及启动世代，不能要求等值。
+MAVLink ODOMETRY 明确发送 reset_counter，而 LOCAL_POSITION_NED 没有该字段；
+当前 ROS nav_msgs/Odometry 同样没有 reset-counter 字段。
+现有观察器 estimator_reset_metadata_available=false 仍是准确状态，没有改成 true。
+
+建议下一小步只读补采：同源 IMU link 角速度/加速度真值与传感器输出，
+并核实 `/mavlink/from` 原始 ODOMETRY 的 sysid/compid、源时间和 reset_counter
+是否实际可用，再设计失联/重启/回绕时清除配准的元数据订阅回归。
+未接入或失效时必须明确输出未知，不编造 counter=0。
+先区分模型接触高频抖动与传感器噪声，再决定是否另行授权单因素参数试验；
+本轮不修改 PID、传感器噪声、EKF 融合参数或闭爪流程。
+此阶段仅新增离线 build 产物与本说明记录，保留待审阅；没有新增提交或推送。
+
+## 阶段 19：无雷达组合模型最小抓取 demo（2026-10-07）
+
+本轮按用户重新收束的主线，停止扩展传感器/EKF 小方向，完成一次实际抓取。
+直接复用已有组合模型、IK、固件自动抓取状态机和真实接触反馈，未重写控制器。
+范围是固定无人机、固定可达方块的台架 demo：无人机在世界 Z=1.2 m 处用
+bench_anchor 固定，机械臂正常运动；方块为 dynamic，不绑定、不传送、不删除支撑。
+不解锁/飞行，不启动雷达、ROS、MAVROS 或 SUPER，不将该结果称为悬停抓取。
+
+### 修改与入口
+
+仅改 `tests/grasp/run_full_arm_grasp.py` 和 `test_full_arm_grasp.py`：
+新增 `--no-lidar`，只从实验副本移除 velodyne link/sensor 和相关 mount joint，
+保留机械臂安装与 PX4 IMU/GPS 等必要仿真传感器。生产 SDF/子模块/ROS 库不变。
+校准记录新增 lidar_enabled，拒绝雷达配置不同的校准文件；
+同时拒绝已有 gzserver/gzclient，不按进程名清理他人仿真。
+使用既有 bench_cube20 配置：20 mm/10 g 方块，夹爪 P=.045、原力矩上限 .01 N·m，
+指面抗扭 patch=4 mm、coefficient=.8，ODE quick/40/1 ms。
+这些是此前已验证的台架配置，不是本轮新增 PID/摩擦参数搜索，也不改飞行世界。
+场景生成/检查 Python 回归 19 项通过，纯状态机/反馈 C++ 回归 16 项通过。
+
+状态机入口为 `arm_control grasp_start bench_cube20 10`；脚本只发送一次 START，
+后续运动均由固件执行：PRECHECK→APPROACH→ALIGN→CLOSE→VERIFY→
+EXIT_SUPPORT→LIFT→RETRACT_CLEAR→RETRACT→SETTLE→HOLD→DONE。
+目标坐标是 SO101 base_link、单位 m；模板接近点 (.17,.035,.05)，
+校准名义 pickup 点 (.18,.015,.07)，最终收回点 (.12,.015,.03)。
+闭爪前按实际夹指参考点进行相对位置微调，连续三次满足 3 mm 对齐条件，
+再通过双侧接触/法向力确认夹持，不靠夹爪到达空载闭合角来判成功。
+
+### 本次位置、姿态与结果
+
+新校准案例 `demo_combo_nolidar_cal_20261007_01` 没有方块，完成 IK 实际 pose 校准。
+PX4 FK 与实际工具位置差约 0.0375 mm；校准阶段名义 EE 误差 13.54 mm，
+只满足既有 benchNear，不冒充该阶段严格到位。之后 ALIGN 独立核对真实对齐。
+方块实际放置点：世界 (0.183279,-0.005130,1.064362) m，
+对应本固定安装的臂基座 (0.183279,0.005130,0.085638) m。
+方块 RPY=(-2.586224,-0.025376,1.557754) rad，按本次测得夹指姿态设置；
+这是固定物体姿态模板，不声称任意物体/任意 6D 姿态抓取已经通过。
+
+完整抓取案例 `demo_combo_nolidar_grasp_20261007_01`：
+
+| 验收项 | 实测 |
+|---|---:|
+| 进入闭爪时真实对齐误差 | 约 1.60 mm |
+| 最终状态 | DONE / SUCCEEDED / HELD，fault=0 |
+| 收回后独立无支撑保持 | 11.913 s（请求 10 s，加完成后继续观察） |
+| 保持期间最低实际抬高 | 40.29 mm |
+| 双侧接触比例 | 100% |
+| 方块—支撑／非夹指／支撑—臂接触 | 均为 0 |
+| 两侧平均法向力 | 0.15947 / 0.15994 N |
+| 平均竖直接触合力／物重 | 0.09664 / 0.098066 N |
+| 保持末期相对滑移 | 0.353 mm（记录，不作为额外调参方向） |
+| 无雷达、动态方块、未解锁、完整阶段及物理验收 | 独立检查全部通过 |
+
+全过程约 78.5 s 仿真时间、80.8 s 墙钟。结果 success/grasp_validated=true，
+strict_retention_passed=true；这个 strict 是保持漂移的独立诊断，不表示整个
+接近阶段均达到严格 EE 判据。最终收回/HOLD 的 strict_position_reached=true。
+ULog 独立核对全程未解锁/未起飞；物体有限、遥测时间单调，未观察到 NaN。
+本轮进程已自行退出，仅清理本轮启动的进程。
+
+### 复现（名称必须未使用）
+
+```bash
+cd /home/pcz/PX4-RoboMaster
+python3 src/modules/arm_control/tests/grasp/run_full_arm_grasp.py demo_cal_new \
+  --calibrate --no-lidar --gripper-p .045 --patch-radius-mm 4 --arrival-mm 15
+python3 src/modules/arm_control/tests/grasp/run_full_arm_grasp.py demo_grasp_new \
+  --calibration build/full_arm_grasp/demo_cal_new/calibration.json \
+  --no-lidar --fsm --grasp --retrieve --retrieve-route stow --hold-seconds 10 \
+  --gripper-p .045 --patch-radius-mm 4 --arrival-mm 15
+```
+
+若想亲自看界面，第二条增加 `--gui --gui-wait`；图形 WSL 终端中运行，
+界面准备完成后按回车才发送 START。必须先退出已有仿真；脚本不会代为全局杀进程。
+本次产物统一在 `build/full_arm_grasp/<case>/`，包括校准、场景、manifest、
+真实 pose/contact CSV、阶段事件、PX4 状态和 ULog；抓取案例另有独立
+`verify_demo.py` / `demo_checks.json`，检查全部通过。
+
+结论：无雷达、固定无人机的组合模型最小抓取闭环已实际跑通。
+不要求为微小滑移继续调参；下一阶段再设计悬停版抓取入口和安全门控。
+当前 bench_cube20 的能力检查依赖固定锚点，不能直接解除锚点后用同一 profile
+冒充飞行抓取；悬停抓取与携物飞行仍未验收。
+阶段 19 结束时改动留待审阅。按用户随后授权，测试入口/回归已单独本地提交
+`59bc0e73ca7b0f984226b8e661f6a4e8683ad7ab`
+（`test: add lidar-free combined-model grasp demo`），提交前 Python 回归再次 19/19 通过。
+阶段 18–19 记录及以下设计另作说明提交，未推送；未跟踪 flight 副本不改动。
+
+## 阶段 20：悬停版抓取入口与安全门控设计草案（2026-10-07）
+
+本节只有设计：没有实现 hover profile、解除锚点、发送动作或试飞。
+用户此次授权提交草案不等于授权执行飞行。当前可运行、已验收的仍是阶段 19 台架 demo。
+
+### 主线与入口
+
+第一版仍只做固定 20 mm/10 g 方块、固定偏航、无雷达、无 SUPER/避障、Gazebo 真值
+相对定位的 SITL demo。航控仍使用原 PX4/MAVROS，不向 EKF 注入真值、不调飞行 PID。
+不先扩展任意物体、任意姿态、返航或携物航线。
+
+保留 `bench_cube20`（profile 1）及其固定锚点/坐标/物理配置校验；
+拟新增独立 `hover_cube20_v1`（profile 2，待实现注册），不把 CAP_BENCH 伪装成有效。
+当前 CLI/反馈校验只接受台架 profile，新的入口现在不存在，不能直接执行。
+原有 ARM_JOINT_COMMAND/STATUS、bench 请求/反馈语义与枚举编号不改写。
+
+最小控制分工：
+
+1. 专用 demo 协调器复用现有飞行管理器起飞/定点悬停，获取匹配目标的抓取悬停租约。
+2. 飞行管理器是唯一飞行设定点发布者；租约存续时锁定位置/偏航目标，拒绝新的
+   导航目标，不允许 pending_goal 或 SUPER 回调切换航线。完成但仍 HELD 时也不解锁导航。
+3. ArmControl 是唯一机械臂目标发布者；接受一次匹配任务/profile/目标的 START 后，
+   复用现有 APPROACH→ALIGN→CLOSE→VERIFY→离台→回收→HOLD，重复 START 仍 BUSY。
+4. Gazebo collector 只读真实 pose/contact，增加同物理步悬停几何上下文；
+   原接触/力/物体字段可以复用，但台架 world +Y clearance 不改名充当三维净空。
+   新上下文单独携带体/臂/物体姿态、机体速度/角速度和三维净空有效性。
+
+悬停租约是持续刷新的任务授权，不是永久 hover_ready 布尔值；任务 ID、profile、
+目标身份、源时间/序号/世代均须匹配。旧 latched 数据或转发旧包不能续期。
+具体消息布局/编号和本机 SITL 入口实现时再校核，不能绕过现有双向链直接发关节目标。
+
+### 坐标与路径
+
+同一物理步直接用实际 T_G_A（world→臂安装位姿）和 T_G_O（物体位姿），
+计算 `T_A_O = inverse(T_G_A) * T_G_O`。不依赖冻结的 MAVROS/Gazebo 原点配准，
+不照搬世界 `[x,-y,1.15-z]` 或台架固定点作为飞行目标。
+Gazebo 真值明确标注 SIM_GROUND_TRUTH，只用于这版 demo 的相对抓取与验收。
+
+固定物体抓取参考与预接近/侧向离台/世界向上抬高路径按支撑/物体坐标定义，
+每步转换到当前臂基座。完整刚体姿态参与换算，不只处理平移或 yaw。
+保留当前腕姿态模板，不宣称 5DOF 机械臂已经能跟踪任意 6D 姿态；
+相对抓取朝向不可实现时拒绝，不靠移动/重放置方块制造对齐。
+回收使用已验证分段路线和场景已知几何的扫掠净空检查，不直接对角线穿过支撑。
+
+关节角/角速度/目标限速、IK 与工作空间限制继续生效。初始折叠 EE 的 Z 可能
+低于工作空间 min_z；只对经过 hover gate 的已知初始状态，复用已有有界、单调
+向合法域内回归规则，不开放一般越界目标或解除限制。
+
+### 首轮候选门限（设计值，尚未由悬停实测验收）
+
+| 条件 | START / 闭爪前要求 |
+|---|---|
+| 权威飞行状态 | PX4 armed、OFFBOARD、非 landed、无已处理电机故障；飞行状态数据 ≤1 s，offboard 控制/租约 ≤0.3 s |
+| 相对几何/反馈 | 真值几何 ≤0.1 s、配对支持 ≤20 ms；关节 ≤0.2 s、接触窗口 ≤0.3 s；源身份、目标、时钟一致 |
+| 悬停稳定 | 真值速度 ≤0.05 m/s、角速度 ≤0.10 rad/s、roll/pitch 各 ≤5°，相对任务悬停参考位移 ≤3 cm；START 前连续 2 s |
+| 推力分配 | 当前分配的 thrust/torque 均 achieved；四个有效电机指令 <0.95，连续满足悬停窗口；只代表分配余量代理，不冒充实测推力 |
+| 可达/净空 | 目标处于合法工作空间、IK 被原样接受；已知几何三维/扫掠净空有效，非夹指路径候选最低 10 mm；未知不放行 |
+| 闭爪对齐 | 真实夹指参考误差 ≤3 mm，三次新观察间隔 ≥0.6 s；相对目标速度 ≤0.005 m/s，抓取朝向误差 ≤5°；期间持续满足 hover gate |
+| 夹持/离台 | 复用双侧接触 ≥90%、每侧法向力 >0.01 N 等确认；实际离台抬高 ≥25 mm，支撑接触 ≤0.1% 才能 HELD |
+
+门限的实现应分清启动稳定驻留、软退化消抖与硬故障；不能用一次异常包重拟合目标。
+硬故障（非有限值、模式/租约丢失、时钟/身份/重置、明确碰撞/分离）立即禁止新增运动。
+候选姿态硬限为 10°；连续分配不足/接近上饱和达到 0.3 s 则退出抓取。
+姿态硬限不替代 PX4 原有保护；这些设计值不可直接当作已校准的飞行安全范围。
+
+ArmControl 直接读取 PX4 vehicle_status/control_mode/local_position 重置计数和
+control_allocator_status，不能把来自 Gazebo 的几何能力位当飞行授权。
+PX4 重置/实例切换须撤销当前租约与抓取，冻结待人工重新授权；不用先完成通用
+传感器/EKF 改造项目，也不能在元数据未知时假定没有重置。
+同物理步上下文采用统一 producer 世代；不同采样器的 epoch 数字不能直接硬等。
+
+### 异常退出与完成
+
+闭爪前：停止新的臂目标并有界减速/实测位姿附近保持，飞行侧继续安全定点悬停，
+任务标记失败；不自动换目标重试。夹持后：保持已有闭合偏置、不自动松爪，
+停止臂路径推进，按真实观测保留 HELD 或 UNKNOWN；仅有明确分离证据才 LOST。
+请求飞行管理器保持安全悬停，禁止自动返航、降落或恢复任务。
+FCU/飞行估计不可用或已经失控时尊重 PX4 自身 failsafe，不能承诺软件必能维持悬停。
+不在空中 disarm，不强制夺回模式，不直接把折叠轨迹当安全退出路径。
+
+成功标准仍是实际抓取、收回、无支撑保持 10 s 且未掉落；完成后继续监视接触，
+保持夹持/飞行目标所有权，直到另行授权下一任务。小滑移只记录，不作为调参支线。
+
+### 实施顺序与改动落点
+
+先实现 profile 分流、`grasp/HoverGate` 与只读几何/租约输入，回归证明无许可、
+旧许可、模式切换、重置及不可达目标均不闭爪；bench 原回归不能退化。
+再在无锚点、折叠臂的空载悬停中只观察 gate，不发送抓取 START。
+通过后做 APPROACH/ALIGN 的 no-close 联调，再执行一轮悬停抓取和 10 s 保持。
+只有这轮通过后才另行设计携物位移/返航；不在同一轮扩展路线规划。
+
+生产代码计划留在现有 `arm_control/grasp/`、Gazebo `so101/` 和 ROS 飞行管理器
+的小型协调模块中，不另建一套机械臂/飞行控制器。消息/状态新增枚举只追加、
+不重编号；先明确所有权和输入契约，再实现和分别提交子模块/主仓库改动。
+以上仅设计归档；本轮未编写或执行悬停版控制代码，未试飞。
