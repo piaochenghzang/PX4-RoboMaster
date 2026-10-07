@@ -128,10 +128,22 @@ def stop(p):
         except sp.TimeoutExpired:
             p.kill();p.wait(timeout=5)
 
-def build_world(folder,env,calibration,iterations=40,cube_mm=20,gripper_p=None,solver='quick',patch_radius_mm=0,grasp_feedback=False,gui=False):
+def remove_lidar(model):
+    """Remove only the expanded lidar links/mounts in this experiment copy."""
+    lidar=[link for link in model.findall('link') if link.get('name','').startswith('velodyne::')]
+    if not lidar: raise RuntimeError('cannot identify expanded velodyne links for no-lidar scene')
+    names={link.get('name') for link in lidar}
+    for joint in list(model.findall('joint')):
+        if joint.findtext('parent') in names or joint.findtext('child') in names:
+            model.remove(joint)
+    for link in lidar: model.remove(link)
+
+
+def build_world(folder,env,calibration,iterations=40,cube_mm=20,gripper_p=None,solver='quick',patch_radius_mm=0,grasp_feedback=False,gui=False,no_lidar=False):
     # Expand the same production model used by normal SITL, not a two-link fixture.
     expanded=sp.check_output(['gz','sdf','-p',str(MODELS/'yhang550/yhang550.sdf')],env=env,text=True,timeout=30)
     model=ET.fromstring(expanded).find('model')
+    if no_lidar: remove_lidar(model)
     if grasp_feedback:
         bridge=model.find("plugin[@name='mavlink_interface']")
         if bridge is None: raise RuntimeError('MAVLink interface missing')
@@ -209,6 +221,7 @@ def main():
     mode.add_argument('--calibration',type=Path)
     p.add_argument('--port',type=int,default=11356)
     p.add_argument('--gui',action='store_true')
+    p.add_argument('--no-lidar',action='store_true',help='Omit lidar links/sensors/mounts in the generated bench scene only')
     p.add_argument('--gui-wait',action='store_true',help='With --gui, wait for Enter after feedback readiness before requesting grasp; physics remains running')
     p.add_argument('--align-only',action='store_true',help='Measure and align fingers to the fixed cube; stop before closing')
     p.add_argument('--grasp',action='store_true',help='Explicitly enable closing and bilateral-contact verification')
@@ -272,10 +285,15 @@ def main():
             if sock.connect_ex(('127.0.0.1',port))==0: p.error(f'port {port} occupied; stop your simulation first')
     active=sp.check_output(['pgrep','-a','-x','px4'],text=True) if sp.run(['pgrep','-x','px4'],stdout=sp.DEVNULL).returncode==0 else ''
     if active: p.error('PX4 already running; this test will not interrupt it')
+    for name in ('gzserver','gzclient'):
+        if sp.run(['pgrep','-x',name],stdout=sp.DEVNULL).returncode==0:
+            p.error(name+' already running; this test will not interrupt it')
     calibration=json.loads(args.calibration.read_text()) if args.calibration else None
     if calibration and (np.linalg.norm(np.array(calibration['pickup_base'])-PICKUP)>1e-6
                         or calibration.get('model_sha256')!=hashlib.sha256((MODELS/'so101/so101.sdf').read_bytes()).hexdigest()):
         p.error('calibration target/model mismatch; recalibrate')
+    if calibration and calibration.get('lidar_enabled',True)==args.no_lidar:
+        p.error('calibration lidar configuration mismatch; recalibrate')
     folder.mkdir(parents=True);(folder/'rootfs').mkdir()
     env=os.environ.copy()
     env.update(GAZEBO_MASTER_URI=f'http://127.0.0.1:{args.port}',
@@ -287,7 +305,7 @@ def main():
     with (folder/'build.log').open('w') as log:
         for source,output,extra in [('full_arm_probe.cpp','observer',[]),('grasp_probe.cpp','libgrasp_clock.so',['-DSO101_CLOCK_PLUGIN','-shared','-fPIC'])]:
             sp.run(['g++','-std=c++17',str(HERE/source),'-o',str(folder/output),*extra,*flags,'-pthread'],check=True,stdout=log,stderr=sp.STDOUT,timeout=120)
-    build_world(folder,env,calibration,args.iterations,args.cube_mm,args.gripper_p,args.solver,args.patch_radius_mm,args.fsm,args.gui)
+    build_world(folder,env,calibration,args.iterations,args.cube_mm,args.gripper_p,args.solver,args.patch_radius_mm,args.fsm,args.gui,args.no_lidar)
     if args.fsm_test=='missing_object':
         scene=ET.parse(folder/'scene.world');world=scene.find('world')
         world.remove(world.find("model[@name='test_cube']"))
@@ -314,6 +332,7 @@ def main():
                   sha256={str(f):hashlib.sha256(f.read_bytes()).hexdigest() for f in source_paths})
     (folder/'manifest.json').write_text(json.dumps(manifest,indent=2))
     manifest.update(firmware_state_machine=args.fsm,fsm_test=args.fsm_test,
+                    lidar_enabled=not args.no_lidar,
                     exit_observe_seconds=args.exit_observe_seconds,
                     restore_feedback_after=args.restore_feedback_after,
                     gripper_timeout_policy='last_target' if args.fsm else 'measured_position',
@@ -487,6 +506,7 @@ def main():
         if frame_error>.003: raise RuntimeError('Gazebo/PX4 world-frame mismatch')
         if args.calibrate:
             data=dict(pickup_base=PICKUP.tolist(),gripper_world_position=pos.tolist(),
+                      lidar_enabled=not args.no_lidar,
                       gripper_world_quaternion=[r[k] for k in ['gw','gqx','gqy','gqz']],
                       cube_world_position=(pos+R@finger_center).tolist(),
                       reference_gripper=finger_center.tolist(),cube_mm=args.cube_mm,

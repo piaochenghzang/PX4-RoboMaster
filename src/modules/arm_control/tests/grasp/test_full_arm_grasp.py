@@ -74,6 +74,26 @@ class FullArmChecks(unittest.TestCase):
             self.assertEqual(world.find('physics/max_step_size').text,'0.001')
             self.assertIsNotNone(world.find("model[@name='yhang550']/joint[@name='bench_anchor']"))
 
+    def test_no_lidar_scene_keeps_arm_and_px4_sensors(self):
+        expanded=('<sdf version="1.7"><model name="yhang550">'
+                  '<link name="yhang550_base::base_link"><sensor name="imu" type="imu"/></link>'
+                  '<link name="so101::base_link"/>'
+                  '<link name="velodyne::link"><sensor name="laser" type="ray"/></link>'
+                  '<joint name="velodyne_mount_joint" type="fixed"><parent>yhang550_base::base_link</parent>'
+                  '<child>velodyne::link</child></joint>'
+                  '<joint name="so101_mount_joint" type="fixed"><parent>yhang550_base::base_link</parent>'
+                  '<child>so101::base_link</child></joint></model></sdf>')
+        with TemporaryDirectory() as name:
+            with patch('run_full_arm_grasp.sp.check_output',return_value=expanded):
+                build_world(Path(name),{},None,no_lidar=True)
+            model=ET.parse(Path(name)/'scene.world').find('world/model')
+            self.assertIsNone(model.find("link[@name='velodyne::link']"))
+            self.assertIsNone(model.find("joint[@name='velodyne_mount_joint']"))
+            self.assertIsNotNone(model.find("link[@name='so101::base_link']"))
+            self.assertIsNotNone(model.find("joint[@name='so101_mount_joint']"))
+            self.assertIsNotNone(model.find("link[@name='yhang550_base::base_link']/sensor"))
+            self.assertIsNotNone(model.find("joint[@name='bench_anchor']"))
+
     def test_empty_contact_window_cannot_verify_contact(self):
         self.assertEqual(contact_summary([])['bilateral_fraction'],0)
 
