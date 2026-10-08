@@ -2023,3 +2023,118 @@ FCU/飞行估计不可用或已经失控时尊重 PX4 自身 failsafe，不能�
 的小型协调模块中，不另建一套机械臂/飞行控制器。消息/状态新增枚举只追加、
 不重编号；先明确所有权和输入契约，再实现和分别提交子模块/主仓库改动。
 以上仅设计归档；本轮未编写或执行悬停版控制代码，未试飞。
+
+## 阶段 21：已知目标输入与坐标转换（2026-10-08）
+
+按用户要求拆成小阶段。本轮检查发现上次额度/工具中断前，已知目标文件尚未落盘，
+不将其算作已完成。此前刚开始、未验证的悬停固件接线已经撤回；
+差异和两个新增文件备份保存在 `build/grasp_demo_stage21/`，没有激活或编译。
+已提交的阶段 19 抓取 demo、台架 profile 和此前未跟踪 flight 副本未改动。
+只使用 Ubuntu-20.04，未访问 Ubuntu22。
+
+新增 `src/modules/arm_control/tests/hover/known_target.py`、`known_target.json`、
+`test_known_target.py`。输入必须显式标记 gazebo_world、位置单位 m、四元数 wxyz；
+拒绝 map/world 模糊别名、非法形状、非有限值、零/错误归一化四元数。
+候选悬停位根据机体—臂安装与已校准物体中心参考偏移推算，不直接等于物体位置。
+预览始终标记 planned、flight_ready=false、close_permitted=false，
+不发布命令、不生成 MAVROS 目标、不声称 IK 可达性已测试。
+可对保存的实际机体/臂 world pose 做完整刚体逆变换，但不重标旧采样时刻或声称实时新鲜。
+
+默认示例沿用阶段 19 的 20 mm 方块姿态/夹指参考模板，将世界目标改为
+`(0.6, 0, 1.364362) m`；推得机体悬停位约
+`(0.416721, 0.005130, 1.5) m`、世界 yaw=0。
+名义物体中心在臂基座为 `(0.183279, 0.005130, 0.085638) m`，
+不是 FK 工具目标点。默认安装矩阵与当前生产 yhang550.sdf 的 so101 include 一致。
+数学/输入测试先 9 项通过；加入后续轨迹/局部控制转换回归后为 11 项通过，
+包括非零 yaw、完整 roll/pitch/yaw 快照往返和不能把计划值冒充实测值。
+
+```bash
+cd /home/pcz/PX4-RoboMaster
+python3 src/modules/arm_control/tests/hover/test_known_target.py
+python3 src/modules/arm_control/tests/hover/known_target.py
+```
+
+## 阶段 22：已知目标飞行接管与粗到位，不闭爪（2026-10-08）
+
+### 实现范围与输入边界
+
+复用 ROS 现有 super_flight_manager，不另写飞行控制器。新增显式参数
+known_goal_mode（默认 false，要求 use_sim_time=true）、KnownFlightSetpoint 消息、
+known_flight_handover.h 输入租约及回归。只有专用模式才跳过雷达等待，并从
+`/grasp_demo/known_setpoint` 接收 map/ENU 指令；保留 MAVROS 既有
+FRAME_LOCAL_NED 枚举/ROS ENU 转换约定，不额外手动翻轴。
+
+源任务首次接受后唯一绑定，旧/重复时刻、换任务、错 frame、非法 mask、
+非有限值、过期/未来包不续期；输入 ≤0.3 s，控制位置离当前 odom ≤1 m、
+速度 ≤1 m/s、局部高度 0.3–2.5 m。流失效进入 FAILSAFE_HOVER 并锁定，
+不能靠后续正常包自动恢复；模式/解锁丢失后不自动夺回/重新解锁。
+该模式拒绝普通用户规划目标及 SUPER 指令，管理器仍为唯一 MAVROS 飞行发布者。
+正常导航默认逻辑没有关闭雷达等待或改变恢复策略。
+
+CoordinateTruth 仅追加同物理步机体线/角速度世界真值和有效标志；
+旧 FK 观察逻辑不变，采样器没有控制动作。消息生成/导出依赖补齐，首次编译因
+旧 CMake 规则未生成新头失败，强制重新生成后管理器、真值库及测试编译成功。
+
+PX4 测试目录新增 run_known_target_flight.py，默认只预览；只有 --execute-flight
+才启动本机 PX4/Gazebo/MAVROS 与已知目标管理器。拒绝已有会话/占用端口，
+父节点与子进程固定使用同一个本地 master，只清理自己启动的进程。
+从生产组合模型扩展生成实验副本，移除雷达，不添加 bench_anchor；
+物体 dynamic、支撑 static，不绑定或运行中传送物体。实验 ODE quick/40，
+没有修改生产 SDF、飞行 PID、EKF 参数或 arm_control。
+必要传感器和原初始折叠保持照常运行。
+
+### 真值辅助控制是本版 demo 的明确假设
+
+位置转换每次采用 `T_L_G = T_L_B * inverse(T_G_B)`，将 world 的 6 s 平滑
+短轨迹采样转换为当前局部控制坐标；它不是已标定的导航 TF，更不是阶段 17
+的冻结原点诊断。速度前馈为
+`v_cmd_L = R_L_G * (v_des_G - v_true_G) + R_L_B * v_est_B`。
+这里 nav_msgs/Odometry twist 是 body FLU，先按其姿态旋转；偏航也按当前
+world/local 姿态换算后走原限速器。
+
+这明确使用 Gazebo 机体真值参与控制坐标及估计速度偏差补偿，是仿真定位输入，
+不是只给物体坐标就证明了真实导航定位能力。没有向 EKF 注入真值，但闭环性能
+也不能冒充原 GPS/IMU 定位精度已改善或将来实机必能达到同样结果。
+
+### 分级验收与证据
+
+原测试 CTest 4 项加接管租约为 5/5 通过，已知目标 Python 11 项、
+原抓取场景 Python 19 项通过。test_known_flight_ros.py 在独立 11361 master
+构造消息，6 项接口检查通过：错 frame、有效任务、换任务、旧包、断流退出、
+不自动恢复。该测试不启动/连接 PX4、Gazebo、MAVROS；只验证接口，不冒充物理结果。
+
+两次实际无雷达、无锚点、空载折叠臂短程飞行结果：
+
+| 案例 | 到位后保持 | 世界位置平均/最大误差 | 结论 |
+|---|---:|---:|---|
+| known_goal_no_close_20261008_01 | 10.001 s | 2.23 / 3.50 cm | 本阶段粗到位通过 |
+| known_goal_no_close_20261008_02 | 10.003 s | 2.30 / 3.52 cm | 补充物体/折叠证据后通过 |
+
+结果目录 `build/known_target_flight/<case>/` 保存场景、manifest/源码哈希、
+逐帧真值/源年龄、ROS graph、日志、ULog 和 result.json。
+第二轮起飞前核对实际方块位置与已知输入相差 ≤4 mm；保持期间最大折叠角误差
+约 0.02130 rad。唯一飞行发布者 /known_flight_manager_probe，
+arm_motion_requests_sent=false、gripper_requests_sent=false、grasp_tested=false。
+两个会话均在完成保持后停止本轮仿真进程，没有验证降落、返航或携物。
+
+进入保持前连续 2 s 要求位置 ≤3 cm、速度 ≤0.05 m/s、姿态 ≤5°；
+本阶段后续 10 s 粗到位包络为 ≤5 cm。最大 3.52 cm 超过阶段 20 草案的
+连续 3 cm 抓取许可要求，因此明确 hover_grasp_permission_validated=false，
+不能把 success=true 当作允许闭爪。下一小阶段才接实际悬停许可、相对对齐和拒绝用例，
+许可不达标则不启动抓取，不在这一轮把更严格许可改成已经通过。
+
+```bash
+source /opt/ros/noetic/setup.bash
+source /home/pcz/super_ws/devel/setup.bash
+cd /home/pcz/PX4-RoboMaster
+python3 src/modules/arm_control/tests/hover/run_known_target_flight.py my_known_goal_case --execute-flight
+```
+
+名称必须未使用；不加 --execute-flight 时不会启动仿真或飞行。
+阶段 21–22 结束时改动同步到 ROS 发布副本并留待审阅。按用户审核后的授权，
+ROS 本地提交 `3f6efbc4c0de15b68860aa5cddce99d005c48c85`
+（simulation-only known target flight handover），PX4 测试提交
+`753fca0f30eb1756cb8a6bc2f2f7c3ff2a92de51`（known target coordinates/no-close trials）。
+提交前 CTest 5/5、坐标 Python 11 项通过；去掉新增文件末尾空行后 diff --check 通过。
+本集中说明另作提交，未推送。
+旧 flight 未跟踪副本未改动；悬停抓取入口/实际许可仍未实现，闭爪与携物尚未执行。
