@@ -53,6 +53,10 @@ void ArmControl::processGraspRequests(const so101_grasp::Input &input)
 {
     arm_grasp_request_s request{};
     for (int count=0; count<4 && _arm_grasp_request.update(&request); ++count) {
+        if (_hover_approach.owns()) {
+            _grasp.last_id=request.request_id; _grasp.last_request_result=so101_grasp::RequestResult::Busy;
+            continue;
+        }
 #if !defined(CONFIG_ARCH_BOARD_PX4_SITL)
         // This v1 profile relies on Gazebo truth and a fixed bench anchor.
         // It is not a hardware/flight grasp interface.

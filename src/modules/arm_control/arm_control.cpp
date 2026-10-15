@@ -74,6 +74,7 @@ void ArmControl::Run()
     updateHoverPermit();
     updateControlState();
     const auto grasp_input=graspInput();
+    updateHoverApproach();
     processGraspRequests(grasp_input);
     executeGraspAction(_grasp.step(grasp_input),grasp_input);
     publishGraspStatus();
@@ -85,7 +86,7 @@ void ArmControl::Run()
     }
 
     updateControlState();
-    if (!_joint_feedback_valid || (_grasp.owns() && grasp_input.joint_age>=.2f)) {
+    if (!_joint_feedback_valid || ((_grasp.owns() || _hover_approach.owns()) && grasp_input.joint_age>=.2f)) {
         // Freeze trajectory advancement while feedback is unavailable.
         publishControlStatus();
         return;
@@ -128,7 +129,7 @@ void ArmControl::processCartesianSetpoint()
     if (!_arm_cartesian_setpoint.update(&setpoint)) {
         return;
     }
-    if (_grasp.owns()) { PX4_WARN("manual target rejected: grasp ownership locked"); return; }
+    if (_grasp.owns() || _hover_approach.owns()) { PX4_WARN("manual target rejected: arm ownership locked"); return; }
 
     if (!setpoint.valid || !PX4_ISFINITE(setpoint.gripper)) {
         PX4_WARN("Cartesian target rejected");
@@ -249,6 +250,30 @@ int ArmControl::print_status()
 
 int ArmControl::custom_command(int argc, char *argv[])
 {
+    if (argc>0 && (!strcmp(argv[0],"target") || !strcmp(argv[0],"test_warm_start") ||
+        !strcmp(argv[0],"test_cartesian_ik") || !strcmp(argv[0],"grasp_start") ||
+        !strcmp(argv[0],"grasp_reset") || !strcmp(argv[0],"grasp_cancel"))) {
+        uORB::Subscription sub{ORB_ID(arm_approach_status)}; arm_approach_status_s s{};
+        if (sub.copy(&s) && s.ownership_locked) { PX4_ERR("no-close approach BUSY/locked"); return PX4_ERROR; }
+    }
+    if (argc>0 && (!strcmp(argv[0],"hover_approach") || !strcmp(argv[0],"hover_resume") || !strcmp(argv[0],"hover_cancel"))) {
+#if !defined(CONFIG_ARCH_BOARD_PX4_SITL)
+        return PX4_ERROR;
+#else
+        if (argc!=5 || !get_instance()) return PX4_ERROR;
+        uint64_t ids[4]{};
+        for (int k=0;k<4;++k) {
+            if (argv[k+1][0]=='-') return PX4_ERROR;
+            char *end=nullptr; errno=0; ids[k]=strtoull(argv[k+1],&end,10);
+            if (errno==ERANGE || !ids[k] || end==argv[k+1] || *end!='\0') return PX4_ERROR;
+        }
+        arm_approach_request_s r{}; r.timestamp=hrt_absolute_time(); r.request_id=r.timestamp;
+        r.task_id=ids[0]; r.plan_id=ids[1]; r.target_id=ids[2]; r.scene_id=ids[3];
+        r.action=!strcmp(argv[0],"hover_approach") ? 1 : (!strcmp(argv[0],"hover_resume") ? 2 : 3);
+        static uORB::Publication<arm_approach_request_s> pub{ORB_ID(arm_approach_request)};
+        return pub.publish(r) ? PX4_OK : PX4_ERROR;
+#endif
+    }
     if (argc>0 && !strcmp(argv[0],"grasp_status")) {
         uORB::Subscription sub{ORB_ID(arm_grasp_status)};
         arm_grasp_status_s s{};
@@ -259,7 +284,7 @@ int ArmControl::custom_command(int argc, char *argv[])
             s.completed_success,(double)s.bilateral_fraction,(double)s.fixed_normal_n,(double)s.moving_normal_n,(double)s.actual_lift);
         return PX4_OK;
     }
-    if (argc>0 && (!strcmp(argv[0],"hover_context") || !strcmp(argv[0],"hover_grasp_prepare"))) {
+    if (argc>0 && (!strcmp(argv[0],"hover_context") || !strcmp(argv[0],"hover_task_context") || !strcmp(argv[0],"hover_grasp_prepare"))) {
 #if !defined(CONFIG_ARCH_BOARD_PX4_SITL)
         PX4_ERR("hover preparation is local SITL only"); return PX4_ERROR;
 #else
@@ -274,7 +299,8 @@ int ArmControl::custom_command(int argc, char *argv[])
             PX4_INFO("prepare-only request queued; no arm motion or closing");
             return pub.publish(r) ? PX4_OK : PX4_ERROR;
         }
-        if (argc!=13) { PX4_ERR("hover_context requires 12 numeric source fields"); return PX4_ERROR; }
+        const bool bound=!strcmp(argv[0],"hover_task_context");
+        if (argc!=(bound ? 23 : 13)) { PX4_ERR("invalid hover context field count"); return PX4_ERROR; }
         uint64_t u[5]{};
         for (int k=0;k<5;++k) {
             if (argv[k+1][0]=='-') return PX4_ERROR;
@@ -291,6 +317,23 @@ int ArmControl::custom_command(int argc, char *argv[])
         c.task_id=u[0]; c.source_sequence=u[1]; c.sample_time_us=u[2]; c.source_epoch=u[3]; c.valid=u[4]!=0;
         c.body_speed=f[0]; c.body_angular_speed=f[1]; c.tilt=f[2]; c.hover_position_error=f[3];
         c.alignment_error=f[4]; c.relative_speed=f[5]; c.orientation_error=f[6];
+        if (bound) {
+            uint64_t extra[6]{};
+            for (int k=0;k<6;++k) {
+                if (argv[k+13][0]=='-') return PX4_ERROR;
+                char *end=nullptr; errno=0; extra[k]=strtoull(argv[k+13],&end,10);
+                if (errno==ERANGE || end==argv[k+13] || *end!='\0') return PX4_ERROR;
+            }
+            if (!extra[0] || !extra[1] || !extra[2] || extra[4]>1 || extra[5]>1) return PX4_ERROR;
+            float x[4]{};
+            for (int k=0;k<4;++k) {
+                char *end=nullptr; x[k]=strtof(argv[k+19],&end);
+                if (end==argv[k+19] || *end!='\0' || !PX4_ISFINITE(x[k]) || fabsf(x[k])>100.f) return PX4_ERROR;
+            }
+            c.plan_id=extra[0]; c.target_id=extra[1]; c.scene_id=extra[2]; c.lease_sample_us=extra[3];
+            c.lease_valid=extra[4]; c.geometry_valid=extra[5]; c.clearance=x[3];
+            for (int k=0;k<3;++k) c.approach_base[k]=x[k];
+        }
         static uORB::Publication<arm_hover_context_s> pub{ORB_ID(arm_hover_context)};
         return pub.publish(c) ? PX4_OK : PX4_ERROR;
 #endif
@@ -965,10 +1008,11 @@ bool ArmControl::sanitizeCartesianTarget(const matrix::Vector3f &raw_target, mat
         return false;
     }
 
-    // Folded startup FK can be just outside min_z. The fixed bench APPROACH
-    // may recover inward using the same step/IK/joint limits; manual targets
-    // and every later grasp phase retain the ordinary workspace checks.
-    if (_grasp.phase==so101_grasp::Phase::Approach && _grasp_feedback.capabilities==31
+    // Folded startup FK can be just outside min_z. Bench APPROACH and the
+    // separately guarded hover approach may only recover inward using the
+    // same step/IK/joint limits; manual targets retain ordinary checks.
+    if (((_grasp.phase==so101_grasp::Phase::Approach && _grasp_feedback.capabilities==31) ||
+         _hover_approach.moving())
         && so101_grasp::monotonicRecovery(
             {_ee_target_position(0),_ee_target_position(1),_ee_target_position(2)},
             {raw_target(0),raw_target(1),raw_target(2)},

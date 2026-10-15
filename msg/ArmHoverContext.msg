@@ -12,3 +12,12 @@ float32 hover_position_error
 float32 alignment_error
 float32 relative_speed
 float32 orientation_error
+# Optional no-close task contract. Zero fields never authorize an approach.
+uint64 plan_id
+uint64 target_id
+uint64 scene_id
+uint64 lease_sample_us
+bool lease_valid
+bool geometry_valid
+float32[3] approach_base
+float32 clearance

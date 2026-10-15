@@ -59,6 +59,9 @@
 #include <uORB/topics/control_allocator_status.h>
 #include <uORB/topics/actuator_motors.h>
 #include "grasp/HoverPermit.hpp"
+#include "grasp/HoverApproach.hpp"
+#include <uORB/topics/arm_approach_request.h>
+#include <uORB/topics/arm_approach_status.h>
 #include "grasp/GraspStateMachine.hpp"
 
 #include <matrix/matrix/math.hpp>
@@ -146,6 +149,9 @@ private:
     void pollJointFeedback();
     void pollGraspFeedback();
     void updateHoverPermit();
+    void updateHoverApproach();
+    void stopHoverMotion();
+    so101_hover::TargetResult applyHoverTarget(const so101_hover::Point &target);
     so101_grasp::Input graspInput() const;
     void processGraspRequests(const so101_grasp::Input &input);
     void executeGraspAction(const so101_grasp::Action &action, const so101_grasp::Input &input);
@@ -218,6 +224,11 @@ private:
     arm_hover_context_s _hover_context{};
     so101_hover::Gate _hover_gate;
     so101_hover::Preparation _hover_preparation;
+    so101_hover::Approach _hover_approach;
+    uORB::Subscription _approach_request_sub{ORB_ID(arm_approach_request)};
+    uORB::Publication<arm_approach_status_s> _approach_status_pub{ORB_ID(arm_approach_status)};
+    bool _approach_stop_pending{false};
+    float _approach_jaw_target{.3f};
 
     // Runtime
     uint32_t _run_count{0};

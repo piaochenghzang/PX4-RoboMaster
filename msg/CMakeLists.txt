@@ -54,6 +54,8 @@ set(msg_files
 	ArmHoverContext.msg
 	ArmHoverRequest.msg
 	ArmHoverStatus.msg
+	ArmApproachRequest.msg
+	ArmApproachStatus.msg
 	ArmJointCommand.msg
 	ArmJointStatus.msg
 	AutotuneAttitudeControlStatus.msg
