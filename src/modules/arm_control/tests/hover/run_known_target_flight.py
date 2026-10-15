@@ -123,10 +123,13 @@ def make_world(folder,target,env):
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('name'); p.add_argument('--execute-flight',action='store_true')
+    p.add_argument('--observe-hover-permit',action='store_true',
+        help='Test PREPARE/refusal/revocation only; never move the arm or close the jaw')
     p.add_argument('--target',type=Path,default=Path(__file__).with_name('known_target.json'))
     args=p.parse_args()
     target=KnownTarget(json.loads(args.target.read_text()))
     if not args.execute_flight:
+        if args.observe_hover_permit: p.error('--observe-hover-permit requires --execute-flight')
         print(json.dumps(target.preview(),indent=2)); return 0
     if not args.name.replace('_','').isalnum(): p.error('Use a unique safe case name')
     if target.name!='test_cube': p.error('This first fixture supports test_cube only')
@@ -153,12 +156,19 @@ def main():
     os.environ.pop('ROS_IP',None)
     files=[Path(__file__),Path(__file__).with_name('known_target.py'),args.target,folder/'scene.world',
         WS/'src/super_px4_bridge/src/super_flight_manager.cpp',WS/'devel/lib/libso101_coordinate_truth.so']
-    save(folder/'manifest.json',dict(stage=2,lidar=False,vehicle_fixed=False,object_attached=False,
+    if args.observe_hover_permit: files.append(Path(__file__).with_name('hover_permit_probe.py'))
+    if args.observe_hover_permit:
+        files += [BUILD/'bin/px4', ROOT/'src/modules/arm_control/grasp/HoverPermit.hpp',
+            ROOT/'src/modules/arm_control/grasp/HoverPermitAdapter.cpp',
+            WS/'src/super_px4_bridge/src/coordinate_truth_plugin.cpp',
+            WS/'src/super_px4_bridge/msg/CoordinateTruth.msg']
+    save(folder/'manifest.json',dict(stage=3 if args.observe_hover_permit else 2,
+        hover_prepare_only=args.observe_hover_permit,lidar=False,vehicle_fixed=False,object_attached=False,
         arm_motion_requests_sent=False,gripper_requests_sent=False,grasp_tested=False,
         localization_source='LIVE_GAZEBO_TRUTH_CONTROL_TRANSFORM_AND_VELOCITY_OFFSET_COMPENSATION',
         ekf_truth_injected=False,flight_pid_modified=False,planned=target.preview(),
         hashes={str(f):hashlib.sha256(f.read_bytes()).hexdigest() for f in files}))
-    procs=[]; logs=[]; subscribers=None; publisher=None
+    procs=[]; logs=[]; subscribers=None; publisher=None; hover_probe=None
     def start(name,cmd,cwd=None):
         log=(folder/(name+'.log')).open('w'); logs.append(log)
         proc=sp.Popen(cmd,env=env,cwd=cwd,stdout=log,stderr=sp.STDOUT,start_new_session=True)
@@ -166,6 +176,7 @@ def main():
     started=time.monotonic(); result=dict(success=False,grasp_tested=False)
     armed_seen=False; last_sim=None; progress=time.monotonic(); rows=[]
     def safety():
+        if hover_probe and hover_probe.error: raise RuntimeError(hover_probe.error)
         if any(proc.poll() is not None for proc in procs): raise RuntimeError('Own simulation process exited')
         if time.monotonic()-started>260: raise RuntimeError('Wall watchdog exceeded')
         if time.monotonic()-progress>20 and last_sim is not None: raise RuntimeError('Sim clock stalled')
@@ -195,6 +206,14 @@ def main():
         if not .3<=takeoff_local<=2.5: raise RuntimeError('Takeoff coordinate invalid')
         if np.linalg.norm(target.hover[:2,3]-np.array(row['body'][:2]))>1.0 or not 1.0<=target.hover[2,3]<=2.0:
             raise RuntimeError('First-stage flight fixture requires <=1m horizontal travel and 1..2m world hover height')
+        if args.observe_hover_permit:
+            from hover_permit_probe import HoverPermitProbe
+            hover_probe=HoverPermitProbe(BUILD,env,subscribers,target,folder); hover_probe.start()
+            deadline=time.monotonic()+10
+            while hover_probe.stage in ('unarmed','unarmed_ack'):
+                safety()
+                if time.monotonic()>deadline: raise RuntimeError('Unarmed refusal test timeout')
+                time.sleep(.01)
         start('flight_manager',['rosrun','super_px4_bridge','super_flight_manager_node',
             '_known_goal_mode:=true','_auto_arm:=true','_takeoff_height:='+str(takeoff_local),
             '_hover_stable_time:=2.0','__name:=known_flight_manager_probe'])
@@ -248,7 +267,8 @@ def main():
                 elif stable_since is None: stable_since=now
                 elif now-stable_since>=2 and hold_since is None:
                     hold_since=now; print('Physical world goal reached; observing 10-second no-close hold.',flush=True)
-                if hold_since is not None and now-hold_since>=10:
+                if (hold_since is not None and now-hold_since>=10 and
+                        (hover_probe is None or hover_probe.complete)):
                     held=[r for r in rows if r['sim_s']>=hold_since]
                     hold_pass=bool(all(r['hover_error_m']<=.05 and r['tilt_rad']<=math.radians(5) for r in held))
                     result.update(success=hold_pass,flight_goal_validated=hold_pass,
@@ -261,6 +281,10 @@ def main():
                     break
                 if row['manager']=='FAILSAFE_HOVER': raise RuntimeError('Flight input lease failed; no automatic resumption')
                 time.sleep(.004)
+        if hover_probe:
+            result['hover_prepare']=hover_probe.finish(); hover_probe=None
+            if not result['hover_prepare']['hover_prepare_validated']:
+                raise RuntimeError('Hover PREPARE tests incomplete')
         graph=rosgraph.Master('/known_target_graph').getSystemState()
         save(folder/'ros_graph.json',dict(publishers=graph[0],subscribers=graph[1],services=graph[2]))
         pubs=[nodes for topic,nodes in graph[0] if topic=='/mavros/setpoint_raw/local']
@@ -269,6 +293,11 @@ def main():
     except (Exception,KeyboardInterrupt) as error:
         result.update(success=False,error=str(error),final_sim_s=last_sim)
     finally:
+        if hover_probe:
+            try: result['hover_prepare']=hover_probe.finish()
+            except Exception as error:
+                result.update(success=False,hover_probe_error=str(error))
+                result['hover_prepare_events']=hover_probe.events
         if publisher: publisher.unregister()
         if subscribers:
             for sub in subscribers.subscribers: sub.unregister()

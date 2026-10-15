@@ -51,6 +51,9 @@ set(msg_files
 	ArmGraspFeedback.msg
 	ArmGraspRequest.msg
 	ArmGraspStatus.msg
+	ArmHoverContext.msg
+	ArmHoverRequest.msg
+	ArmHoverStatus.msg
 	ArmJointCommand.msg
 	ArmJointStatus.msg
 	AutotuneAttitudeControlStatus.msg

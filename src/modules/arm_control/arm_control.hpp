@@ -50,6 +50,15 @@
 #include <uORB/topics/arm_grasp_feedback.h>
 #include <uORB/topics/arm_grasp_request.h>
 #include <uORB/topics/arm_grasp_status.h>
+#include <uORB/topics/arm_hover_context.h>
+#include <uORB/topics/arm_hover_request.h>
+#include <uORB/topics/arm_hover_status.h>
+#include <uORB/topics/vehicle_status.h>
+#include <uORB/topics/vehicle_local_position.h>
+#include <uORB/topics/vehicle_land_detected.h>
+#include <uORB/topics/control_allocator_status.h>
+#include <uORB/topics/actuator_motors.h>
+#include "grasp/HoverPermit.hpp"
 #include "grasp/GraspStateMachine.hpp"
 
 #include <matrix/matrix/math.hpp>
@@ -136,6 +145,7 @@ private:
     float updateDt();
     void pollJointFeedback();
     void pollGraspFeedback();
+    void updateHoverPermit();
     so101_grasp::Input graspInput() const;
     void processGraspRequests(const so101_grasp::Input &input);
     void executeGraspAction(const so101_grasp::Action &action, const so101_grasp::Input &input);
@@ -197,6 +207,17 @@ private:
     arm_grasp_feedback_s _grasp_feedback{};
     so101_grasp::GraspStateMachine _grasp;
     bool _grasp_hold_pending{false};
+    uORB::Subscription _hover_context_sub{ORB_ID(arm_hover_context)};
+    uORB::Subscription _hover_request_sub{ORB_ID(arm_hover_request)};
+    uORB::Subscription _hover_vehicle_sub{ORB_ID(vehicle_status)};
+    uORB::Subscription _hover_position_sub{ORB_ID(vehicle_local_position)};
+    uORB::Subscription _hover_land_sub{ORB_ID(vehicle_land_detected)};
+    uORB::Subscription _hover_allocator_sub{ORB_ID(control_allocator_status)};
+    uORB::Subscription _hover_motors_sub{ORB_ID(actuator_motors)};
+    uORB::Publication<arm_hover_status_s> _hover_status_pub{ORB_ID(arm_hover_status)};
+    arm_hover_context_s _hover_context{};
+    so101_hover::Gate _hover_gate;
+    so101_hover::Preparation _hover_preparation;
 
     // Runtime
     uint32_t _run_count{0};

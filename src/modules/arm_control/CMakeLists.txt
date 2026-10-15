@@ -42,6 +42,7 @@ px4_add_module(
 		arm_control.hpp
 		grasp/GraspStateMachine.cpp
 		grasp/GraspAdapter.cpp
+		grasp/HoverPermitAdapter.cpp
 	DEPENDS
 		px4_work_queue
 )

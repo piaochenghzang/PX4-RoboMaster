@@ -36,6 +36,7 @@
 #include <cmath>
 #include <cstring>
 #include <cstdlib>
+#include <cerrno>
 
 ArmControl::ArmControl() :
     ModuleParams(nullptr),
@@ -70,6 +71,7 @@ void ArmControl::Run()
 
     pollJointFeedback();
     pollGraspFeedback();
+    updateHoverPermit();
     updateControlState();
     const auto grasp_input=graspInput();
     processGraspRequests(grasp_input);
@@ -257,6 +259,43 @@ int ArmControl::custom_command(int argc, char *argv[])
             s.completed_success,(double)s.bilateral_fraction,(double)s.fixed_normal_n,(double)s.moving_normal_n,(double)s.actual_lift);
         return PX4_OK;
     }
+    if (argc>0 && (!strcmp(argv[0],"hover_context") || !strcmp(argv[0],"hover_grasp_prepare"))) {
+#if !defined(CONFIG_ARCH_BOARD_PX4_SITL)
+        PX4_ERR("hover preparation is local SITL only"); return PX4_ERROR;
+#else
+        if (!get_instance()) return PX4_ERROR;
+        if (!strcmp(argv[0],"hover_grasp_prepare")) {
+            if (argc!=2 || argv[1][0]=='-') return PX4_ERROR;
+            char *end=nullptr; errno=0; const uint64_t task=strtoull(argv[1],&end,10);
+            if (errno==ERANGE || !task || end==argv[1] || *end!='\0') return PX4_ERROR;
+            arm_hover_request_s r{}; r.timestamp=hrt_absolute_time(); r.request_id=r.timestamp;
+            r.task_id=task; r.action=arm_hover_request_s::PREPARE;
+            static uORB::Publication<arm_hover_request_s> pub{ORB_ID(arm_hover_request)};
+            PX4_INFO("prepare-only request queued; no arm motion or closing");
+            return pub.publish(r) ? PX4_OK : PX4_ERROR;
+        }
+        if (argc!=13) { PX4_ERR("hover_context requires 12 numeric source fields"); return PX4_ERROR; }
+        uint64_t u[5]{};
+        for (int k=0;k<5;++k) {
+            if (argv[k+1][0]=='-') return PX4_ERROR;
+            char *end=nullptr; errno=0; u[k]=strtoull(argv[k+1],&end,10);
+            if (errno==ERANGE || end==argv[k+1] || *end!='\0') return PX4_ERROR;
+        }
+        if (!u[0] || u[1]>UINT32_MAX || u[3]>UINT32_MAX || u[4]>1) return PX4_ERROR;
+        float f[7]{};
+        for (int k=0;k<7;++k) {
+            char *end=nullptr; f[k]=strtof(argv[k+6],&end);
+            if (end==argv[k+6] || *end!='\0' || !PX4_ISFINITE(f[k]) || f[k]<0 || f[k]>100.f) return PX4_ERROR;
+        }
+        arm_hover_context_s c{}; c.timestamp=hrt_absolute_time();
+        c.task_id=u[0]; c.source_sequence=u[1]; c.sample_time_us=u[2]; c.source_epoch=u[3]; c.valid=u[4]!=0;
+        c.body_speed=f[0]; c.body_angular_speed=f[1]; c.tilt=f[2]; c.hover_position_error=f[3];
+        c.alignment_error=f[4]; c.relative_speed=f[5]; c.orientation_error=f[6];
+        static uORB::Publication<arm_hover_context_s> pub{ORB_ID(arm_hover_context)};
+        return pub.publish(c) ? PX4_OK : PX4_ERROR;
+#endif
+    }
+
     if (argc>0 && (!strcmp(argv[0],"grasp_start") || !strcmp(argv[0],"grasp_cancel") || !strcmp(argv[0],"grasp_reset"))) {
         if (!get_instance()) { PX4_ERR("arm_control must be running"); return PX4_ERROR; }
         arm_grasp_request_s request{};
