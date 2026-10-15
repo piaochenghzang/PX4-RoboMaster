@@ -21,7 +21,7 @@ from geometry_msgs.msg import Pose
 from mavros_msgs.msg import State, PositionTarget
 from nav_msgs.msg import Odometry
 from std_msgs.msg import String
-from super_px4_bridge.msg import CoordinateTruth, KnownFlightSetpoint
+from super_px4_bridge.msg import CoordinateTruth, KnownFlightSetpoint, KnownFlightStatus
 from known_target import KnownTarget, rotation, quintic_segment, local_motion
 
 ROOT=Path(__file__).resolve().parents[5]
@@ -53,15 +53,18 @@ class Sources:
     def __init__(self):
         self.lock=threading.RLock()
         self.state=None; self.odom=None; self.truth=None; self.manager=''
+        self.known_status=None
         self.subscribers=[
             rospy.Subscriber('/mavros/state',State,lambda m:self.update('state',m),queue_size=50),
             rospy.Subscriber('/mavros/local_position/odom',Odometry,lambda m:self.update('odom',m),queue_size=100),
             rospy.Subscriber('/grasp_audit/truth',CoordinateTruth,lambda m:self.update('truth',m),queue_size=100),
             rospy.Subscriber('/grasp_demo/flight_state',String,lambda m:self.update('manager',m.data),queue_size=20)]
+        self.subscribers.append(rospy.Subscriber('/grasp_demo/known_status',KnownFlightStatus,
+            lambda m:self.update('known_status',m),queue_size=20))
     def update(self,key,value):
         with self.lock: setattr(self,key,value)
     def read(self):
-        with self.lock: state,odom,truth,manager=self.state,self.odom,self.truth,self.manager
+        with self.lock: state,odom,truth,manager,known=self.state,self.odom,self.truth,self.manager,self.known_status
         now=rospy.Time.now().to_sec()
         if not state or not state.connected or not odom or not truth: return None
         if truth.header.frame_id!='gazebo_world' or odom.header.frame_id!='map' or odom.child_frame_id!='base_link':
@@ -86,10 +89,10 @@ class Sources:
         rotation(body[3:]); rotation(local[3:]); rotation(arm[3:])
         return dict(now=now,state=state,body=body,arm=arm,local=local,actual_v=actual_v,
             actual_w=actual_w,estimated_body_v=estimated_body_v,manager=manager,
-            truth=truth,ages=ages,joints=joint_values)
+            truth=truth,ages=ages,joints=joint_values,known_status=known)
 
 
-def make_world(folder,target,env):
+def make_world(folder,target,env,approach_guard=False):
     expanded=sp.check_output(['gz','sdf','-p',str(MODELS/'yhang550/yhang550.sdf')],
         env=env,text=True,timeout=30)
     model=ET.fromstring(expanded).find('model'); remove_lidar(model)
@@ -117,6 +120,7 @@ def make_world(folder,target,env):
         ET.SubElement(ET.SubElement(ET.SubElement(e,'geometry'),'box'),'size').text='.012 .014 .004'
     plugin=ET.SubElement(world,'plugin',name='coordinate_truth',filename='libso101_coordinate_truth.so')
     ET.SubElement(plugin,'vehicleName').text='yhang550'; ET.SubElement(plugin,'targetName').text=target.name
+    if approach_guard: ET.SubElement(plugin,'approachGuard').text='true'
     tree.write(folder/'scene.world',encoding='unicode',xml_declaration=True)
 
 
@@ -125,11 +129,13 @@ def main():
     p.add_argument('name'); p.add_argument('--execute-flight',action='store_true')
     p.add_argument('--observe-hover-permit',action='store_true',
         help='Test PREPARE/refusal/revocation only; never move the arm or close the jaw')
+    p.add_argument('--execute-approach',action='store_true',help='Bounded native arm approach; jaw target never changes')
     p.add_argument('--target',type=Path,default=Path(__file__).with_name('known_target.json'))
     args=p.parse_args()
+    if args.execute_approach and args.observe_hover_permit: p.error('Choose permission tests OR no-close approach')
     target=KnownTarget(json.loads(args.target.read_text()))
     if not args.execute_flight:
-        if args.observe_hover_permit: p.error('--observe-hover-permit requires --execute-flight')
+        if args.observe_hover_permit or args.execute_approach: p.error('Execution requires --execute-flight')
         print(json.dumps(target.preview(),indent=2)); return 0
     if not args.name.replace('_','').isalnum(): p.error('Use a unique safe case name')
     if target.name!='test_cube': p.error('This first fixture supports test_cube only')
@@ -150,21 +156,30 @@ def main():
         LD_LIBRARY_PATH=str(WS/'devel/lib')+':'+str(BUILD/'build_gazebo-classic')+
             ':/opt/ros/noetic/lib:/usr/lib/x86_64-linux-gnu/gazebo-11/plugins',
         GAZEBO_MODEL_DATABASE_URI='',PX4_SIM_MODEL='gazebo-classic_yhang550',PX4_SYS_AUTOSTART='1020')
-    env.pop('ROS_IP',None); make_world(folder,target,env)
+    env.pop('ROS_IP',None); make_world(folder,target,env,args.execute_approach)
     # Parent ROS probe and owned children must use the same local master.
     os.environ.update(ROS_MASTER_URI=env['ROS_MASTER_URI'],ROS_HOSTNAME='localhost')
     os.environ.pop('ROS_IP',None)
     files=[Path(__file__),Path(__file__).with_name('known_target.py'),args.target,folder/'scene.world',
         WS/'src/super_px4_bridge/src/super_flight_manager.cpp',WS/'devel/lib/libso101_coordinate_truth.so']
     if args.observe_hover_permit: files.append(Path(__file__).with_name('hover_permit_probe.py'))
-    if args.observe_hover_permit:
+    if args.execute_approach: files.append(Path(__file__).with_name('hover_approach_probe.py'))
+    if args.execute_approach:
+        files += [ROOT/'src/modules/arm_control/grasp/HoverApproach.hpp',
+            ROOT/'src/modules/arm_control/grasp/HoverApproachAdapter.cpp',
+            WS/'src/super_px4_bridge/msg/KnownFlightStatus.msg',
+            WS/'src/super_px4_bridge/msg/KnownFlightSetpoint.msg',
+            WS/'src/super_px4_bridge/include/super_px4_bridge/known_flight_handover.h',
+            WS/'src/super_px4_bridge/config/grasp_frame_audit.yaml']
+    if args.observe_hover_permit or args.execute_approach:
         files += [BUILD/'bin/px4', ROOT/'src/modules/arm_control/grasp/HoverPermit.hpp',
             ROOT/'src/modules/arm_control/grasp/HoverPermitAdapter.cpp',
             WS/'src/super_px4_bridge/src/coordinate_truth_plugin.cpp',
             WS/'src/super_px4_bridge/msg/CoordinateTruth.msg']
-    save(folder/'manifest.json',dict(stage=3 if args.observe_hover_permit else 2,
+    save(folder/'manifest.json',dict(stage=4 if args.execute_approach else (3 if args.observe_hover_permit else 2),
+        no_close_approach=args.execute_approach,
         hover_prepare_only=args.observe_hover_permit,lidar=False,vehicle_fixed=False,object_attached=False,
-        arm_motion_requests_sent=False,gripper_requests_sent=False,grasp_tested=False,
+        arm_motion_requests_permitted=args.execute_approach,gripper_requests_sent=False,grasp_tested=False,
         localization_source='LIVE_GAZEBO_TRUTH_CONTROL_TRANSFORM_AND_VELOCITY_OFFSET_COMPENSATION',
         ekf_truth_injected=False,flight_pid_modified=False,planned=target.preview(),
         hashes={str(f):hashlib.sha256(f.read_bytes()).hexdigest() for f in files}))
@@ -178,7 +193,7 @@ def main():
     def safety():
         if hover_probe and hover_probe.error: raise RuntimeError(hover_probe.error)
         if any(proc.poll() is not None for proc in procs): raise RuntimeError('Own simulation process exited')
-        if time.monotonic()-started>260: raise RuntimeError('Wall watchdog exceeded')
+        if time.monotonic()-started>(440 if args.execute_approach else 260): raise RuntimeError('Wall watchdog exceeded')
         if time.monotonic()-progress>20 and last_sim is not None: raise RuntimeError('Sim clock stalled')
     try:
         core=start('roscore',['roscore'])
@@ -214,6 +229,11 @@ def main():
                 safety()
                 if time.monotonic()>deadline: raise RuntimeError('Unarmed refusal test timeout')
                 time.sleep(.01)
+        if args.execute_approach:
+            if not row['truth'].approach_geometry_valid:
+                raise RuntimeError('Known fixture geometry guard unavailable; no takeoff')
+            from hover_approach_probe import HoverApproachProbe
+            hover_probe=HoverApproachProbe(BUILD,env,subscribers,target,folder); hover_probe.start()
         start('flight_manager',['rosrun','super_px4_bridge','super_flight_manager_node',
             '_known_goal_mode:=true','_auto_arm:=true','_takeoff_height:='+str(takeoff_local),
             '_hover_stable_time:=2.0','__name:=known_flight_manager_probe'])
@@ -235,8 +255,9 @@ def main():
                 tilt=max(abs(math.atan2(R[2,1],R[2,2])),abs(math.asin(np.clip(-R[2,0],-1,1))))
                 if armed_seen and tilt>math.radians(15): raise RuntimeError('Tilt guard exceeded')
                 fold_error=float(np.max(np.abs(row['joints']-[-.07,-1.175,1.45,1.3,-1.57,.3])))
-                if fold_error>.08: raise RuntimeError('Folded arm departed initial target')
-                if now>120: raise RuntimeError('Simulation-time limit exceeded')
+                if fold_error>.08 and not (args.execute_approach and hover_probe.motion_started):
+                    raise RuntimeError('Folded arm departed initial target before approach')
+                if now>(300 if args.execute_approach else 120): raise RuntimeError('Simulation-time limit exceeded')
                 if route_start is None and row['manager']=='HOVER_READY':
                     route_start=now; route_point=body.copy()
                     print('HOVER_READY: known world route begins; arm remains folded.',flush=True)
@@ -245,6 +266,9 @@ def main():
                     lp,lv,yaw=local_motion(wp,wv,target.yaw,row['body'],row['local'],
                         row['actual_v'],row['estimated_body_v'])
                     cmd=KnownFlightSetpoint(); cmd.header.stamp=rospy.Time.now(); cmd.header.frame_id='map'; cmd.task_id=1
+                    if args.execute_approach:
+                        cmd.task_id,cmd.plan_id,cmd.target_id,cmd.scene_id=hover_probe.plan.ids
+                        cmd.terminal_hold=now-route_start>=6
                     cmd.setpoint.header=cmd.header; cmd.setpoint.coordinate_frame=PositionTarget.FRAME_LOCAL_NED
                     cmd.setpoint.type_mask=PositionTarget.IGNORE_AFX|PositionTarget.IGNORE_AFY|PositionTarget.IGNORE_AFZ|PositionTarget.IGNORE_YAW_RATE
                     cmd.setpoint.position.x,cmd.setpoint.position.y,cmd.setpoint.position.z=map(float,lp)
@@ -282,8 +306,9 @@ def main():
                 if row['manager']=='FAILSAFE_HOVER': raise RuntimeError('Flight input lease failed; no automatic resumption')
                 time.sleep(.004)
         if hover_probe:
-            result['hover_prepare']=hover_probe.finish(); hover_probe=None
-            if not result['hover_prepare']['hover_prepare_validated']:
+            key='hover_approach' if args.execute_approach else 'hover_prepare'
+            result[key]=hover_probe.finish(); hover_probe=None
+            if not result[key].get('approach_validated' if args.execute_approach else 'hover_prepare_validated'):
                 raise RuntimeError('Hover PREPARE tests incomplete')
         graph=rosgraph.Master('/known_target_graph').getSystemState()
         save(folder/'ros_graph.json',dict(publishers=graph[0],subscribers=graph[1],services=graph[2]))
@@ -294,7 +319,7 @@ def main():
         result.update(success=False,error=str(error),final_sim_s=last_sim)
     finally:
         if hover_probe:
-            try: result['hover_prepare']=hover_probe.finish()
+            try: result['hover_approach' if args.execute_approach else 'hover_prepare']=hover_probe.finish()
             except Exception as error:
                 result.update(success=False,hover_probe_error=str(error))
                 result['hover_prepare_events']=hover_probe.events
@@ -303,7 +328,10 @@ def main():
             for sub in subscribers.subscribers: sub.unregister()
         for proc in reversed(procs): stop(proc)
         for log in logs: log.close()
-        result.update(armed_seen=armed_seen,arm_motion_requests_sent=False,gripper_requests_sent=False,
+        request_count=(hover_probe.approach_request_count if args.execute_approach and hover_probe else
+            result.get('hover_approach',{}).get('approach_request_count',0))
+        result.update(armed_seen=armed_seen,arm_motion_requests_sent=bool(request_count),
+            arm_approach_request_count=request_count,gripper_requests_sent=False,
             grasp_tested=False,own_processes_stopped=True,wall_elapsed_s=time.monotonic()-started)
         save(folder/'result.json',result); print(json.dumps(result,indent=2,allow_nan=False),flush=True)
     return 0 if result['success'] else 2
