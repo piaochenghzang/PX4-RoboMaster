@@ -2138,3 +2138,118 @@ ROS 本地提交 `3f6efbc4c0de15b68860aa5cddce99d005c48c85`
 提交前 CTest 5/5、坐标 Python 11 项通过；去掉新增文件末尾空行后 diff --check 通过。
 本集中说明另作提交，未推送。
 旧 flight 未跟踪副本未改动；悬停抓取入口/实际许可仍未实现，闭爪与携物尚未执行。
+
+## 阶段 23：悬停准备许可、拒绝与撤销（2026-10-15）
+
+本轮只访问 Ubuntu-20.04。继续无雷达、动态飞机、折叠臂的已知目标 SITL；
+没有发送机械臂运动或闭爪命令，没有启动 hover 抓取 profile，也未调飞行 PID。
+完成后按授权本地提交，未推送：
+
+- ROS `0b5b426448e5acd971a346423d97610dc8f89e1b`：真实夹爪/物体速度采集。
+- PX4 `200c60eec2626a457f76b1384016b3f605bd39ab`：可撤销 PREPARE 与无动作验收。
+- 本集中说明另作提交。原未跟踪 tests/flight/ 副本保持不动，子模块未改动。
+
+### 接口及修改范围
+
+新增 ArmHoverContext/Request/Status 三个 uORB 话题，独立于已有 ARM_JOINT 和
+bench 抓取消息。SITL 本地入口 `arm_control hover_context ...` 只发布观测上下文；
+`arm_control hover_grasp_prepare <task>` 只申请准备票据。
+两者在非 SITL 构建中拒绝。没有新增 MAVLink 抓取执行入口，也不接受此票据发动作。
+
+`grasp/HoverPermit.hpp` 分离悬停条件与准备票据；`HoverPermitAdapter.cpp`
+读取 PX4 原生状态并接入 ArmControl。只有悬停条件合格、任务匹配、关节反馈健康且
+原抓取流程未占有控制权，才能接受准备。任一条件退出、关节反馈过期、换任务或
+抓取流程占有控制权时撤销；恢复不自动准备，旧 request ID 不能再次生效。
+`motion_authorized` 和 `close_authorized` 全程硬编码 false。
+
+ROS CoordinateTruth 追加夹爪 link 原点和目标 model 原点的世界线/角速度；
+与 pose 同物理步采集，缺失/不支持的目标明确 invalid，不补零。
+测试参考点速度使用 v_link + omega × R*offset，不能把 link 原点速度当工具点速度。
+偏移仍是现有 cube20 碰撞模板 (-.0079,-.000218121,-.0981274) m，不是任意 IK TCP。
+已同步运行工作区和 ROS Git 副本；现有台架控制/夹持参数不变。
+
+### 本轮门限与边界
+
+准备候选连续 2 s 要求：世界悬停位置误差 ≤3 cm、线速度 ≤0.05 m/s、
+角速度 ≤0.10 rad/s、真实总倾角 ≤5°；四电机控制量有限、非负、最大 <0.95，
+原生分配器推力/力矩达成且无已处理电机故障/停转掩码。
+PX4 必须 ARMED + OFFBOARD、未落地、非 failsafe，本地位置/速度有效并且
+heading_good_for_control=true。位置/速度来自 Gazebo 真值，不声称 EKF 精度已验收。
+
+源物理时间年龄 ≤100 ms、未来偏差 ≤20 ms，重复序号不能刷新接收年龄；
+新任务前不接受时钟回退、世代或原生 xy/z/vxy/vz/heading reset counter 变化。
+原生位置/电机/分配器数据 ≤300 ms、vehicle_status ≤1 s、关节反馈 ≤200 ms。
+land_detected 发布约 1 Hz，实际允许年龄 1.2 s 而非草案 1 s，容纳周期与排队；
+这不改变几何/速度门限。模块更新周期 100 ms，延迟报告采用仿真时间观测值，
+不把观察器轮询延迟冒充精确控制反应时间。
+
+close_geometry_ready 还检查参考点对齐 ≤3 mm、相对速度 ≤5 mm/s、姿态差 ≤5°；
+它只是几何诊断，本轮保持 false，也不能触发闭爪。start_ready 只表示悬停候选，
+不等于完整抓取授权。当前任务 ID 仅绑定本地上下文与准备请求，没有完成与
+ROS 飞行租约/profile/目标实体的执行级绑定；这些是接 hover 执行入口前的剩余项。
+
+### 实测发现及修复
+
+原 1.5 m 场景 `hover_prepare_20261015_01` 已到位但一直拒绝准备。
+只读核对发现原生 heading_good_for_control=false。当前
+EKF/ekf.h 的 isYawFinalAlignComplete() 要求飞行中磁场对齐完成；
+aid_sources/magnetometer/mag_control.cpp 的 checkHaglYawResetReq()
+在估计 HAGL >1.5 m 才请求该对齐。世界高度 1.5 m 不代表估计 HAGL 已越过门限。
+本轮未关闭此检查、未写 EKF 参数，也不把这一拒绝记作通过。
+
+新增 `known_target_high.json` 对照：方块世界 z=1.7643621485 m，
+派生悬停机体原点 (0.416721237,0.005129812,1.9) m；原配置未改。
+协调器等待原生航向最终对齐后才发送第一个任务上下文，避免把正常起飞对齐的
+reset 当作已经绑定任务后的异常；绑定后再发生 reset 仍锁止，不能自动恢复。
+
+`_02` 原型完成整组接受/撤销；随后补强了持续检查关节反馈的撤销条件。
+`_03` 在 72.003 s 捕获实际位置误差 0.03040 m，准备刚接受就被原生门控撤销。
+初版测试把“下次读取前已撤销”误报异常；修正后该情况只记撤销、等待重新合格，
+不计接受正例。补了对应观察竞态单元测试；保留失败产物，不回写成通过。
+
+最终 `hover_prepare_20261015_04` 完整通过，独立 `verify_hover_case.py`
+交叉检查 result、原始 hover_status.jsonl、telemetry.jsonl、初末目标与事件：
+
+| 情形 | 实测结果 | 撤销观测延迟（仿真秒） |
+|---|---|---:|
+| 无上下文/未解锁、任务不符 | 拒绝；不产生准备 | — |
+| 正常真实悬停 | 5 次 PREPARE 接受，无动作授权 | — |
+| invalid 输入 | 撤销并拒绝重试 | 0.100 |
+| 速度注入至至少 0.06 m/s | 撤销并拒绝重试 | 0.103 |
+| 位置误差注入至至少 0.04 m | 撤销并拒绝重试 | 0.107 |
+| 观测上下文断流 | 过期撤销并拒绝重试 | 0.201 |
+| 重发原始序号/采样时间 | 不能续期，撤销并拒绝重试 | 0.210 |
+
+五次恢复后均不自动准备。注入只改变许可测试输入，不改变飞机、物体或关节状态。
+关节链实际断开/飞行模式丢失没有在空中注入；原生条件拒绝、票据撤销/重放/任务变化
+等纯逻辑已覆盖，不能据此声称实际拔断整条 MAVLink 链也已验收。
+
+到位后观察 19.751 s，世界位置平均/最大误差 1.894/3.584 cm，最大折叠误差
+0.02141 rad。粗包络通过不代表持续处于 3 cm 抓取许可内，短暂越界仍会撤销。
+初末 target_sequence=0，六关节 joint_target 均为
+[-.07,-1.175,1.45,1.3,-1.57,.3]，抓取状态始终 IDLE、不占有控制权。
+唯一飞行发布者 /known_flight_manager_probe；无绑定物体、锚点、雷达或闭爪。
+hover_prepare_validated=true、hover_grasp_permission_validated=false、
+grasp_tested=false。测试自行清理本轮进程，没有验证降落、携物或飞行抓取。
+
+### 回归、复现和后续
+
+最终 SITL/ROS 编译成功；纯 C++ 门控/票据 26 项、观察器 Python 5 项、
+已知目标坐标 11 项、原台架场景 19 项、原抓取逻辑 16 项及 ROS CTest 5/5 通过。
+独立离线核验 verified=true；提交检查仅修剪新增文件末尾空行，不改变逻辑。
+
+```bash
+source /opt/ros/noetic/setup.bash
+source /home/pcz/super_ws/devel/setup.bash
+cd /home/pcz/PX4-RoboMaster
+python3 src/modules/arm_control/tests/hover/run_known_target_flight.py my_prepare_case \
+  --execute-flight --observe-hover-permit \
+  --target src/modules/arm_control/tests/hover/known_target_high.json
+python3 src/modules/arm_control/tests/hover/verify_hover_case.py \
+  build/known_target_flight/my_prepare_case
+```
+
+名称必须唯一、已有仿真会拒绝启动。结果目录保存场景、manifest/二进制与源码哈希、
+原始状态/真值、ROS graph、日志/ULog、result.json；最终轮另存 verification.json。
+本阶段只交付可撤销的“准备”接口。下一步再接执行级飞行租约/目标绑定、独立
+hover profile 和精确接近入口，继续先无闭爪；不能直接将 bench profile 解除锚点。
