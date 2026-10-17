@@ -1,11 +1,10 @@
 """No-close local SITL tests of native hover PREPARE, refusal and revocation."""
 import json
 import math
-import re
-import subprocess as sp
 import threading
 import numpy as np
 from known_target import rotation
+from native_client import NativeClient
 
 CUBE_REFERENCE = np.array([-.0079, -.000218121, -.0981274])
 
@@ -48,12 +47,13 @@ def metrics(row, target):
     return result
 
 
-class HoverPermitProbe:
+class HoverPermitProbe(NativeClient):
     """Fault injection affects permission inputs ONLY, never vehicle/arm setpoints."""
     FAULTS = [('invalid', 4), ('speed', 64), ('position', 32), ('drop', 2), ('replay', 2)]
 
     def __init__(self, build, env, sources, target, folder):
-        self.build, self.env, self.sources, self.target = build, env, sources, target
+        super().__init__(build, env)
+        self.sources, self.target = sources, target
         self.log = (folder / 'hover_status.jsonl').open('x')
         self.events = []; self.complete = False; self.error = None; self.latest = {}
         self.stop_event = threading.Event()
@@ -65,26 +65,6 @@ class HoverPermitProbe:
         self.baseline = self.status('arm_control_status')
         self.assert_unchanged()
         self.thread = threading.Thread(target=self.run, daemon=True)
-
-    def client(self, module, *args):
-        result = sp.run([str(self.build / 'bin' / ('px4-' + module)), *map(str, args)],
-            env=self.env, stdout=sp.PIPE, stderr=sp.STDOUT, text=True, timeout=4)
-        if result.returncode: raise RuntimeError(module + ' failed: ' + result.stdout)
-        return result.stdout
-
-    def status(self, topic):
-        out = {}
-        for line in self.client('listener', topic, 1).splitlines():
-            m = re.match(r'\s+(\w+):\s+(.+)', line)
-            if not m: continue
-            key, value = m.groups(); value = value.strip()
-            if value.startswith('['): out[key] = [float(x) for x in value.strip('[]').split(',')]
-            elif value in ('True', 'False'): out[key] = value == 'True'
-            else:
-                try: out[key] = float(value.split()[0])
-                except ValueError: pass
-        if 'timestamp' not in out: raise RuntimeError('Missing native ' + topic)
-        return out
 
     def assert_unchanged(self):
         arm = self.status('arm_control_status'); grasp = self.status('arm_grasp_status')

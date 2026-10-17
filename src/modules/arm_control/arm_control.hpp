@@ -182,6 +182,7 @@ private:
     static bool computeDLSJointStep(const JacobianPos &J, const matrix::Vector3f &error, float dq[ARM_DOF]);
     IKResult solvePositionIK(const float q_initial[ARM_DOF], const matrix::Vector3f &target_position, float q_solution[ARM_DOF]);
     bool updateIKTarget(const matrix::Vector3f &target_position);
+    int previewCartesianIK(const matrix::Vector3f &target_position);
     static const char *ikStatusString(IKStatus status);
     static uint8_t convertIkStatus(IKStatus status);
 

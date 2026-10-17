@@ -40,6 +40,7 @@ px4_add_module(
 	SRCS
 		arm_control.cpp
 		arm_control.hpp
+		diagnostics/IKPreview.cpp
 		grasp/GraspStateMachine.cpp
 		grasp/GraspAdapter.cpp
 		grasp/HoverPermitAdapter.cpp
