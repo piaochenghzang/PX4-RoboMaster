@@ -3,25 +3,28 @@
 本文件合并原 INTERFACE、KINEMATICS、ELBOW_TRACKING、TARGET_SWITCH、
 GRASP 五份专项记录。后续修改和实验只维护本文；原记录可从 Git 历史恢复。
 以下历史章节描述各阶段当时的结果，“未提交”和“下一步”不代表当前状态。
-最新增量见文末「第九步：夹爪失联保持与界面复现」；本轮修改了 Ubuntu20
-的下位 ROS 插件，但 ROS 仓库仍不提交。历史章节的“未修改 ROS”仅描述当时状态。
+最新状态见文末「第二十五步：原生 IK 只读检测与主链清理」。
+本轮只在 Ubuntu-20.04 检测和整理 PX4 仓库，未修改 ROS 库、模型或控制参数，
+未提交或推送。历史章节的“未提交”“ROS 不提交”等仅描述当时状态。
 
-## 目录与职责（2026-09-28）
+## 目录与职责（2026-10-17）
 
 ```text
 src/modules/arm_control/
   arm_control.cpp / arm_control.hpp    PX4 运行模块、IK、目标轨迹和反馈
   ArrivalCheck.hpp                    严格到位判定
   CMakeLists.txt / Kconfig             固件构建配置
+  grasp/                             抓取状态机、悬停许可与无闭爪接近
+  diagnostics/IKPreview.cpp           SITL 原生 IK 只读诊断，不投递目标
   tests/
     kinematics/                       FK 对照与到位判定边界测试
-    grasp/                            几何审查、隔离夹具、整臂抓取实验
+    grasp/                            整臂台架基线、夹持/故障回归与独立时钟
+    hover/                            已知目标、飞行/许可/接近及只读 IK 检查
 ```
 
-主机实验源码不加入飞控模块 CMake。迁移修正了 Python 仓库根目录定位
-及 test_arrival.cpp 头文件引用；脚本名和隔离实验参数保持不变。
-运行结果集中在 build/grasp_validation 或 build/full_arm_grasp，不放进源码目录。
-ROS 库不提交；正常机体、模型和控制参数不因目录迁移而修改。
+主机实验源码不加入飞控模块 CMake；diagnostics 实现仅在 SITL 预处理编译，
+实机命令拒绝该入口。历史双连杆夹具和旧 SUPER 试验已归档，见第二十五步；
+当前保留整臂基线和已知目标主链。运行结果放在 build 下，不放进源码目录。
 
 ## 接口规范与现有约束
 
@@ -2394,4 +2397,123 @@ source /home/pcz/super_ws/devel/setup.bash
 python3 src/modules/arm_control/tests/hover/run_known_target_flight.py UNIQUE_CASE \
   --execute-flight --execute-approach \
   --target src/modules/arm_control/tests/hover/known_target_approach.json
+```
+
+
+## 第二十五步：原生 IK 只读检测与主链清理（2026-10-17）
+
+### 本轮边界与结论
+
+按最新审阅意见，本轮只检查原生 IK、拒绝用例及检查前后目标不变。
+所有部位仍保留 16 mm 净空，不增加手指接触豁免，不闭爪。
+没有发送飞行、PREPARE、展开、笛卡尔目标或夹爪请求；原有折叠保持照常运行。
+只使用 Ubuntu-20.04，未访问 Ubuntu22，未改 PID、限位、SDF 或 ROS 源码。
+
+`fixed_target_readonly_20261017_03` 和最终整理后的 `_04` 均通过只读检测。
+最终证据：`build/fixed_target_checks/fixed_target_readonly_20261017_04/`。
+`inspection_verified=true`，`final_armed=false`，无飞行设定值发布者；
+`flight_tested=false`、`grasp_tested=false`，不能当作到位、抓取或飞行正例。
+
+### 原生入口和坐标转换
+
+新增 `diagnostics/IKPreview.cpp`，命令为 `arm_control ik_check x y z`。
+仅 SITL 可用；从新鲜 arm_control_status 快照取得合法种子，调用现有
+solvePositionIK，结果只写日志。不会调用 updateIKTarget/sanitizeCartesianTarget，
+不会写 IK 缓存、目标、到位计时或任务所有权，也不会投递关节命令。
+诊断成功执行不等于解算成功：正常拒绝可返回 0，必须读取
+workspace_valid / ik_evaluated / ik_success；参数格式非法返回非零。
+
+`tests/hover/fixed_grasp_target.py` 只做坐标转换与严格结果解析。
+继续使用已校核的 pad 参考点和 FK 工具偏置，不把方块中心直接当工具原点：
+
+- 由世界物体姿态减去旋转后的夹持参考偏置，得到夹爪坐标。
+- 乘以 gripper_frame 工具偏置，再转换到计划或实测 SO101 基座坐标。
+- 位置 IK 仍是位置 IK；该参考姿态不是原生 IK 已满足完整抓取方向的证明。
+
+`check_fixed_target_native.py` 默认只打印预览。显式 `--native-sim` 才会
+启动其拥有的未解锁仿真；拒绝占用已有仿真，退出只清理自建进程。
+每条查询先保存原始输出，再解析，并在每个用例后读取三类状态进行比较。
+新增共享 `native_client.py`，替代借用 HoverPermitProbe 未初始化实例的做法；
+已有准备许可观察器复用它，不改变准备/拒绝逻辑。
+
+修复三个检测基础问题：
+
+- PX4 日志单条文本有限，原长 JSON 会截断；现在拆为短记录，缺失或截断即拒绝。
+- 空闲状态的未测量 inf 保留为 JSON 字符串标记；反馈、关节目标和 IK 结果仍严格校验。
+- 原生 -1.57f 输出为 -1.57000005；解析按相同 float32 比较，不扩大真实关节范围。
+
+### 最终实测用例
+
+| 检查 | 实际结果 |
+|---|---|
+| 计划悬停假设下固定工具点 | 臂系约 (0.218480, 0.015814, 0.077299) m；原生 IK 成功，残差 0.073921 mm |
+| 同一点重复查询 | 解、误差及种子序号完全一致 |
+| 未解锁实际机体位姿下的同一世界点 | 在臂工作空间外，未进入 IK；不能冒充飞机已到计划悬停位 |
+| 盒外 (0.5, 0, 0.05) m | workspace_valid=false，未进入 IK |
+| 盒内远点 (0.39, 0.24, 0.39) m | 原生求解失败，残差约 77.709 mm；未接受或发布目标 |
+| NaN、Inf、尾随字符、缺参数 | 全部返回非零，拒绝输入 |
+
+9 次查询/拒绝后及最终快照共 10 个不变性检查点：
+六关节 joint_target 最大变化 0 rad，target_sequence、ik_status、ik_error 不变；
+抓取/接近 phase、last_request_id 不变，所有权始终未锁定，夹爪目标始终 0.3 rad。
+每项状态和输出分别保存在 native/、invariants.json、before.json、after.json。
+上述 0 rad 是原生 listener 状态浮点读出精度下的差值，不是额外的位级测量；
+同时通过目标序号/缓存/所有权核对与只读实现审阅确认未投递或写入新目标。
+
+这里证明的是“只读解算/拒绝不改变控制目标”，不是物理运动全程安全。
+本轮没有执行净空路径审查、碰撞接触、完整朝向到位或抓取。
+原 16 mm 拒绝仍有效，不能因位置 IK 成功就直接闭爪。
+
+失败尝试也保留：20261015_01 为日志解析失败；20261017_01 为空闲 inf 保存失败；
+20261017_02 为 float32 边界误报。未覆盖或改写为成功。
+
+### 清理范围、保留主链与恢复
+
+删除 5 个历史源文件，共 1407 行原文件内容：
+
+- tests/grasp/grasp_fixture.py、grasp_probe.cpp、grasp_load_plugin.cpp、run_grasp_case.py：
+  旧双连杆夹具、载荷与探针实验。没有当前运行主链引用。
+- tests/flight/run_empty_arm_hover.py：早期 SUPER 接管试验，原为未跟踪文件；
+  当前已知目标流程不依赖 SUPER/雷达，不继续保留这套独立试验入口。
+
+删除前已将上述五项及旧 run_full_arm_grasp.py 一并归档：
+`build/cleanup_backup_20261017_01/legacy_experiments.tar.gz`。
+SHA-256：
+`0d2635f7a8fa6de0a86b6169de7d0889dabfded2fd9650fb04bec31320886d56`。
+四个已跟踪旧文件还可从 Git 历史恢复；未跟踪飞行脚本必须使用该备份。
+需要恢复时先解压到新的审阅目录，不直接覆盖当前源码。
+备份在被忽略的 build 内，尚未上传；清理 build 前应另存。
+
+旧 grasp_probe.cpp 的时钟分支仍是全臂基线依赖，不能整段丢弃：
+已原样抽成 grasp_clock_plugin.cpp，更新整臂编译和源码指纹入口，
+仍为不超过 100 Hz 的 Gazebo 仿真时间，无控制命令。
+另删除本轮未验收、超出当前范围的假设终态碰撞审计分支，避免混淆只读 IK 结论。
+
+当前保留的工作链：
+
+`已知目标/坐标转换 → 飞行目标接管 → 悬停许可 → 原生不闭爪接近`；
+后续经审阅后再接闭爪、抬起与回收。
+台架整臂抓取基线、夹持反馈、失联保持、取消/失败退出和关键回归全部保留；
+台架锚点 profile 不作为飞行入口。旧章节仍保留实验历史，
+其中已删除入口的命令仅是历史记录，不再是当前推荐运行方式。
+
+### 回归和复测入口
+
+最终 SITL 构建通过；只读/坐标/计划/观察器 Python 35 项、全臂场景 19 项、
+原生接近、悬停许可和 16 项抓取逻辑通过；102 组 SDF/FK 对照与到位边界通过。
+抽取后的独立时钟插件编译通过。未重跑会驱动夹爪的物理台架实验。
+本轮未新增其他说明文档，未自动提交或推送。
+
+```bash
+# 无 ROS/控制连接的默认预览
+python3 src/modules/arm_control/tests/hover/check_fixed_target_native.py
+
+# 独立未解锁只读复测，不执行飞行/展开/闭爪；需使用唯一名称
+source /opt/ros/noetic/setup.bash
+source /home/pcz/super_ws/devel/setup.bash
+python3 src/modules/arm_control/tests/hover/check_fixed_target_native.py UNIQUE_NAME --native-sim
+
+# 不启动仿真的离线回归
+cd src/modules/arm_control/tests/hover
+python3 -m unittest test_fixed_target_native test_known_target test_hover_probe test_approach_plan -v
 ```
