@@ -303,7 +303,7 @@ def main():
                PX4_SIM_MODEL='gazebo-classic_yhang550',PX4_SYS_AUTOSTART='1020')
     flags=shlex.split(sp.check_output(['pkg-config','--cflags','--libs','gazebo'],text=True))
     with (folder/'build.log').open('w') as log:
-        for source,output,extra in [('full_arm_probe.cpp','observer',[]),('grasp_probe.cpp','libgrasp_clock.so',['-DSO101_CLOCK_PLUGIN','-shared','-fPIC'])]:
+        for source,output,extra in [('full_arm_probe.cpp','observer',[]),('grasp_clock_plugin.cpp','libgrasp_clock.so',['-shared','-fPIC'])]:
             sp.run(['g++','-std=c++17',str(HERE/source),'-o',str(folder/output),*extra,*flags,'-pthread'],check=True,stdout=log,stderr=sp.STDOUT,timeout=120)
     build_world(folder,env,calibration,args.iterations,args.cube_mm,args.gripper_p,args.solver,args.patch_radius_mm,args.fsm,args.gui,args.no_lidar)
     if args.fsm_test=='missing_object':
@@ -315,7 +315,7 @@ def main():
         scene=ET.parse(folder/'scene.world')
         scene.find("world/model[@name='yhang550']/plugin[@name='mavlink_interface']/mavlink_tcp_port").text='4562'
         scene.write(folder/'scene.world',encoding='unicode',xml_declaration=True)
-    source_paths=[HERE/'run_full_arm_grasp.py',HERE/'full_arm_probe.cpp',HERE/'grasp_probe.cpp',folder/'scene.world',BUILD/'bin/px4',
+    source_paths=[HERE/'run_full_arm_grasp.py',HERE/'full_arm_probe.cpp',HERE/'grasp_clock_plugin.cpp',folder/'scene.world',BUILD/'bin/px4',
                   MODELS/'so101/so101.sdf',MODELS/'yhang550/yhang550.sdf',MODELS/'yhang550_base/yhang550_base.sdf',MODELS/'test_cube/model.sdf',
                   Path('/home/pcz/super_ws/devel/lib/libso101_joint_position_controller.so'),BUILD/'build_gazebo-classic/libgazebo_mavlink_interface.so']
     source_paths += [Path('/home/pcz/super_ws/src/so101_gazebo/src/joint_position_controller.cpp'),
