@@ -227,13 +227,17 @@ def main():
             ROOT/'src/modules/arm_control/grasp/HoverPermitAdapter.cpp',
             WS/'src/super_px4_bridge/src/coordinate_truth_plugin.cpp',
             WS/'src/super_px4_bridge/msg/CoordinateTruth.msg']
+    parameter_overrides={name[len('PX4_PARAM_'):]:value for name,value in env.items()
+        if name.startswith('PX4_PARAM_')}
     save(folder/'manifest.json',dict(stage=5 if args.execute_fixed_grasp else (4 if args.execute_approach else (3 if args.observe_hover_permit else 2)),
         no_close_approach=args.execute_approach,
         hover_prepare_only=args.observe_hover_permit,lidar=False,vehicle_fixed=False,object_attached=False,
         arm_motion_requests_permitted=args.execute_approach or args.execute_fixed_grasp,
         fixed_grasp_permitted=args.execute_fixed_grasp,gripper_requests_sent=False,grasp_tested=False,
         localization_source='LIVE_GAZEBO_TRUTH_CONTROL_TRANSFORM_AND_VELOCITY_OFFSET_COMPENSATION',
-        ekf_truth_injected=False,flight_pid_modified=False,planned=target.preview(),
+        ekf_truth_injected=False,px4_parameter_overrides=parameter_overrides,
+        flight_pid_modified=any(name.startswith(('MPC_','MC_')) for name in parameter_overrides),
+        planned=target.preview(),
         precision_hover=dict(additional_flight_controller=False,
             strategy='BASE_HOLD_AFTER_UNFOLD_THEN_WORLD_TCP_IK'),
         hashes={str(f):hashlib.sha256(f.read_bytes()).hexdigest() for f in files}))
