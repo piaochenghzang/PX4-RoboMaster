@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-"""Stage 2 bounded local-SITL known-target flight; never sends arm/gripper targets."""
+"""Bounded local-SITL known-target flight; arm execution requires explicit opt-in."""
 import argparse
-import csv
 import hashlib
 import json
 import math
@@ -14,6 +13,7 @@ import sys
 import threading
 import time
 import xml.etree.ElementTree as ET
+from collections import deque
 import numpy as np
 import rosgraph
 import rospy
@@ -29,7 +29,7 @@ BUILD=ROOT/'build/px4_sitl_default'
 WS=Path('/home/pcz/super_ws')
 MODELS=ROOT/'Tools/simulation/gazebo-classic/sitl_gazebo-classic/models'
 sys.path.insert(0,str(ROOT/'src/modules/arm_control/tests/grasp'))
-from run_full_arm_grasp import remove_lidar
+from run_full_arm_grasp import remove_lidar,set_pad_patch
 
 
 def values(p):
@@ -54,6 +54,7 @@ class Sources:
         self.lock=threading.RLock()
         self.state=None; self.odom=None; self.truth=None; self.manager=''
         self.known_status=None
+        self.truth_history=deque(maxlen=200)
         self.subscribers=[
             rospy.Subscriber('/mavros/state',State,lambda m:self.update('state',m),queue_size=50),
             rospy.Subscriber('/mavros/local_position/odom',Odometry,lambda m:self.update('odom',m),queue_size=100),
@@ -62,7 +63,18 @@ class Sources:
         self.subscribers.append(rospy.Subscriber('/grasp_demo/known_status',KnownFlightStatus,
             lambda m:self.update('known_status',m),queue_size=20))
     def update(self,key,value):
-        with self.lock: setattr(self,key,value)
+        with self.lock:
+            if key=='truth':
+                if self.truth_history:
+                    old=self.truth_history[-1]
+                    identity=lambda t:(t.source_instance,t.world_epoch,t.vehicle_id,t.target_id)
+                    if identity(old)!=identity(value) or value.header.stamp<old.header.stamp:
+                        self.truth_history.clear()
+                    elif value.header.stamp==old.header.stamp:return
+                self.truth_history.append(value)
+            setattr(self,key,value)
+    def truth_samples(self):
+        with self.lock:return list(self.truth_history)
     def read(self):
         with self.lock: state,odom,truth,manager,known=self.state,self.odom,self.truth,self.manager,self.known_status
         now=rospy.Time.now().to_sec()
@@ -92,7 +104,7 @@ class Sources:
             truth=truth,ages=ages,joints=joint_values,known_status=known)
 
 
-def make_world(folder,target,env,approach_guard=False):
+def make_world(folder,target,env,approach_guard=False,fixed_grasp=False):
     expanded=sp.check_output(['gz','sdf','-p',str(MODELS/'yhang550/yhang550.sdf')],
         env=env,text=True,timeout=30)
     model=ET.fromstring(expanded).find('model'); remove_lidar(model)
@@ -100,6 +112,20 @@ def make_world(folder,target,env,approach_guard=False):
     if p is None: p=ET.SubElement(model,'pose')
     p.text='0 0 0 0 0 0'
     if model.find("joint[@name='bench_anchor']") is not None: raise RuntimeError('Unexpected fixed bench')
+    if fixed_grasp:
+        from fixed_demo_plan import configure_arm_hold
+        configure_arm_hold(model)
+        bridge=model.find("plugin[@name='mavlink_interface']")
+        ET.SubElement(bridge,'enableArmGraspFeedback').text='true'
+        controller=model.find("plugin[@name='gripper_controller']")
+        controller.find('p').text='.25'
+        ET.SubElement(controller,'commandTimeoutPolicy').text='last_target'
+        joint=next(j for j in model.findall('joint') if j.get('name').split('::')[-1]=='gripper')
+        joint.find('axis/limit/lower').text='.04';joint.find('axis/limit/upper').text='.3'
+        pads=[c for c in model.iter('collision') if c.get('name','').split('::')[-1] in
+            ('gripper_fixed_finger_collision','moving_jaw_collision')]
+        if len(pads)!=2:raise RuntimeError('Cannot identify both production pads')
+        for pad in pads:set_pad_patch(pad,4)
     tree=ET.parse(ROOT/'Tools/simulation/gazebo-classic/sitl_gazebo-classic/worlds/empty.world')
     tree.getroot().set('version','1.7'); world=tree.find('world')
     world.find('physics/ode/solver/iters').text='40'
@@ -107,20 +133,32 @@ def make_world(folder,target,env,approach_guard=False):
     R=target.object[:3,:3]
     rpy=[math.atan2(R[2,1],R[2,2]),math.asin(np.clip(-R[2,0],-1,1)),math.atan2(R[1,0],R[0,0])]
     cube=ET.parse(MODELS/'test_cube/model.sdf').find('model')
+    if fixed_grasp:
+        # This calibrated fixture is tilted. Change only its experiment copy,
+        # not the production object, mass, or inertia; no artificial attachment.
+        for coefficient in cube.findall('.//collision/surface/friction/ode/*'):
+            if coefficient.tag in ('mu','mu2'):coefficient.text='1.2'
     p=cube.find('pose')
     if p is None: p=ET.SubElement(cube,'pose')
     p.text=' '.join(map(str,[*target.object[:3,3],*rpy])); world.append(cube)
     support=ET.SubElement(world,'model',name='cube_support'); ET.SubElement(support,'static').text='true'
     down=1 if R[2,2]<0 else -1
     center=target.object[:3,3]+down*R[:,2]*.012
+    if fixed_grasp:
+        from fixed_demo_plan import SUPPORT_OFFSET_X
+        center=center+R[:,0]*SUPPORT_OFFSET_X
     ET.SubElement(support,'pose').text=' '.join(map(str,[*center,*rpy]))
     link=ET.SubElement(support,'link',name='link')
     for kind in ('collision','visual'):
         e=ET.SubElement(link,kind,name=kind)
-        ET.SubElement(ET.SubElement(ET.SubElement(e,'geometry'),'box'),'size').text='.012 .014 .004'
+        ET.SubElement(ET.SubElement(ET.SubElement(e,'geometry'),'box'),'size').text='.004 .024 .004' if fixed_grasp else '.012 .014 .004'
+        if fixed_grasp and kind=='collision':
+            ode=ET.SubElement(ET.SubElement(ET.SubElement(e,'surface'),'friction'),'ode')
+            for coefficient in ('mu','mu2'):ET.SubElement(ode,coefficient).text='1.2'
     plugin=ET.SubElement(world,'plugin',name='coordinate_truth',filename='libso101_coordinate_truth.so')
     ET.SubElement(plugin,'vehicleName').text='yhang550'; ET.SubElement(plugin,'targetName').text=target.name
     if approach_guard: ET.SubElement(plugin,'approachGuard').text='true'
+    if fixed_grasp: ET.SubElement(plugin,'fixedGraspGuard').text='true'
     tree.write(folder/'scene.world',encoding='unicode',xml_declaration=True)
 
 
@@ -130,12 +168,20 @@ def main():
     p.add_argument('--observe-hover-permit',action='store_true',
         help='Test PREPARE/refusal/revocation only; never move the arm or close the jaw')
     p.add_argument('--execute-approach',action='store_true',help='Bounded native arm approach; jaw target never changes')
-    p.add_argument('--target',type=Path,default=Path(__file__).with_name('known_target.json'))
+    p.add_argument('--execute-fixed-grasp',action='store_true',help='Explicit fixed-point controlled contact, close and 30mm lift')
+    p.add_argument('--target',type=Path)
     args=p.parse_args()
-    if args.execute_approach and args.observe_hover_permit: p.error('Choose permission tests OR no-close approach')
-    target=KnownTarget(json.loads(args.target.read_text()))
+    if sum([args.execute_approach,args.observe_hover_permit,args.execute_fixed_grasp])>1:
+        p.error('Choose permission, no-close approach OR explicit fixed grasp')
+    args.target=args.target or Path(__file__).with_name('known_target_fixed.json' if args.execute_fixed_grasp else 'known_target.json')
+    template=None
+    if args.execute_fixed_grasp:
+        from fixed_demo_plan import FixedDemoPlan
+        template=FixedDemoPlan(args.target);precheck=template.preview();target=template.target
+        if not precheck['sampled_geometry_feasible']:p.error('Fixed demo numerical geometry rejected')
+    else:target=KnownTarget(json.loads(args.target.read_text()))
     if not args.execute_flight:
-        if args.observe_hover_permit or args.execute_approach: p.error('Execution requires --execute-flight')
+        if args.observe_hover_permit or args.execute_approach or args.execute_fixed_grasp: p.error('Execution requires --execute-flight')
         print(json.dumps(target.preview(),indent=2)); return 0
     if not args.name.replace('_','').isalnum(): p.error('Use a unique safe case name')
     if target.name!='test_cube': p.error('This first fixture supports test_cube only')
@@ -156,7 +202,8 @@ def main():
         LD_LIBRARY_PATH=str(WS/'devel/lib')+':'+str(BUILD/'build_gazebo-classic')+
             ':/opt/ros/noetic/lib:/usr/lib/x86_64-linux-gnu/gazebo-11/plugins',
         GAZEBO_MODEL_DATABASE_URI='',PX4_SIM_MODEL='gazebo-classic_yhang550',PX4_SYS_AUTOSTART='1020')
-    env.pop('ROS_IP',None); make_world(folder,target,env,args.execute_approach)
+    env.pop('ROS_IP',None); make_world(folder,target,env,args.execute_approach or args.execute_fixed_grasp,args.execute_fixed_grasp)
+    if template:save(folder/'fixed_demo_plan.json',precheck)
     # Parent ROS probe and owned children must use the same local master.
     os.environ.update(ROS_MASTER_URI=env['ROS_MASTER_URI'],ROS_HOSTNAME='localhost')
     os.environ.pop('ROS_IP',None)
@@ -164,6 +211,10 @@ def main():
         WS/'src/super_px4_bridge/src/super_flight_manager.cpp',WS/'devel/lib/libso101_coordinate_truth.so']
     if args.observe_hover_permit: files.append(Path(__file__).with_name('hover_permit_probe.py'))
     if args.execute_approach: files.append(Path(__file__).with_name('hover_approach_probe.py'))
+    if args.execute_fixed_grasp:
+        files += [Path(__file__).with_name('fixed_demo_plan.py'),Path(__file__).with_name('fixed_grasp_probe.py'),
+            Path(__file__).with_name('native_client.py'),
+            ROOT/'src/modules/arm_control/grasp/FixedGrasp.hpp',ROOT/'src/modules/arm_control/grasp/FixedGraspAdapter.cpp']
     if args.execute_approach:
         files += [ROOT/'src/modules/arm_control/grasp/HoverApproach.hpp',
             ROOT/'src/modules/arm_control/grasp/HoverApproachAdapter.cpp',
@@ -171,17 +222,20 @@ def main():
             WS/'src/super_px4_bridge/msg/KnownFlightSetpoint.msg',
             WS/'src/super_px4_bridge/include/super_px4_bridge/known_flight_handover.h',
             WS/'src/super_px4_bridge/config/grasp_frame_audit.yaml']
-    if args.observe_hover_permit or args.execute_approach:
+    if args.observe_hover_permit or args.execute_approach or args.execute_fixed_grasp:
         files += [BUILD/'bin/px4', ROOT/'src/modules/arm_control/grasp/HoverPermit.hpp',
             ROOT/'src/modules/arm_control/grasp/HoverPermitAdapter.cpp',
             WS/'src/super_px4_bridge/src/coordinate_truth_plugin.cpp',
             WS/'src/super_px4_bridge/msg/CoordinateTruth.msg']
-    save(folder/'manifest.json',dict(stage=4 if args.execute_approach else (3 if args.observe_hover_permit else 2),
+    save(folder/'manifest.json',dict(stage=5 if args.execute_fixed_grasp else (4 if args.execute_approach else (3 if args.observe_hover_permit else 2)),
         no_close_approach=args.execute_approach,
         hover_prepare_only=args.observe_hover_permit,lidar=False,vehicle_fixed=False,object_attached=False,
-        arm_motion_requests_permitted=args.execute_approach,gripper_requests_sent=False,grasp_tested=False,
+        arm_motion_requests_permitted=args.execute_approach or args.execute_fixed_grasp,
+        fixed_grasp_permitted=args.execute_fixed_grasp,gripper_requests_sent=False,grasp_tested=False,
         localization_source='LIVE_GAZEBO_TRUTH_CONTROL_TRANSFORM_AND_VELOCITY_OFFSET_COMPENSATION',
         ekf_truth_injected=False,flight_pid_modified=False,planned=target.preview(),
+        precision_hover=dict(additional_flight_controller=False,
+            strategy='BASE_HOLD_AFTER_UNFOLD_THEN_WORLD_TCP_IK'),
         hashes={str(f):hashlib.sha256(f.read_bytes()).hexdigest() for f in files}))
     procs=[]; logs=[]; subscribers=None; publisher=None; hover_probe=None
     def start(name,cmd,cwd=None):
@@ -193,7 +247,7 @@ def main():
     def safety():
         if hover_probe and hover_probe.error: raise RuntimeError(hover_probe.error)
         if any(proc.poll() is not None for proc in procs): raise RuntimeError('Own simulation process exited')
-        if time.monotonic()-started>(440 if args.execute_approach else 260): raise RuntimeError('Wall watchdog exceeded')
+        if time.monotonic()-started>(440 if (args.execute_approach or args.execute_fixed_grasp) else 260): raise RuntimeError('Wall watchdog exceeded')
         if time.monotonic()-progress>20 and last_sim is not None: raise RuntimeError('Sim clock stalled')
     try:
         core=start('roscore',['roscore'])
@@ -205,7 +259,7 @@ def main():
         rospy.init_node('known_target_flight_probe',anonymous=True,disable_signals=True)
         subscribers=Sources()
         start('gazebo',['gzserver','--verbose','--seed','123','-s','libgazebo_ros_api_plugin.so',str(folder/'scene.world')])
-        start('px4',[str(BUILD/'bin/px4'),'-d',str(BUILD/'etc')],folder/'rootfs')
+        px4_proc=start('px4',[str(BUILD/'bin/px4'),'-d',str(BUILD/'etc')],folder/'rootfs')
         start('mavros',['roslaunch','mavros','px4.launch','fcu_url:=udp://:14540@127.0.0.1:14580'])
         while True:
             safety(); row=subscribers.read()
@@ -214,9 +268,18 @@ def main():
             time.sleep(.1)
         identity=(row['truth'].source_instance,row['truth'].world_epoch,row['truth'].vehicle_id,row['truth'].target_id)
         object_pose=row['truth'].target_pose
+        save(folder/'preflight_state.json',dict(sim_s=row['now'],body_world=row['body'],
+            arm_world=row['arm'],object_world=values(object_pose),
+            fixed_grasp_geometry_valid=row['truth'].fixed_grasp_geometry_valid,
+            fixed_grasp_clearance_m=row['truth'].fixed_grasp_clearance,
+            fixed_grasp_forbidden_contact=row['truth'].fixed_grasp_forbidden_contact))
         if row['truth'].target_name!=target.name or not row['truth'].target_id or np.linalg.norm(
             np.asarray(values(object_pose)[:3])-target.object[:3,3])>.004:
             raise RuntimeError('Actual fixed object position does not match the known target input')
+        if args.execute_fixed_grasp:
+            actual=rotation(values(object_pose)[3:])
+            angle=math.acos(float(np.clip((np.trace(target.object[:3,:3].T@actual)-1)*.5,-1,1)))
+            if angle>math.radians(2):raise RuntimeError('Fixed cube did not settle in its calibrated support pose; no takeoff')
         takeoff_local=row['local'][2]+target.hover[2,3]-row['body'][2]
         if not .3<=takeoff_local<=2.5: raise RuntimeError('Takeoff coordinate invalid')
         if np.linalg.norm(target.hover[:2,3]-np.array(row['body'][:2]))>1.0 or not 1.0<=target.hover[2,3]<=2.0:
@@ -234,6 +297,11 @@ def main():
                 raise RuntimeError('Known fixture geometry guard unavailable; no takeoff')
             from hover_approach_probe import HoverApproachProbe
             hover_probe=HoverApproachProbe(BUILD,env,subscribers,target,folder); hover_probe.start()
+        if args.execute_fixed_grasp:
+            if not row['truth'].fixed_grasp_geometry_valid or row['truth'].fixed_grasp_forbidden_contact:
+                raise RuntimeError('Fine grasp geometry guard unavailable; no takeoff')
+            from fixed_grasp_probe import FixedGraspProbe
+            hover_probe=FixedGraspProbe(BUILD,env,subscribers,template,folder,expected_pid=px4_proc.pid);hover_probe.start()
         start('flight_manager',['rosrun','super_px4_bridge','super_flight_manager_node',
             '_known_goal_mode:=true','_auto_arm:=true','_takeoff_height:='+str(takeoff_local),
             '_hover_stable_time:=2.0','__name:=known_flight_manager_probe'])
@@ -255,9 +323,9 @@ def main():
                 tilt=max(abs(math.atan2(R[2,1],R[2,2])),abs(math.asin(np.clip(-R[2,0],-1,1))))
                 if armed_seen and tilt>math.radians(15): raise RuntimeError('Tilt guard exceeded')
                 fold_error=float(np.max(np.abs(row['joints']-[-.07,-1.175,1.45,1.3,-1.57,.3])))
-                if fold_error>.08 and not (args.execute_approach and hover_probe.motion_started):
+                if fold_error>.08 and not ((args.execute_approach or args.execute_fixed_grasp) and hover_probe.motion_started):
                     raise RuntimeError('Folded arm departed initial target before approach')
-                if now>(300 if args.execute_approach else 120): raise RuntimeError('Simulation-time limit exceeded')
+                if now>(300 if (args.execute_approach or args.execute_fixed_grasp) else 120): raise RuntimeError('Simulation-time limit exceeded')
                 if route_start is None and row['manager']=='HOVER_READY':
                     route_start=now; route_point=body.copy()
                     print('HOVER_READY: known world route begins; arm remains folded.',flush=True)
@@ -266,7 +334,7 @@ def main():
                     lp,lv,yaw=local_motion(wp,wv,target.yaw,row['body'],row['local'],
                         row['actual_v'],row['estimated_body_v'])
                     cmd=KnownFlightSetpoint(); cmd.header.stamp=rospy.Time.now(); cmd.header.frame_id='map'; cmd.task_id=1
-                    if args.execute_approach:
+                    if args.execute_approach or args.execute_fixed_grasp:
                         cmd.task_id,cmd.plan_id,cmd.target_id,cmd.scene_id=hover_probe.plan.ids
                         cmd.terminal_hold=now-route_start>=6
                     cmd.setpoint.header=cmd.header; cmd.setpoint.coordinate_frame=PositionTarget.FRAME_LOCAL_NED
@@ -282,7 +350,7 @@ def main():
                     source_ages_s=row['ages'],fold_error_rad=fold_error,
                     truth_stamp_s=row['truth'].header.stamp.to_sec(),
                     source_instance=row['truth'].source_instance,world_epoch=row['truth'].world_epoch,
-                    close_permitted=False)
+                    close_permitted=bool(args.execute_fixed_grasp and hover_probe and hover_probe.native.get('close_authorized')))
                 if not rows or now-rows[-1]['sim_s']>=.05:
                     rows.append(record); out.write(json.dumps(record,allow_nan=False)+'\n'); out.flush()
                 good=(route_start is not None and now-route_start>=6 and row['manager']=='TRACK_KNOWN'
@@ -290,7 +358,9 @@ def main():
                 if not good: stable_since=None
                 elif stable_since is None: stable_since=now
                 elif now-stable_since>=2 and hold_since is None:
-                    hold_since=now; print('Physical world goal reached; observing 10-second no-close hold.',flush=True)
+                    hold_since=now
+                    print('Physical world hover reached; guarded grasp coordinator continues.' if args.execute_fixed_grasp else
+                        'Physical world goal reached; observing 10-second no-close hold.',flush=True)
                 if (hold_since is not None and now-hold_since>=10 and
                         (hover_probe is None or hover_probe.complete)):
                     held=[r for r in rows if r['sim_s']>=hold_since]
@@ -306,9 +376,9 @@ def main():
                 if row['manager']=='FAILSAFE_HOVER': raise RuntimeError('Flight input lease failed; no automatic resumption')
                 time.sleep(.004)
         if hover_probe:
-            key='hover_approach' if args.execute_approach else 'hover_prepare'
+            key='fixed_grasp' if args.execute_fixed_grasp else ('hover_approach' if args.execute_approach else 'hover_prepare')
             result[key]=hover_probe.finish(); hover_probe=None
-            if not result[key].get('approach_validated' if args.execute_approach else 'hover_prepare_validated'):
+            if not result[key].get('grasp_validated' if args.execute_fixed_grasp else ('approach_validated' if args.execute_approach else 'hover_prepare_validated')):
                 raise RuntimeError('Hover PREPARE tests incomplete')
         graph=rosgraph.Master('/known_target_graph').getSystemState()
         save(folder/'ros_graph.json',dict(publishers=graph[0],subscribers=graph[1],services=graph[2]))
@@ -319,7 +389,7 @@ def main():
         result.update(success=False,error=str(error),final_sim_s=last_sim)
     finally:
         if hover_probe:
-            try: result['hover_approach' if args.execute_approach else 'hover_prepare']=hover_probe.finish()
+            try: result['fixed_grasp' if args.execute_fixed_grasp else ('hover_approach' if args.execute_approach else 'hover_prepare')]=hover_probe.finish()
             except Exception as error:
                 result.update(success=False,hover_probe_error=str(error))
                 result['hover_prepare_events']=hover_probe.events
@@ -328,11 +398,16 @@ def main():
             for sub in subscribers.subscribers: sub.unregister()
         for proc in reversed(procs): stop(proc)
         for log in logs: log.close()
-        request_count=(hover_probe.approach_request_count if args.execute_approach and hover_probe else
+        request_count=(hover_probe.approach_request_count if (args.execute_approach or args.execute_fixed_grasp) and hover_probe else
+            result.get('fixed_grasp',{}).get('grasp_requests',0) if args.execute_fixed_grasp else
             result.get('hover_approach',{}).get('approach_request_count',0))
         result.update(armed_seen=armed_seen,arm_motion_requests_sent=bool(request_count),
-            arm_approach_request_count=request_count,gripper_requests_sent=False,
-            grasp_tested=False,own_processes_stopped=True,wall_elapsed_s=time.monotonic()-started)
+            arm_approach_request_count=request_count,
+            gripper_requests_sent=bool(args.execute_fixed_grasp and (
+                hover_probe.close_requested if hover_probe else result.get('fixed_grasp',{}).get('close_requested',False))),
+            grasp_tested=bool(args.execute_fixed_grasp and (
+                hover_probe.close_requested if hover_probe else result.get('fixed_grasp',{}).get('close_requested',False))),
+            own_processes_stopped=True,wall_elapsed_s=time.monotonic()-started)
         save(folder/'result.json',result); print(json.dumps(result,indent=2,allow_nan=False),flush=True)
     return 0 if result['success'] else 2
 

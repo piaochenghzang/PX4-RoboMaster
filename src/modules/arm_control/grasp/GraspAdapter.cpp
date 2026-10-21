@@ -53,7 +53,7 @@ void ArmControl::processGraspRequests(const so101_grasp::Input &input)
 {
     arm_grasp_request_s request{};
     for (int count=0; count<4 && _arm_grasp_request.update(&request); ++count) {
-        if (_hover_approach.owns()) {
+        if (_hover_approach.owns() || _fixed_grasp.owns()) {
             _grasp.last_id=request.request_id; _grasp.last_request_result=so101_grasp::RequestResult::Busy;
             continue;
         }

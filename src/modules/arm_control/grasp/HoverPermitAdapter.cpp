@@ -47,7 +47,7 @@ void ArmControl::updateHoverPermit()
     _hover_gate.update(in);
     const bool arm_ready=_command_initialized && _joint_feedback_valid && _last_feedback_time &&
         now>=_last_feedback_time && now-_last_feedback_time<=200000;
-    const bool eligible=_hover_gate.start_ready && !_grasp.owns() && !_hover_approach.owns() && arm_ready;
+    const bool eligible=_hover_gate.start_ready && !_grasp.owns() && !_hover_approach.owns() && !_fixed_grasp.owns() && arm_ready;
     _hover_preparation.update(_hover_gate.task,eligible);
     arm_hover_request_s request{};
     if (_hover_request_sub.update(&request)) {

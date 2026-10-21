@@ -18,7 +18,7 @@ def prepare_outcome(status, previous_id):
     raise RuntimeError('Inconsistent PREPARE result')
 
 
-def metrics(row, target):
+def metrics(row, target, reference=CUBE_REFERENCE):
     """Same-step physical geometry; velocity includes omega cross reference offset."""
     truth = row['truth']
     names = list(truth.link_names)
@@ -32,7 +32,7 @@ def metrics(row, target):
     op = np.array([obj.position.x, obj.position.y, obj.position.z])
     objr = rotation([obj.orientation.w, obj.orientation.x, obj.orientation.y, obj.orientation.z])
     def xyz(v): return np.array([v.x, v.y, v.z])
-    offset = gr @ CUBE_REFERENCE
+    offset = gr @ reference
     reference_v = xyz(truth.gripper_linear_velocity_world) + np.cross(
         xyz(truth.gripper_angular_velocity_world), offset)
     bodyr = rotation(row['body'][3:])

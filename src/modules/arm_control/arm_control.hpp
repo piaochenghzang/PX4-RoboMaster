@@ -60,6 +60,7 @@
 #include <uORB/topics/actuator_motors.h>
 #include "grasp/HoverPermit.hpp"
 #include "grasp/HoverApproach.hpp"
+#include "grasp/FixedGrasp.hpp"
 #include <uORB/topics/arm_approach_request.h>
 #include <uORB/topics/arm_approach_status.h>
 #include "grasp/GraspStateMachine.hpp"
@@ -150,8 +151,11 @@ private:
     void pollGraspFeedback();
     void updateHoverPermit();
     void updateHoverApproach();
+    void updateFixedGrasp(const arm_approach_request_s *request, const so101_hover::ApproachInput &motion);
     void stopHoverMotion();
-    so101_hover::TargetResult applyHoverTarget(const so101_hover::Point &target);
+    float hoverMotionClearance() const;
+    so101_hover::TargetResult applyHoverTarget(const so101_hover::Point &target, float max_joint_step=.02f);
+    so101_hover::TargetResult applyHoverJoints(const float (&desired)[ARM_DOF]);
     so101_grasp::Input graspInput() const;
     void processGraspRequests(const so101_grasp::Input &input);
     void executeGraspAction(const so101_grasp::Action &action, const so101_grasp::Input &input);
@@ -226,6 +230,8 @@ private:
     so101_hover::Gate _hover_gate;
     so101_hover::Preparation _hover_preparation;
     so101_hover::Approach _hover_approach;
+    so101_hover::FixedGrasp _fixed_grasp;
+    bool _fixed_unfold_complete{false};
     uORB::Subscription _approach_request_sub{ORB_ID(arm_approach_request)};
     uORB::Publication<arm_approach_status_s> _approach_status_pub{ORB_ID(arm_approach_status)};
     bool _approach_stop_pending{false};

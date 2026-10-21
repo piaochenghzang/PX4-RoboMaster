@@ -86,7 +86,7 @@ void ArmControl::Run()
     }
 
     updateControlState();
-    if (!_joint_feedback_valid || ((_grasp.owns() || _hover_approach.owns()) && grasp_input.joint_age>=.2f)) {
+    if (!_joint_feedback_valid || ((_grasp.owns() || _hover_approach.owns() || _fixed_grasp.owns()) && grasp_input.joint_age>=.2f)) {
         // Freeze trajectory advancement while feedback is unavailable.
         publishControlStatus();
         return;
@@ -129,7 +129,7 @@ void ArmControl::processCartesianSetpoint()
     if (!_arm_cartesian_setpoint.update(&setpoint)) {
         return;
     }
-    if (_grasp.owns() || _hover_approach.owns()) { PX4_WARN("manual target rejected: arm ownership locked"); return; }
+    if (_grasp.owns() || _hover_approach.owns() || _fixed_grasp.owns()) { PX4_WARN("manual target rejected: arm ownership locked"); return; }
 
     if (!setpoint.valid || !PX4_ISFINITE(setpoint.gripper)) {
         PX4_WARN("Cartesian target rejected");
@@ -269,7 +269,9 @@ int ArmControl::custom_command(int argc, char *argv[])
         uORB::Subscription sub{ORB_ID(arm_approach_status)}; arm_approach_status_s s{};
         if (sub.copy(&s) && s.ownership_locked) { PX4_ERR("no-close approach BUSY/locked"); return PX4_ERROR; }
     }
-    if (argc>0 && (!strcmp(argv[0],"hover_approach") || !strcmp(argv[0],"hover_resume") || !strcmp(argv[0],"hover_cancel"))) {
+    if (argc>0 && (!strcmp(argv[0],"hover_approach") || !strcmp(argv[0],"hover_resume") || !strcmp(argv[0],"hover_cancel") ||
+        !strcmp(argv[0],"fixed_grasp_start") || !strcmp(argv[0],"fixed_grasp_close") ||
+        !strcmp(argv[0],"fixed_grasp_cancel") || !strcmp(argv[0],"fixed_grasp_resume"))) {
 #if !defined(CONFIG_ARCH_BOARD_PX4_SITL)
         return PX4_ERROR;
 #else
@@ -283,6 +285,10 @@ int ArmControl::custom_command(int argc, char *argv[])
         arm_approach_request_s r{}; r.timestamp=hrt_absolute_time(); r.request_id=r.timestamp;
         r.task_id=ids[0]; r.plan_id=ids[1]; r.target_id=ids[2]; r.scene_id=ids[3];
         r.action=!strcmp(argv[0],"hover_approach") ? 1 : (!strcmp(argv[0],"hover_resume") ? 2 : 3);
+        if (!strcmp(argv[0],"fixed_grasp_start")) r.action=4;
+        if (!strcmp(argv[0],"fixed_grasp_close")) r.action=5;
+        if (!strcmp(argv[0],"fixed_grasp_cancel")) r.action=6;
+        if (!strcmp(argv[0],"fixed_grasp_resume")) r.action=7;
         static uORB::Publication<arm_approach_request_s> pub{ORB_ID(arm_approach_request)};
         return pub.publish(r) ? PX4_OK : PX4_ERROR;
 #endif
@@ -297,7 +303,8 @@ int ArmControl::custom_command(int argc, char *argv[])
             s.completed_success,(double)s.bilateral_fraction,(double)s.fixed_normal_n,(double)s.moving_normal_n,(double)s.actual_lift);
         return PX4_OK;
     }
-    if (argc>0 && (!strcmp(argv[0],"hover_context") || !strcmp(argv[0],"hover_task_context") || !strcmp(argv[0],"hover_grasp_prepare"))) {
+    if (argc>0 && (!strcmp(argv[0],"hover_context") || !strcmp(argv[0],"hover_task_context") ||
+        !strcmp(argv[0],"fixed_grasp_context") || !strcmp(argv[0],"hover_grasp_prepare"))) {
 #if !defined(CONFIG_ARCH_BOARD_PX4_SITL)
         PX4_ERR("hover preparation is local SITL only"); return PX4_ERROR;
 #else
@@ -312,8 +319,9 @@ int ArmControl::custom_command(int argc, char *argv[])
             PX4_INFO("prepare-only request queued; no arm motion or closing");
             return pub.publish(r) ? PX4_OK : PX4_ERROR;
         }
-        const bool bound=!strcmp(argv[0],"hover_task_context");
-        if (argc!=(bound ? 23 : 13)) { PX4_ERR("invalid hover context field count"); return PX4_ERROR; }
+        const bool fine=!strcmp(argv[0],"fixed_grasp_context");
+        const bool bound=!strcmp(argv[0],"hover_task_context") || fine;
+        if (argc!=(fine ? 27 : (bound ? 23 : 13))) { PX4_ERR("invalid hover context field count"); return PX4_ERROR; }
         uint64_t u[5]{};
         for (int k=0;k<5;++k) {
             if (argv[k+1][0]=='-') return PX4_ERROR;
@@ -348,6 +356,15 @@ int ArmControl::custom_command(int argc, char *argv[])
             for (int k=0;k<3;++k) c.approach_base[k]=x[k];
         }
         static uORB::Publication<arm_hover_context_s> pub{ORB_ID(arm_hover_context)};
+        if (fine) {
+            c.fixed_grasp=true;
+            for (int k=0;k<3;++k) {
+                char *end=nullptr; c.lift_base[k]=strtof(argv[k+23],&end);
+                if (end==argv[k+23] || *end!='\0' || !PX4_ISFINITE(c.lift_base[k])) return PX4_ERROR;
+            }
+            char *end=nullptr; c.jaw_clearance=strtof(argv[26],&end);
+            if (end==argv[26] || *end!='\0' || !PX4_ISFINITE(c.jaw_clearance) || fabsf(c.jaw_clearance)>100.f) return PX4_ERROR;
+        }
         return pub.publish(c) ? PX4_OK : PX4_ERROR;
 #endif
     }
@@ -1028,7 +1045,7 @@ bool ArmControl::sanitizeCartesianTarget(const matrix::Vector3f &raw_target, mat
     // separately guarded hover approach may only recover inward using the
     // same step/IK/joint limits; manual targets retain ordinary checks.
     if (((_grasp.phase==so101_grasp::Phase::Approach && _grasp_feedback.capabilities==31) ||
-         _hover_approach.moving())
+         _hover_approach.moving() || (_fixed_grasp.phase==so101_hover::FixedPhase::Approach && !_fixed_grasp.paused))
         && so101_grasp::monotonicRecovery(
             {_ee_target_position(0),_ee_target_position(1),_ee_target_position(2)},
             {raw_target(0),raw_target(1),raw_target(2)},

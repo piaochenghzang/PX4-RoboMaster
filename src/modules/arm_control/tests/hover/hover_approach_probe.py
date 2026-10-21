@@ -148,6 +148,8 @@ class HoverApproachProbe(HoverPermitProbe):
                 self.last_status=now
                 hover=self.status('arm_hover_status'); self.latest=hover
                 state=self.status('arm_approach_status'); arm=self.status('arm_control_status')
+                if state.get('mode')!=0:
+                    raise RuntimeError('No-close observer refuses another approach mode')
                 grasp=self.status('arm_grasp_status')
                 record=dict(sim_s=now,stage=self.stage,hover=hover,approach=state,arm=arm,
                     measured_joint_position=row['joints'].tolist(),

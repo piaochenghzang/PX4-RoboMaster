@@ -13,9 +13,18 @@ void ArmControl::stopHoverMotion()
     _has_last_ik_solution=false; _arrival.reset(); _approach_stop_pending=false;
 }
 
-so101_hover::TargetResult ArmControl::applyHoverTarget(const so101_hover::Point &p)
+float ArmControl::hoverMotionClearance() const
+{
+    using so101_hover::FixedPhase;
+    if (_fixed_grasp.owns() && _fixed_grasp.phase>=FixedPhase::Close && _fixed_grasp.phase<=FixedPhase::Done)
+        return _hover_context.jaw_clearance;
+    return _hover_context.clearance;
+}
+
+so101_hover::TargetResult ArmControl::applyHoverTarget(const so101_hover::Point &p,float max_joint_step)
 {
     using so101_hover::TargetResult;
+    if (!PX4_ISFINITE(max_joint_step) || max_joint_step<=0 || max_joint_step>.02f) return TargetResult::Rejected;
     const matrix::Vector3f raw{p.x,p.y,p.z}; matrix::Vector3f safe{};
     if (!sanitizeCartesianTarget(raw,safe) || (safe-raw).norm()>.0002f) {
         PX4_ERR("hover raw workspace rejected %.6f %.6f %.6f",(double)raw(0),(double)raw(1),(double)raw(2)); return TargetResult::Rejected;
@@ -28,17 +37,24 @@ so101_hover::TargetResult ArmControl::applyHoverTarget(const so101_hover::Point 
     }
     float largest=0;
     for (int j=0;j<ARM_DOF;++j) largest=std::max(largest,fabsf(candidate[j]-seed[j]));
-    const float scale=largest>.02f ? .02f/largest : 1.f;
+    const float scale=largest>max_joint_step ? max_joint_step/largest : 1.f;
+    float desired[ARM_DOF]{};
+    for (int j=0;j<ARM_DOF;++j) desired[j]=seed[j]+scale*(candidate[j]-seed[j]);
+    return applyHoverJoints(desired);
+}
+
+so101_hover::TargetResult ArmControl::applyHoverJoints(const float (&desired)[ARM_DOF])
+{
+    using so101_hover::TargetResult;
+    float seed[ARM_DOF]{},candidate[ARM_DOF]{};
+    for (int j=0;j<ARM_DOF;++j) seed[j]=_joint_target[j];
     // Triangle-chain upper bounds from production SDF, including all collision
     // corners and the jaw subtree; regression checks these constants against SDF.
     constexpr float radii[ARM_DOF]{.51f,.45f,.33f,.20f,.13f};
     // Reserve 10 mm clearance plus 6 mm for the next bounded body sample.
-    const float budget=_hover_context.clearance-.016f;
-    float desired[ARM_DOF]{},measured[ARM_DOF]{};
-    for (int j=0;j<ARM_DOF;++j) {
-        desired[j]=seed[j]+scale*(candidate[j]-seed[j]);
-        measured[j]=_latest_joint_status.position[j];
-    }
+    const float budget=hoverMotionClearance()-.016f;
+    float measured[ARM_DOF]{};
+    for (int j=0;j<ARM_DOF;++j) measured[j]=_latest_joint_status.position[j];
     const float reserve=so101_hover::pendingDisplacement(seed,measured,radii);
     if (!PX4_ISFINITE(budget) || !PX4_ISFINITE(reserve)) return TargetResult::Rejected;
     if (budget<=.001f || reserve>=budget) {
@@ -75,7 +91,7 @@ void ArmControl::updateHoverApproach()
     in.context_fresh=fresh(c.sample_time_us,100000) && fresh(c.timestamp,300000);
     in.lease_fresh=c.lease_valid && fresh(c.lease_sample_us,300000);
     in.arm_ready=_command_initialized && _joint_feedback_valid && fresh(_last_feedback_time,200000);
-    in.geometry_valid=c.geometry_valid; in.clearance=c.clearance;
+    in.geometry_valid=c.geometry_valid; in.clearance=hoverMotionClearance();
     in.tool_relative_speed=c.relative_speed;
     in.goal={c.approach_base[0],c.approach_base[1],c.approach_base[2]};
     in.accepted={_ee_target_position(0),_ee_target_position(1),_ee_target_position(2)};
@@ -96,9 +112,10 @@ void ArmControl::updateHoverApproach()
     in.geometry_valid=in.geometry_valid && in.goal.x>=.05f && in.goal.x<=.4f &&
         fabsf(in.goal.y)<=.25f && in.goal.z>=.02f && in.goal.z<=.4f;
     arm_approach_request_s r{};
-    if (_approach_request_sub.update(&r)) {
+    const bool requested=_approach_request_sub.update(&r);
+    if (requested && r.action<=3) {
 #if defined(CONFIG_ARCH_BOARD_PX4_SITL)
-        if (!_grasp.owns() && fresh(r.timestamp,300000)) {
+        if (!_grasp.owns() && !_fixed_grasp.owns() && !c.fixed_grasp && fresh(r.timestamp,300000)) {
             const bool was_idle=!_hover_approach.owns();
             _hover_approach.request(r.request_id,r.action,{r.task_id,r.plan_id,r.target_id,r.scene_id},in);
             if (was_idle && _hover_approach.owns()) _approach_jaw_target=_joint_target[GRIPPER_INDEX];
@@ -119,7 +136,12 @@ void ArmControl::updateHoverApproach()
     if (_hover_approach.owns() && fabsf(_joint_target[GRIPPER_INDEX]-_approach_jaw_target)>1e-6f) {
         _hover_approach.fail(so101_hover::ApproachFault::BindingChanged); stopHoverMotion();
     }
+    // Exactly one motion owner publishes the shared status. The explicit mode
+    // preserves the old no-close phase/authorization contract.
+    updateFixedGrasp(requested && r.action>=4 ? &r : nullptr,in);
+    if (_fixed_grasp.owns()) return;
     arm_approach_status_s s{}; s.timestamp=now;
+    s.mode=arm_approach_status_s::MODE_APPROACH;
     const auto &b=_hover_approach.binding;
     s.task_id=b.task; s.plan_id=b.plan; s.target_id=b.target; s.scene_id=b.scene;
     s.last_request_id=_hover_approach.last_id; s.request_result=_hover_approach.request_result;

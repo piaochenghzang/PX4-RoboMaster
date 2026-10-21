@@ -21,3 +21,7 @@ bool lease_valid
 bool geometry_valid
 float32[3] approach_base
 float32 clearance
+# Explicit opt-in fixed-point fine grasp; false keeps the old no-close contract.
+bool fixed_grasp
+float32[3] lift_base # same task's fixed world tool target + 30mm world up, in live arm frame
+float32 jaw_clearance # independent full jaw-stroke pair-specific slack +16mm
