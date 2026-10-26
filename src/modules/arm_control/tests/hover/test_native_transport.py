@@ -36,6 +36,11 @@ class NativeTransportTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError,'guard rejected'):
                 self.client().client('arm_control','fixed_grasp_start',1,2,3,4)
 
+    def test_quaternion_annotation_is_not_parsed_as_array_data(self):
+        with patch('native_client.socket.socket') as mock:
+            self.connection(mock,[b'  timestamp: 1000\n  q: [1.0, 0.0, 0.0, 0.0] (Roll: 0.0 deg)\n\x00\x00',b''])
+            self.assertEqual(self.client().status('vehicle_visual_odometry')['q'],[1.,0.,0.,0.])
+
     def test_wrong_process_or_uid_rejected_before_send(self):
         for peer in [(os.getpid()+1,os.geteuid(),0),(os.getpid(),os.geteuid()+1,0)]:
             with patch('native_client.socket.socket') as mock:

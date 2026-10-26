@@ -108,5 +108,78 @@ class KnownTargetTests(unittest.TestCase):
         self.assertAlmostEqual(yaw,math.pi/2)
 
 
+class SourceFreshnessTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import run_known_target_flight as runner
+        except ModuleNotFoundError as error:
+            if error.name.split('.')[0] in ('rospy','rosgraph','geometry_msgs','mavros_msgs','nav_msgs','std_msgs','super_px4_bridge'):
+                raise unittest.SkipTest('Source the ROS workspace to test source snapshots')
+            raise
+        cls.runner=runner
+
+    def setUp(self):
+        from types import SimpleNamespace as N
+        from threading import RLock
+        from unittest.mock import patch
+        self.patch=patch.object(self.runner.rospy.Time,'now',return_value=self.runner.rospy.Time.from_sec(10.))
+        self.patch.start();self.addCleanup(self.patch.stop)
+        self.s=self.runner.Sources.__new__(self.runner.Sources)
+        self.s.lock=RLock();self.s.state=N(connected=True);self.s.manager='';self.s.known_status=None
+        point=N(x=0.,y=0.,z=0.);pose=N(position=point,orientation=N(w=1.,x=0.,y=0.,z=0.))
+        header=lambda stamp,frame:N(stamp=self.runner.rospy.Time.from_sec(stamp),frame_id=frame)
+        self.s.truth=N(header=header(10.,'gazebo_world'),body_velocity_valid=True,target_present=True,
+            link_names=['yhang550_base::base_link','so101::base_link'],link_poses=[pose,pose],
+            body_linear_velocity_world=point,body_angular_velocity_world=point,
+            joint_names=['shoulder_pan','shoulder_lift','elbow_flex','wrist_flex','wrist_roll','gripper'],
+            joint_position=[0.]*6)
+        self.s.odom=N(header=header(10.,'map'),child_frame_id='base_link',
+            pose=N(pose=pose),twist=N(twist=N(linear=point)))
+
+    def test_stale_odometry_does_not_block_physical_truth(self):
+        self.s.odom.header.stamp=self.runner.rospy.Time.from_sec(9.8)
+        self.assertIsNone(self.s.read())
+        row=self.s.read(require_odometry=False)
+        self.assertIs(row['truth'],self.s.truth)
+        self.assertIsNone(row['local']);self.assertIsNone(row['estimated_body_v'])
+
+    def test_missing_odometry_never_admits_navigation(self):
+        self.s.odom=None
+        self.assertIsNone(self.s.read())
+        self.assertIsNotNone(self.s.read(require_odometry=False))
+
+    def test_truth_age_and_frame_still_fail_closed(self):
+        for stamp in (9.89,10.03):
+            self.s.truth.header.stamp=self.runner.rospy.Time.from_sec(stamp)
+            self.assertIsNone(self.s.read(require_odometry=False))
+        self.s.truth.header.stamp=self.runner.rospy.Time.from_sec(10.)
+        self.s.truth.header.frame_id='wrong'
+        with self.assertRaisesRegex(RuntimeError,'frame'):self.s.read(require_odometry=False)
+
+    def test_nonfinite_motion_still_rejected(self):
+        self.s.truth.body_linear_velocity_world.x=float('nan')
+        with self.assertRaisesRegex(RuntimeError,'Nonfinite'):self.s.read(require_odometry=False)
+
+    def test_repeated_truth_conversion_does_not_renew_freshness(self):
+        from unittest.mock import patch
+        with patch.object(self.runner,'rotation',wraps=self.runner.rotation) as convert:
+            first=self.s.read(require_odometry=False)
+            again=self.s.read(require_odometry=False)
+            self.assertEqual(convert.call_count,2) # Body/arm once, not per poll.
+            self.assertIs(first['joints'],again['joints'])
+            self.assertFalse(first['joints'].flags.writeable)
+        self.patch.stop()
+        with patch.object(self.runner.rospy.Time,'now',return_value=self.runner.rospy.Time.from_sec(10.11)):
+            self.assertIsNone(self.s.read(require_odometry=False))
+
+    def test_new_truth_frame_is_revalidated(self):
+        from copy import deepcopy
+        self.s.read(require_odometry=False)
+        self.s.truth=deepcopy(self.s.truth)
+        self.s.truth.body_linear_velocity_world.x=float('nan')
+        with self.assertRaisesRegex(RuntimeError,'Nonfinite'):self.s.read(require_odometry=False)
+
+
 if __name__ == '__main__':
     unittest.main()

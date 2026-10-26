@@ -11,22 +11,29 @@ from fixed_grasp_target import load_target
 from check_approach_route import fk, ik, origins, links, joints, names, aabb
 
 PAD_NAMES={'gripper_fixed_finger_collision','moving_jaw_collision'}
-SUPPORT_HALF=np.array([.002,.012,.002])  # 4x24x4 mm, experiment copy only
-SUPPORT_OFFSET_X=-.0015  # Covers both open-centered and closed cube gravity projections.
-OPEN_REFERENCE=np.array([.005,-.000218,-.102])  # 3mm side gap; grip upper cube region above support.
-ROUTE=[[.2357102098,.0142010304,.3282294517],[.26,.015,.36]]
+SUPPORT_HALF=np.array([.004,.012,.002])  # 8x24x4 mm fixture, clear of the near-vertical grasp's full jaw stroke.
+SUPPORT_OFFSET_X=0.  # Center the reduced-tilt fixture under the cube.
+OPEN_REFERENCE=np.array([.0045,-.000218,-.104])  # 2.5mm side gap; 7mm axial overlap and extra support clearance.
+# Insert near the OPEN-jaw midpoint, then shift 4mm to the original grip
+# reference. Do not spend the fixed pad's 3mm side gap on axial insertion.
+ROUTE=[[.1357102098,.0142010304,.3582294517],
+       [.1597799872,.0189933693,.3900677946],[.16,.015,.39]]
 START=np.array([-.07,-1.175,1.45,1.3,-1.57])
 UNFOLDED=np.array([-.07,-1.175,1.45,-1.3,-1.57])
-ARM_HOLD={'shoulder_lift':dict(i=1.,i_max=.18,torque_limit=.8),
-          'wrist_flex':dict(i=.8,i_max=.14,torque_limit=.22)}
+GRIPPER_P=1.5  # Demo copy only; unchanged .01Nm cap preserves holding bias near contact.
+LIFT_DISTANCE=.04  # Tool travel margin for measured finger slip; payload must still rise >=25mm.
+ARM_HOLD={'shoulder_lift':dict(p=6.,i=1.,i_max=.25,torque_limit=.8),
+          'elbow_flex':dict(p=5.,i=1.,i_max=.45,torque_limit=.6),
+          'wrist_flex':dict(p=2.4,i=.8,i_max=.14,torque_limit=.22)}
 
 
 def configure_arm_hold(model):
-    """Bounded gravity-bias removal in the experiment copy, no raised torque."""
+    """Experiment tracking gains only; production and torque caps unchanged."""
     for name,cfg in ARM_HOLD.items():
         controller=model.find("plugin[@name='%s_controller']"%name)
         if controller is None or abs(float(controller.findtext('cmdMax'))-cfg['torque_limit'])>1e-8:
             raise ValueError('Unexpected production torque cap for '+name)
+        controller.find('p').text=str(cfg['p'])
         controller.find('i').text=str(cfg['i'])
         element=controller.find('iMax')
         if element is None:element=ET.SubElement(controller,'iMax')
@@ -80,7 +87,7 @@ class FixedDemoPlan:
         self.support[:3,3]+=obj[:3,0]*SUPPORT_OFFSET_X
         self.waypoints_world=[(self.arm@np.r_[p,1])[:3] for p in ROUTE]
         self.grasp_world=self.waypoints_world[-1]
-        self.lift_world=self.grasp_world+np.array([0,0,.03])
+        self.lift_world=self.grasp_world+np.array([0,0,LIFT_DISTANCE])
         # Reject the ENTIRE demo before launch if the unchanged position IK
         # cannot also lift. A reachable grasp point alone is not sufficient.
         goal=(inverse(self.arm)@np.r_[self.lift_world,1])[:3]
@@ -152,10 +159,10 @@ class FixedDemoPlan:
             pad_support_min_m=.003,other_pairs_min_m=.016,support_size_m=(SUPPORT_HALF*2).tolist(),
             support_offset_local_x_m=SUPPORT_OFFSET_X,open_object_reference_gripper_m=OPEN_REFERENCE.tolist(),
             nominal_fixed_pad_axial_overlap_m=max(0.,min(-.075,OPEN_REFERENCE[2]+.01)-max(-.101,OPEN_REFERENCE[2]-.01)),
-            jaw_stroke_rad=[.04,.3],gripper_p=.25,gripper_torque_limit_nm=.01,
+            jaw_stroke_rad=[.04,.3],gripper_p=GRIPPER_P,gripper_torque_limit_nm=.01,
             experiment_arm_hold=ARM_HOLD,
             known_target_config=self.config,expected_q=self.expected_q.tolist(),
-            route_world=[p.tolist() for p in self.waypoints_world],lift_world=self.lift_world.tolist(),
+            route_world=[p.tolist() for p in self.waypoints_world],lift_world=self.lift_world.tolist(),tool_lift_m=LIFT_DISTANCE,
             samples=len(self.samples),route_worst_pair=route,full_jaw_sweep_worst_pair=sweep,
             unfold_all_pairs_min_m=.016,unfold_worst_pair=unfold,
             lift_ik_samples=len(self.lift_samples),lift_ik_final_q=self.lift_samples[-1].tolist(),

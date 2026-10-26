@@ -3,8 +3,25 @@
 #include <algorithm>
 
 namespace so101_hover {
+constexpr float fixedLiftDistance=.04f; // Tool extraction; actual payload acceptance stays 25mm.
+constexpr float fixedCartesianSpeed=.05f;
+constexpr float fixedArmJointSlew=.4f;
+constexpr float fixedJawSlew=.2f;
 inline bool precisionPositionReady(float error) {
-    return std::isfinite(error) && error>=0.f && error<=.005f;
+    // Body motion is compensated in the live TCP target.  Keep the actual
+    // finger alignment/orientation gate authoritative during close handover.
+    return std::isfinite(error) && error>=0.f && error<=.010f;
+}
+inline bool fixedCloseGeometryReady(float alignment,float speed,float orientation,bool closing=false) {
+    // Fixed SITL demo: at most 2mm relative travel during the 200ms dwell.
+    // This does not change the generic prepare-only hover gate.
+    // Contact intentionally moves/centers the cube relative to its OPEN-jaw
+    // reference. Entry pose is not a continued-closing safety certificate.
+    // The caller still requires live hover, full jaw sweep and motion reserve.
+    return std::isfinite(alignment) && alignment>=0.f &&
+        std::isfinite(speed) && speed>=0.f &&
+        std::isfinite(orientation) && orientation>=0.f &&
+        (closing || (alignment<=.003f && speed<=.010f && orientation<=.0872665f));
 }
 // SITL fixed-point grasp only. Never reuses the anchored bench authorization.
 enum class FixedPhase:uint8_t { Idle,Approach,Align,Close,Verify,Lift,Hold,Done,Fault,Canceled };
@@ -31,7 +48,7 @@ public:
             v.profile && i.binding.valid() && i.context_fresh && i.lease_fresh && i.arm_ready &&
             i.geometry_valid && i.hard_hover_ok && std::isfinite(i.clearance) && i.clearance>.016f &&
             i.goal.finite() && i.accepted.finite() && i.measured.finite() && v.lift_goal.finite() &&
-            std::abs((v.lift_goal-i.goal).norm()-.03f)<.001f &&
+            std::abs((v.lift_goal-i.goal).norm()-fixedLiftDistance)<.001f &&
             f.finite && f.capabilities==15 && f.profile==1 && f.target_id==1 &&
             f.joint_age<.2f && f.grasp_age<.3f && f.other>=0 && f.other<1e-6f &&
             f.support_arm>=0 && f.support_arm<1e-6f &&
@@ -63,9 +80,9 @@ public:
     FixedAction step(const FixedInput &v) {
         FixedAction out{}; const auto &i=v.motion; const auto &f=v.feedback;
         if (!owns()) return out;
-        const uint64_t period=v.unfold_complete ? 20000 : 100000;
+        const uint64_t period=v.unfold_complete ? 20000 : 50000;
         const uint64_t elapsed=last_now && i.now>=last_now ? std::min(period,i.now-last_now) : period;
-        out.max_jaw_step=.2f*float(elapsed)*1e-6f;
+        out.max_jaw_step=fixedJawSlew*float(elapsed)*1e-6f;
         const bool live=phase!=FixedPhase::Fault && phase!=FixedPhase::Canceled;
         if (live) {
             if (last_now && i.now<last_now) fail(FixedFault::Clock);
@@ -98,9 +115,12 @@ public:
         }
         if (paused) return out; // Payload monitoring continues while motion is paused.
         if (phase==FixedPhase::Align) {
-            if (dwell(v.close_ready && v.jaw_sweep_valid && i.hover_ready,i.now,1000000)) enter(FixedPhase::Close,i.now);
+            // This SITL fixed-point demo already checks live close geometry
+            // every cycle, including during closure. A short alignment dwell
+            // avoids requiring a hovering vehicle to be perfectly still for 1s.
+            if (dwell(v.close_ready && v.jaw_sweep_valid && i.hover_ready,i.now,200000)) enter(FixedPhase::Close,i.now);
         } else if (phase==FixedPhase::Close) {
-            // Keep bias if alignment briefly degrades; do not advance closure.
+            // Stop advancing if live hover/geometry/motion budget degrades.
             if (v.close_ready) { out.jaw=true; out.jaw_target=.04f; }
             if (both && std::abs(f.jaw_speed)<.02f && fresh) enter(FixedPhase::Verify,i.now);
             if (i.now-entered>20000000) fail(FixedFault::Timeout);
@@ -123,16 +143,16 @@ public:
         if (phase==FixedPhase::Verify || carrying()) { out.jaw=true; out.jaw_target=.04f; }
         const Point goal=carrying() ? v.lift_goal : i.goal;
         const auto delta=goal-i.accepted; const float distance=delta.norm();
-        // The work item already runs at 20ms. Do not lose an entire update
-        // when clock/scheduler jitter gives 19ms instead of exactly 20ms.
+        // IK admission is independent of the finer joint-trajectory cadence.
+        // Do not lose an entire update on small scheduler/clock jitter.
         // Budget ACTUAL elapsed time, capped at one period: no catch-up jump
-        // and no increase above 30mm/s Cartesian or 0.2rad/s target slew.
+        // and no increase above the bounded Cartesian / arm-joint rates.
         const uint64_t minimum_interval=v.unfold_complete ? 16000 : period;
         if (distance>.0002f && (!last_send || i.now-last_send>=minimum_interval) &&
-            (i.accepted-i.measured).norm()<=.015f && i.joint_speed<=.10f) {
+            (i.accepted-i.measured).norm()<=.015f && i.joint_speed<=.20f) {
             const float seconds=float(last_send ? std::min(period,i.now-last_send) : period)*1e-6f;
-            const float max_step=.03f*seconds;
-            out.max_joint_step=.2f*seconds;
+            const float max_step=fixedCartesianSpeed*seconds;
+            out.max_joint_step=fixedArmJointSlew*seconds;
             last_send=i.now; out.send=true; out.goal=i.accepted+delta*(distance>max_step ? max_step/distance : 1.f);
         }
         return out;

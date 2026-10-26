@@ -59,7 +59,7 @@ class NativeClient:
                 continue
             key, value = match.groups(); value = value.strip()
             if value.startswith('['):
-                out[key] = [float(x) for x in value.strip('[]').split(',')]
+                out[key] = [float(x) for x in value[1:value.index(']')].split(',')]
             elif value in ('True', 'False'):
                 out[key] = value == 'True'
             else:

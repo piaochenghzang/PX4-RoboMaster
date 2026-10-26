@@ -17,7 +17,9 @@ int main() {
     { Gate g; Input v; g.update(v); assert(!g.start_ready && (g.denial&Missing)); ++n; }
     { Gate g; auto v=good(); ready(g,v); assert(!g.close_geometry_ready);
       v.alignment_error=.002f; v.relative_speed=.001f; v.orientation_error=.01f; step(g,v);
-      assert(g.close_geometry_ready); ++n; }
+      assert(g.close_geometry_ready);
+      v.relative_speed=.006f;step(g,v);
+      assert(g.start_ready && !g.close_geometry_ready); ++n; } // Generic gate remains 5mm/s.
     { Gate g; auto v=good(); ready(g,v); v.position_error=.035f; step(g,v);
       assert(!g.start_ready && (g.denial&Position)); ++n; }
     { Gate g; auto v=good(); ready(g,v); v.now+=100001; g.update(v);

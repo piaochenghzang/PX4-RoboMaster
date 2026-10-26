@@ -9,8 +9,9 @@ from unittest.mock import patch, Mock
 from threading import RLock
 from pathlib import Path
 import numpy as np
-from fixed_demo_plan import FixedDemoPlan, SUPPORT_HALF, SUPPORT_OFFSET_X, START, UNFOLDED, fk, configure_arm_hold, ARM_HOLD
-from fixed_grasp_probe import pair_feedback, FixedGraspProbe, ObservationCursor, StabilityWindow, context_geometry,world_progress,lateral_center,may_trim,insertion_goal,compensation_speed,precision_motion_ready
+from fixed_demo_plan import FixedDemoPlan, SUPPORT_HALF, SUPPORT_OFFSET_X, START, UNFOLDED, fk, configure_arm_hold, ARM_HOLD, GRIPPER_P, OPEN_REFERENCE
+from fixed_grasp_probe import pair_feedback, FixedGraspProbe, ObservationCursor, StabilityWindow, context_geometry,world_progress,lateral_center,may_trim,insertion_goal,compensation_speed,precision_motion_ready,unfold_motion_ready,waypoint_dwell_seconds,centered_world_target
+from run_known_target_flight import DEMO_OBSTACLES, obstacle_clearance, line_deviation
 
 
 class FixedDemoTests(unittest.TestCase):
@@ -18,27 +19,58 @@ class FixedDemoTests(unittest.TestCase):
     def setUpClass(cls):
         cls.plan=FixedDemoPlan(Path(__file__).with_name('known_target_fixed.json'))
 
+    def test_close_goal_removes_live_entry_residual_in_world_frame(self):
+        R=np.array([[0.,-1.,0.],[1.,0.,0.],[0.,0.,1.]])
+        tool=np.array([5.,0.,1.5]);local=OPEN_REFERENCE+[.001,.002,-.001]
+        goal=centered_world_target(tool,R,local)
+        # Translating the gripper to the goal must leave the cube at the
+        # intended reference, including when its axes differ from world.
+        np.testing.assert_allclose(local-R.T@(goal-tool),OPEN_REFERENCE,atol=1e-12)
+        self.assertLess(float(np.linalg.norm(goal-tool)),.003)
+        np.testing.assert_allclose(centered_world_target(tool,R,OPEN_REFERENCE),tool)
+
     def test_nominal_route_and_jaw_stroke(self):
         report=self.plan.preview()
         self.assertTrue(report['sampled_geometry_feasible'])
         self.assertGreater(report['minimum_sampled_slack_m'],.001)
         self.assertGreater(report['full_jaw_sweep_worst_pair']['distance'],.007)
-        self.assertGreater(report['nominal_fixed_pad_axial_overlap_m'],.008)
+        self.assertGreaterEqual(report['nominal_fixed_pad_axial_overlap_m'],.007-1e-9)
         self.assertFalse(report['motion_permitted'])
         self.assertFalse(report['grasp_tested'])
         self.assertFalse(report['continuous_or_flight_proof'])
         self.assertGreater(report['unfold_worst_pair']['distance'],.05)
         self.assertGreater(report['open_route_min_pad_target_gap_m'],.002)
-        self.assertEqual(len(self.plan.waypoints_world),2)
+        self.assertEqual(report['gripper_p'],GRIPPER_P)
+        self.assertEqual(report['gripper_torque_limit_nm'],.01)
+        self.assertEqual(len(self.plan.waypoints_world),3)
+        self.assertAlmostEqual(float(np.linalg.norm(self.plan.waypoints_world[-1]-self.plan.waypoints_world[-2])),.004,places=8)
 
     def test_known_target_and_world_up_lift(self):
         np.testing.assert_allclose(self.plan.target.object[:3,3],[.6,0,1.5])
-        np.testing.assert_allclose(self.plan.lift_world-self.plan.grasp_world,[0,0,.03])
-        np.testing.assert_allclose(fk(self.plan.expected_q),[.26,.015,.36],atol=.0002)
+        np.testing.assert_allclose(self.plan.lift_world-self.plan.grasp_world,[0,0,.04])
+        np.testing.assert_allclose(fk(self.plan.expected_q),[.16,.015,.39],atol=.0002)
         self.assertGreater(self.plan.target.hover[2,3],1.)
         self.assertLess(self.plan.target.hover[2,3],2.)
         goal=(np.linalg.inv(self.plan.arm)@np.r_[self.plan.lift_world,1])[:3]
         np.testing.assert_allclose(fk(self.plan.lift_samples[-1]),goal,atol=.0002)
+
+    def test_obstacle_demo_translates_the_proven_fixture_only(self):
+        obstacle_plan=FixedDemoPlan(Path(__file__).with_name('known_target_obstacle.json'))
+        np.testing.assert_allclose(obstacle_plan.target.object[:3,3],[5.,0.,1.5])
+        np.testing.assert_allclose(obstacle_plan.target.object[:3,:3],self.plan.target.object[:3,:3],atol=1e-8)
+        np.testing.assert_allclose(obstacle_plan.expected_q,self.plan.expected_q,atol=1e-8)
+        np.testing.assert_allclose(obstacle_plan.target.hover[:3,3]-self.plan.target.hover[:3,3],[4.4,0.,0.])
+        for shifted,original in zip(obstacle_plan.waypoints_world,self.plan.waypoints_world):
+            np.testing.assert_allclose(shifted-original,[4.4,0.,0.],atol=1e-8)
+        self.assertTrue(obstacle_plan.preview()['sampled_geometry_feasible'])
+
+    def test_obstacle_course_blocks_the_direct_path_and_leaves_target_clear(self):
+        start=np.array([0.,0.,1.5]);goal=np.array([5.,0.,1.5])
+        wall=next(row for row in DEMO_OBSTACLES if row['name']=='demo_obstacle_wall')
+        self.assertLess(obstacle_clearance([1.5,0.,1.5],wall),0.)
+        self.assertGreater(min(obstacle_clearance(goal,row) for row in DEMO_OBSTACLES),.9)
+        self.assertAlmostEqual(line_deviation([2.5,0.,1.5],start,goal),0.)
+        self.assertGreater(line_deviation([2.5,1.,1.5],start,goal),.9)
 
     def test_reachable_grasp_but_unreachable_lift_rejected(self):
         with patch('fixed_demo_plan.ROUTE',[[.22,.015,.28]]):
@@ -61,6 +93,20 @@ class FixedDemoTests(unittest.TestCase):
         t.fixed_grasp_forbidden_contact=True
         self.assertFalse(context_geometry(t,True)[0])
 
+    def test_fine_pad_target_contact_does_not_disable_other_collision_checks(self):
+        t=NS(fixed_grasp_geometry_valid=True,fixed_grasp_forbidden_contact=False,
+            fixed_grasp_clearance=.022,fixed_grasp_current_clearance=.025,
+            approach_geometry_valid=False,arm_external_contact=True,
+            arm_obstacle_clearance=.001,fixed_grasp_bilateral_fraction=1.)
+        # Fine profile already classifies the exact permitted pair in the truth
+        # plugin. Unfold cannot use that exception; other fine contacts reject.
+        self.assertFalse(context_geometry(t,False)[0])
+        self.assertEqual(context_geometry(t,True),(True,.025))
+        self.assertEqual(context_geometry(t,True,True),(True,.022))
+        t.fixed_grasp_forbidden_contact=True
+        self.assertFalse(context_geometry(t,True)[0])
+        self.assertFalse(context_geometry(t,True,True)[0])
+
     def test_unfold_recovers_inward(self):
         np.testing.assert_allclose(self.plan.samples[0],START)
         np.testing.assert_allclose(self.plan.samples[130],UNFOLDED)
@@ -80,7 +126,7 @@ class FixedDemoTests(unittest.TestCase):
             self.assertTrue(np.all(abs(footprint)<np.minimum(SUPPORT_HALF[:2],.01)))
         self.assertLess(np.linalg.norm(gravity[:2])/abs(gravity[2]),1.2)
 
-    def test_integral_copy_keeps_pd_and_torque_caps(self):
+    def test_tracking_copy_keeps_d_and_torque_caps(self):
         model=ET.parse(Path(__file__).resolve().parents[5]/
             'Tools/simulation/gazebo-classic/sitl_gazebo-classic/models/so101/so101.sdf').find('model')
         before=ET.tostring(model)
@@ -88,8 +134,9 @@ class FixedDemoTests(unittest.TestCase):
         for name,cfg in ARM_HOLD.items():
             old=model.find("plugin[@name='%s_controller']"%name)
             new=copy.find("plugin[@name='%s_controller']"%name)
-            for field in ('p','d','cmdMax','initialPosition'):
+            for field in ('d','cmdMax','initialPosition'):
                 self.assertEqual(old.findtext(field),new.findtext(field))
+            self.assertAlmostEqual(float(new.findtext('p')),2*float(old.findtext('p')))
             self.assertGreater(float(new.findtext('i')),0)
             self.assertLess(float(new.findtext('iMax')),float(new.findtext('cmdMax')))
         self.assertEqual(ET.tostring(model),before)
@@ -106,14 +153,15 @@ class FixedDemoTests(unittest.TestCase):
 
     def test_world_progress_is_slow_without_catchup_jump(self):
         a=np.array([1.,2.,3.]);goal=a+[0,0,.03]
-        np.testing.assert_allclose(world_progress(a,goal,.1),a+[0,0,.001])
-        np.testing.assert_allclose(world_progress(a,goal,10.),a+[0,0,.001])
+        np.testing.assert_allclose(world_progress(a,goal,.1),a+[0,0,.002])
+        np.testing.assert_allclose(world_progress(a,goal,10.),a+[0,0,.002])
         np.testing.assert_allclose(world_progress(a,goal,.1,False),a)
         np.testing.assert_allclose(world_progress(goal,goal,.1),goal)
         np.testing.assert_allclose(world_progress(a,goal,.1,True,.002),a+[0,0,.0002])
         np.testing.assert_allclose(world_progress(a,goal,10.,True,.002),a+[0,0,.0002])
         with self.assertRaises(ValueError):world_progress(a,goal,-.1)
-        with self.assertRaises(ValueError):world_progress(a,goal,.1,True,.02)
+        np.testing.assert_allclose(world_progress(a,goal,.1,True,.02),a+[0,0,.002])
+        with self.assertRaises(ValueError):world_progress(a,goal,.1,True,.02001)
         with self.assertRaises(ValueError):world_progress(a,[0,0,np.nan],.1)
 
     def test_duplicate_truth_cannot_consume_pending_request_ack(self):
@@ -131,6 +179,22 @@ class FixedDemoTests(unittest.TestCase):
         self.assertIsNone(cursor.take((3,41000),(3,'closing')))
         self.assertTrue(cursor.take((4,61000),(3,'closing')))
 
+    def test_grasp_frame_audit_starts_at_matching_terminal_hold(self):
+        for streaming,matches,terminal,checked in ((False,False,True,False),
+                (False,True,False,False),(False,True,True,True),(True,False,False,True)):
+            with self.subTest(streaming=streaming,matches=matches,terminal=terminal):
+                probe=FixedGraspProbe.__new__(FixedGraspProbe)
+                probe.stop_event=Mock();probe.stop_event.wait.side_effect=[False,True]
+                probe.streaming=streaming;probe.error=None;probe.log=Mock()
+                truth=NS(header=NS(seq=1,stamp=NS(to_nsec=lambda:1000000000)))
+                probe.sources=NS(read=lambda **kwargs:dict(now=1.,known_status=NS(terminal_hold=terminal),truth=truth))
+                probe.plan=NS(matches=lambda status:matches)
+                probe.status_lock=RLock();probe.feedback_lock=RLock();probe.status_snapshot=(1,{},{},{})
+                probe.verify_feedback_frame=Mock(side_effect=RuntimeError('frame audit still enforced'))
+                probe.run()
+                self.assertEqual(probe.verify_feedback_frame.called,checked)
+                self.assertEqual(probe.error,'frame audit still enforced' if checked else None)
+
     def test_unfold_stability_dwell_requires_continuous_source_time(self):
         window=StabilityWindow()
         for i in range(50):self.assertFalse(window.update(1.+i*.02,True))
@@ -143,14 +207,30 @@ class FixedDemoTests(unittest.TestCase):
         with self.assertRaises(ValueError):window.update(4.,True)
         with self.assertRaises(ValueError):window.update(float('nan'),True)
 
+    def test_unfold_handover_reserves_compensation_capacity(self):
+        self.assertTrue(unfold_motion_ready(.020,.003,.05,.005))
+        for values in [(.02001,0,0,0),(0,.00301,0,0),(0,0,.05001,0),
+                (0,0,0,.00501),(float('nan'),0,0,0),(-.001,0,0,0)]:
+            self.assertFalse(unfold_motion_ready(*values))
+        demand=compensation_speed([0,0,0],[.008,0,0],[0,0,.04],[.3,0,0])
+        self.assertTrue(unfold_motion_ready(demand,.001,.01,.004))
+        self.assertLessEqual(demand,.020) # Original native 30mm/s leaves >=10mm/s.
+
+    def test_open_passages_have_no_extra_dwell_but_final_gate_remains(self):
+        self.assertEqual(waypoint_dwell_seconds(1,3),0.)
+        self.assertEqual(waypoint_dwell_seconds(0,3),0.)
+        self.assertEqual(waypoint_dwell_seconds(0,2),0.)
+        self.assertEqual(waypoint_dwell_seconds(2,3),1.)
+        self.assertEqual(waypoint_dwell_seconds(1,2),1.)
+
     def test_shared_status_preserves_mode_and_rejects_other_owners(self):
         for mode,locked,bench,rejected in ((0,False,False,False),(1,True,False,False),
                 (0,True,False,True),(2,False,False,True),(1,True,True,True)):
             with self.subTest(mode=mode,locked=locked,bench=bench):
                 probe=FixedGraspProbe.__new__(FixedGraspProbe)
                 probe.stop_event=Mock();probe.stop_event.wait.side_effect=[False,True]
-                probe.sources=NS(read=lambda:dict(now=1.))
-                values=dict(arm_hover_status={},arm_approach_status=dict(mode=mode,ownership_locked=locked),
+                probe.sources=NS(read=lambda **kwargs:dict(now=1.))
+                values=dict(arm_hover_status={},arm_approach_status=dict(timestamp=1000000,mode=mode,ownership_locked=locked),
                     arm_control_status={},arm_grasp_status=dict(ownership_locked=bench))
                 probe.status=Mock(side_effect=lambda topic:values[topic])
                 probe.status_lock=RLock();probe.status_snapshot=None;probe.error=None
@@ -160,12 +240,23 @@ class FixedDemoTests(unittest.TestCase):
                 if not rejected:self.assertEqual(probe.status_snapshot[2]['mode'],mode)
                 self.assertNotIn('arm_fixed_grasp_status',[c.args[0] for c in probe.status.call_args_list])
 
+    def test_stopped_native_scheduler_aborts_instead_of_waiting_forever(self):
+        probe=FixedGraspProbe.__new__(FixedGraspProbe)
+        probe.stop_event=Mock();probe.stop_event.wait.side_effect=[False,True]
+        probe.sources=NS(read=lambda **kwargs:dict(now=2.))
+        probe.status=Mock(return_value=dict(timestamp=1000000))
+        probe.status_lock=RLock();probe.status_snapshot=None;probe.error=None
+        probe.read_status()
+        self.assertIn('scheduled status stopped',probe.error)
+        probe.stop_event.set.assert_called_once()
+        self.assertIsNone(probe.status_snapshot)
+
     def test_lateral_center_does_not_advance_insertion(self):
         R=np.array([[0.,0.,1.],[1.,0.,0.],[0.,1.,0.]])
         start=np.zeros(3);result=lateral_center(start,R,.002)
         np.testing.assert_allclose(result,[0,-.0001,0])
         self.assertAlmostEqual(float((result-start)@R[:,2]),0.)
-        np.testing.assert_allclose(lateral_center(start,R,.0052),start)
+        np.testing.assert_allclose(lateral_center(start,R,float(OPEN_REFERENCE[0]+.0002)),start)
         limited=lateral_center(R[:,0]*.0049,R,.02)
         self.assertLessEqual(np.linalg.norm(limited),.005000001)
         with self.assertRaises(ValueError):lateral_center(start,R,np.nan)
@@ -185,6 +276,9 @@ class FixedDemoTests(unittest.TestCase):
         self.assertTrue(precision_motion_ready(.020,.003,.003,.08,0.))
         self.assertTrue(precision_motion_ready(.020,.003,.003,.08,.005))
         self.assertFalse(precision_motion_ready(.010,.001,.001,.01,.0051))
+        self.assertTrue(precision_motion_ready(.010,.001,.001,.01,.010,body_limit=.010))
+        self.assertFalse(precision_motion_ready(.010,.001,.001,.01,.0101,body_limit=.010))
+        self.assertFalse(precision_motion_ready(.010,.001,.001,.01,0.,body_limit=.0101))
         for values in ((.021,.001,.001,.01),(.01,.0031,.001,.01),
                        (.01,.001,.0031,.01),(.01,.001,.001,.081),
                        (float('nan'),0,0,0),(-.001,0,0,0)):
@@ -250,6 +344,10 @@ class FixedDemoTests(unittest.TestCase):
             object_center_gripper=[math.cos(.08),-math.sin(.08),0])
         row['now']=1.04;probe.verify_feedback_frame(row)
         history.append(message(1.06,.12))
+        # A new truth bracket alone must verify the pending sample: do not
+        # wait for another (possibly slow) native feedback poll to return.
+        row['now']=1.06;probe.verify_feedback_frame(row)
+        self.assertEqual(probe.checked_feedback,10)
         probe.feedback=dict(probe.feedback,source_sequence=11,sample_time_us=1070000)
         row['now']=1.07;probe.verify_feedback_frame(row)
         self.assertEqual(probe.checked_feedback,10)

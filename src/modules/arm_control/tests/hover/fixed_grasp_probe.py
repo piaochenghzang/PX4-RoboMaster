@@ -2,6 +2,7 @@
 import json
 import math
 import threading
+import time
 from collections import deque
 from pathlib import Path
 import numpy as np
@@ -10,7 +11,7 @@ from known_target import pose,inverse
 from native_client import NativeClient
 from hover_permit_probe import metrics
 from hover_approach_probe import ApproachPlan,token,pose_values
-from fixed_demo_plan import SUPPORT_HALF,OPEN_REFERENCE
+from fixed_demo_plan import SUPPORT_HALF,OPEN_REFERENCE,LIFT_DISTANCE
 
 REFERENCE=OPEN_REFERENCE
 
@@ -41,9 +42,15 @@ class StabilityWindow:
         return now-self.since>=1.
 
 
-def world_progress(current,goal,elapsed,enabled=True,speed=.01):
+def waypoint_dwell_seconds(index,count):
+    # OPEN-jaw approach points are passages, not grasp permits. Keep their
+    # instantaneous distance/motion checks; leave final closure to native Align.
+    return 0. if 0<=index<count-1 else 1.
+
+
+def world_progress(current,goal,elapsed,enabled=True,speed=.02):
     current=np.asarray(current,dtype=float);goal=np.asarray(goal,dtype=float)
-    if current.shape!=(3,) or goal.shape!=(3,) or not np.isfinite([*current,*goal,elapsed,speed]).all() or elapsed<0 or not 0<speed<=.01:
+    if current.shape!=(3,) or goal.shape!=(3,) or not np.isfinite([*current,*goal,elapsed,speed]).all() or elapsed<0 or not 0<speed<=.02:
         raise ValueError('Invalid world trajectory state/time')
     delta=goal-current;distance=float(np.linalg.norm(delta))
     step=min(speed*.1,speed*elapsed) if enabled else 0.
@@ -75,13 +82,25 @@ def compensation_speed(body_position,linear_velocity,angular_velocity,tool_posit
     return float(np.linalg.norm(linear+np.cross(angular,tool-body)))
 
 
-def precision_motion_ready(compensation,arm_error,world_error,joint_speed,body_error):
-    values=np.asarray([compensation,arm_error,world_error,joint_speed,body_error],dtype=float)
-    # Leave >=10mm/s of the unchanged 30mm/s native capacity unused for
-    # insertion/correction. This gates WORLD route progress, never body-motion
-    # compensation or native safety checks. These limits only strengthen admission.
+def precision_motion_ready(compensation,arm_error,world_error,joint_speed,body_error,*,body_limit=.005):
+    values=np.asarray([compensation,arm_error,world_error,joint_speed,body_error,body_limit],dtype=float)
+    # Keep compensation below 20mm/s of the 50mm/s native capacity,
+    # reserving room for insertion/correction. This gates WORLD route progress,
+    # never body-motion compensation or native safety checks.
     return bool(np.isfinite(values).all() and np.all(values>=0) and
-        compensation<=.020 and arm_error<=.003 and world_error<=.003 and joint_speed<=.08 and body_error<=.005)
+        0<body_limit<=.010 and compensation<=.020 and arm_error<=.003 and world_error<=.003 and joint_speed<=.08 and body_error<=body_limit)
+
+
+def unfold_motion_ready(compensation,arm_error,joint_speed,body_error):
+    """Admission by actual TCP demand, with native capacity left for correction."""
+    values=np.asarray([compensation,arm_error,joint_speed,body_error],dtype=float)
+    return bool(np.isfinite(values).all() and np.all(values>=0) and
+        compensation<=.020 and arm_error<=.003 and joint_speed<=.05 and body_error<=.005)
+
+
+def centered_world_target(tool,rotation,local):
+    """Correct the measured <=3mm entry residual before freezing the goal."""
+    return np.asarray(tool)+np.asarray(rotation)@(np.asarray(local)-REFERENCE)
 
 
 def insertion_goal(current,desired,rotation,local,relative_rotation,jaw,orientation_error):
@@ -155,7 +174,7 @@ class FixedGraspProbe(NativeClient):
         self.fk_gripper,self.residual=fk_gripper,residual
         self.config=yaml.safe_load((scripts.parent/'config/grasp_frame_audit.yaml').read_text())
         self.template=template;self.sources=sources;self.target=template.target
-        self.plan=FixedBinding(template,sources.read()['truth'])
+        self.plan=FixedBinding(template,sources.read(require_odometry=False)['truth'])
         self.log=(folder/'fixed_grasp_status.jsonl').open('x')
         self.events=[];self.complete=False;self.error=None;self.motion_started=False
         self.approach_request_count=0;self.close_requested=False
@@ -169,6 +188,7 @@ class FixedGraspProbe(NativeClient):
         self.correction=np.zeros(3)
         self.pickup_height=None;self.grasp_reference=None;self.done_since=None;self.samples=[]
         self.route_index=0;self.route_stable_since=None
+        self.grasp_base=None
         self.unfold_anchor=None;self.unfold_settled=False;self.unfold_window=StabilityWindow()
         self.progress_world=None;self.last_progress_sim=None
         self.last_center_sim=-math.inf
@@ -225,14 +245,11 @@ class FixedGraspProbe(NativeClient):
         last_poll=-math.inf
         try:
             while not self.stop_event.wait(.002):
-                row=self.sources.read()
+                row=self.sources.read(require_odometry=False)
                 if row is None:continue
-                if row['now']-last_poll>=.04:
+                if row['now']-last_poll>=.02:
                     last_poll=row['now'];feedback=self.status('arm_grasp_feedback')
                     with self.feedback_lock:self.feedback=feedback
-                    row=self.sources.read()
-                    if row is None:continue
-                with self.feedback_lock:self.verify_feedback_frame(row)
         except Exception as exc:
             self.error=str(exc);self.stop_event.set()
 
@@ -241,11 +258,13 @@ class FixedGraspProbe(NativeClient):
         last_poll=-math.inf;serial=0
         try:
             while not self.stop_event.wait(.002):
-                row=self.sources.read()
+                row=self.sources.read(require_odometry=False)
                 if row is None or row['now']-last_poll<.2:continue
                 last_poll=row['now']
                 latest=self.status('arm_hover_status');native=self.status('arm_approach_status')
                 arm=self.status('arm_control_status')
+                if row['now']-native['timestamp']*1e-6>.5:
+                    raise RuntimeError('Native scheduled status stopped; abort test instead of waiting for hover')
                 mode=native.get('mode')
                 if mode not in (0,1):raise RuntimeError('Unknown arm approach status mode')
                 if self.status('arm_grasp_status').get('ownership_locked') or (mode==0 and native.get('ownership_locked')):
@@ -259,8 +278,14 @@ class FixedGraspProbe(NativeClient):
         cursor=ObservationCursor()
         try:
             while not self.stop_event.wait(.002):
-                row=self.sources.read()
+                row=self.sources.read(require_odometry=False)
                 if row is None:continue
+                lease=row['known_status']
+                # The fine-grasp frame contract starts at the matching task's
+                # terminal hold, not during distant, rotating navigation.
+                # Once streaming starts, stale/revoked context still fails.
+                if not self.streaming and not (self.plan.matches(lease) and lease.terminal_hold):continue
+                iteration_wall=time.monotonic()
                 t=row['truth'];now=row['now'];source=(t.header.seq,t.header.stamp.to_nsec()//1000)
                 # Do not consume a newly arrived status on an already used
                 # truth frame. Its request ACK must survive until the next
@@ -269,6 +294,9 @@ class FixedGraspProbe(NativeClient):
                 with self.status_lock:snapshot=self.status_snapshot
                 if snapshot is None:continue
                 with self.feedback_lock:
+                    # Retry pending pairing on THIS new truth bracket before
+                    # evaluating freshness, independently of the CLI poll.
+                    self.verify_feedback_frame(row)
                     feedback=self.feedback
                     frame_verified=row['now']-self.last_verified_stamp<=.15
                     verified_stamp=self.last_verified_stamp;frame_error=self.frame_error;pair_skew=self.pair_skew
@@ -293,20 +321,20 @@ class FixedGraspProbe(NativeClient):
                     self.event('context_geometry_rejected',row,raw_geometry=t.fixed_grasp_geometry_valid,
                         forbidden_contact=t.fixed_grasp_forbidden_contact,fk_position_error=pos,
                         fk_rotation_error=angle,frame_verified=frame_verified,
-                        verified_age_s=now-verified_stamp,pair_failure=pair_failure)
+                        verified_age_s=now-verified_stamp,pair_failure=pair_failure,
+                        latest_feedback_sequence=feedback.get('source_sequence'),
+                        latest_feedback_sample_us=feedback.get('sample_time_us'),
+                        paired_feedback_sequence=paired_sequence)
                 self.last_geometry_valid=valid
                 if not self.streaming and self.plan.matches(lease) and lease.terminal_hold and self.latest.get('native_heading_ready'):
                     self.streaming=True;self.event('fixed_task_bound',row,binding=self.plan.ids)
-                phase=int(self.native.get('phase',0))
-                if phase in (1,2) and (feedback.get('fixed_fraction',0)>0 or feedback.get('moving_fraction',0)>0) and (
-                    measured[4]>.006 or measured[6]>math.radians(5)):
-                    self.event('premature_pad_contact',row,alignment_m=measured[4],orientation_rad=measured[6],
-                        fixed_fraction=feedback.get('fixed_fraction'),moving_fraction=feedback.get('moving_fraction'),
-                        sample_time_us=feedback.get('sample_time_us'),paused=self.native.get('paused'),
-                        hover_denial=self.latest.get('denial_mask'),current_clearance_m=clearance,
-                        full_stroke_clearance_m=t.fixed_grasp_clearance)
-                    raise RuntimeError('Premature pad contact before aligned close; no further approach')
+                # The two designated pads may contact the designated cube in
+                # this fine-grasp profile. Do not add an observer-only abort on
+                # that allowed pair; forbidden contacts still invalidate context
+                # above, and native close admission still checks live alignment.
                 tool=(G@np.r_[[-.0079,-.000218121,-.0981274],1])[:3]
+                required_compensation=compensation_speed(row['body'][:3],row['actual_v'],row['actual_w'],tool)
+                unfold_ready=None
                 if phase==1 and self.native.get('unfold_complete') and not self.unfold_settled:
                     if self.unfold_anchor is None:
                         self.unfold_anchor=np.asarray(self.arm['ee_target'],dtype=float)
@@ -317,27 +345,31 @@ class FixedGraspProbe(NativeClient):
                     # own base BEFORE enabling world-TCP compensation. This
                     # avoids chasing unfold transients with the arm itself.
                     ready=(valid and not self.native.get('paused') and self.latest.get('start_ready') and
-                        measured[3]<=.005 and measured[0]<=.005 and measured[1]<=.02 and
-                        self.arm.get('position_error',math.inf)<=.003 and self.arm.get('max_joint_speed',math.inf)<=.05)
+                        unfold_motion_ready(required_compensation,self.arm.get('position_error',math.inf),
+                            self.arm.get('max_joint_speed',math.inf),measured[3]))
+                    unfold_ready=bool(ready)
                     if self.unfold_window.update(now,ready):
                         self.unfold_settled=True;self.progress_world=tool.copy();self.last_progress_sim=now
-                        self.event('unfold_hover_settled',row,body_error_m=measured[3],body_speed_m_s=measured[0])
-                required_compensation=compensation_speed(row['body'][:3],row['actual_v'],row['actual_w'],tool)
-                precision_ready=precision_motion_ready(required_compensation,
+                        self.event('unfold_hover_settled',row,body_error_m=measured[3],body_speed_m_s=measured[0],
+                            compensation_speed_m_s=required_compensation)
+                motion_evidence=(required_compensation,
                     self.arm.get('position_error',math.inf),
                     float(np.linalg.norm(tool-self.progress_world)) if self.progress_world is not None else math.inf,
                     self.arm.get('max_joint_speed',math.inf),measured[3])
+                precision_ready=precision_motion_ready(*motion_evidence)
+                close_motion_ready=precision_motion_ready(*motion_evidence,body_limit=.010)
                 if phase==1 and self.native.get('unfold_complete') and self.route_index<len(self.plan.waypoints_world)-1:
                     distance=float(np.linalg.norm(tool-self.plan.waypoints_world[self.route_index]))
                     ready=distance<=.003 and precision_ready and measured[5]<=.01 and not self.native.get('paused') and self.latest.get('start_ready') and (
                         self.progress_world is not None and np.linalg.norm(self.progress_world-self.plan.waypoints_world[self.route_index])<=.0002)
                     if not ready:self.route_stable_since=None
-                    elif self.route_stable_since is None:self.route_stable_since=now
-                    elif now-self.route_stable_since>=1.:
-                        self.event('pregrasp_reached',row,waypoint=self.route_index,error_m=distance)
-                        self.route_index+=1;self.route_stable_since=None
+                    else:
+                        if self.route_stable_since is None:self.route_stable_since=now
+                        if now-self.route_stable_since>=waypoint_dwell_seconds(self.route_index,len(self.plan.waypoints_world)):
+                            self.event('pregrasp_reached',row,waypoint=self.route_index,error_m=distance)
+                            self.route_index+=1;self.route_stable_since=None
                 final_waypoint=self.route_index==len(self.plan.waypoints_world)-1
-                trim_allowed=may_trim(phase,self.close_requested,self.native.get('paused'),self.latest.get('start_ready'))
+                trim_allowed=may_trim(phase,self.stage in ('close_ack','grasp','done'),self.native.get('paused'),self.latest.get('start_ready'))
                 if phase==1 and final_waypoint and trim_allowed and measured[4]<.08 and self.arm.get('position_error',math.inf)<=.002 and np.linalg.norm(tool-self.progress_world)<=.003 and measured[5]<=.01 and now-self.last_center_sim>=.1:
                     # Correct only the finger-gap direction during insertion.
                     # Do not turn the remaining insertion distance into a trim.
@@ -350,17 +382,25 @@ class FixedGraspProbe(NativeClient):
                     progress_goal,corridor_gap,insertion_ready=insertion_goal(self.progress_world,desired_world,
                         G[:3,:3],local,G[:3,:3].T@pose(O[:3],O[3:])[:3,:3],row['joints'][5],measured[6])
                 if self.progress_world is not None and now-self.last_progress_sim>=.1:
-                    enabled=phase==1 and not self.native.get('paused') and self.latest.get('start_ready') and (
+                    enabled=phase==1 and trim_allowed and (
                         np.linalg.norm(tool-self.progress_world)<=.005 and self.arm.get('position_error',math.inf)<=.005)
                     if final_waypoint:enabled=enabled and precision_ready
                     self.progress_world=world_progress(self.progress_world,progress_goal,now-self.last_progress_sim,
-                        enabled,.002 if final_waypoint else .01)
+                        enabled,.002 if final_waypoint else .02)
                     self.last_progress_sim=now
                 goal_world=self.progress_world if self.progress_world is not None else desired_world
                 base_hold=phase==1 and self.unfold_anchor is not None and not self.unfold_settled
                 if base_hold:goal_world=(A@np.r_[self.unfold_anchor,1])[:3]
                 base=(inverse(A)@np.r_[goal_world,1])[:3]
-                lift=(inverse(A)@np.r_[goal_world+[0,0,.03],1])[:3]
+                # Track WORLD until both pads grip. Once native Verify confirms
+                # bilateral contact, stop pushing against the support through
+                # world-position corrections and hold relative to the body.
+                if 4<=phase<=7:
+                    if self.grasp_base is None:self.grasp_base=base.copy()
+                    base=self.grasp_base.copy()
+                    goal_world=(A@np.r_[base,1])[:3]
+                lift=(inverse(A)@np.r_[goal_world+[0,0,LIFT_DISTANCE],1])[:3]
+                timing=None
                 if self.streaming and source!=self.last_source:
                     self.last_source=source
                     fresh=(self.plan.matches(lease) and lease.terminal_hold and lease.lease_valid and
@@ -369,15 +409,27 @@ class FixedGraspProbe(NativeClient):
                     fields=[self.plan.task,source[0],source[1],t.world_epoch,1,*measured,
                         self.plan.plan,self.plan.target,self.plan.scene,stamp,int(fresh),int(valid),
                         *map(float,base),clearance,*map(float,lift),t.fixed_grasp_clearance]
+                    import rospy
+                    before_wall=time.monotonic();before_sim=rospy.Time.now().to_sec()
                     self.client('arm_control','fixed_grasp_context',*fields)
+                    after_sim=rospy.Time.now().to_sec()
+                    timing=dict(source_age_before_s=before_sim-source[1]*1e-6,
+                        source_age_after_s=after_sim-source[1]*1e-6,
+                        compute_wall_s=before_wall-iteration_wall,
+                        command_wall_s=time.monotonic()-before_wall,
+                        input_ages_s=row['ages'])
                 # Dense physical truth during insertion; native snapshots keep
                 # their original timestamp/fresh flag, never get restamped.
-                if not polled and not (final_waypoint and 1<=phase<=7):continue
+                if not polled and not timing:continue
                 arm=self.arm
                 state=self.native;phase=int(state.get('phase',0))
                 record=dict(sim_s=now,stage=self.stage,phase=phase,native=state,hover=self.latest,arm=arm,
+                    context_timing=timing,
+                    physical_motion=dict(body_speed=measured[0],body_angular_speed=measured[1],
+                        hover_position_error=measured[3]),unfold_stability_ready=unfold_ready,
                     native_status_fresh=polled,
-                    compensation_mode='BASE_HOLD_FOR_UNFOLD_SETTLE' if base_hold else 'WORLD_TCP',
+                    compensation_mode=('BASE_HOLD_FOR_UNFOLD_SETTLE' if base_hold else
+                        'BASE_HOLD_DURING_GRASP' if 4<=phase<=7 else 'WORLD_TCP'),
                     unfold_hover_settled=self.unfold_settled,
                     waypoint_index=self.route_index,
                     planned_waypoint_world=desired_world.tolist(),world_progress_error_m=float(np.linalg.norm(desired_world-goal_world)),
@@ -413,7 +465,13 @@ class FixedGraspProbe(NativeClient):
                     self.motion_started=True;self.stage='approach';self.event('fixed_native_approach_started',row)
                 elif state.get('paused') and self.latest.get('start_ready'):
                     self.request('fixed_grasp_resume')
-                elif self.stage=='approach' and final_waypoint and precision_ready and np.linalg.norm(desired_world-goal_world)<=.0002 and phase==1 and state.get('unfold_complete') and state.get('close_entry_ready'):
+                elif (self.stage=='approach' and final_waypoint and close_motion_ready and phase==1 and
+                        state.get('unfold_complete') and state.get('close_entry_ready') and
+                        measured[4]<=.003 and measured[5]<=.010 and measured[6]<=math.radians(5)):
+                    # Use the live cube center, not the nominal endpoint or
+                    # the lagging measured tool pose. Native slew/IK still
+                    # bounds the <=3mm correction before actual closure.
+                    self.progress_world=centered_world_target(tool,G[:3,:3],local);self.last_progress_sim=now
                     self.expected=state.get('last_request_id',0)
                     self.pickup_height=O[2];self.request('fixed_grasp_close');self.close_requested=True;self.stage='close_ack'
                     self.event('controlled_close_requested',row,alignment=measured[4],orientation=measured[6])

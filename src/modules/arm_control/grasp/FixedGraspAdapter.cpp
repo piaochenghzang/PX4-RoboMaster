@@ -13,7 +13,10 @@ void ArmControl::updateFixedGrasp(const arm_approach_request_s *request,const so
     for (int j=0;j<ARM_DOF;++j) { anchor[j]=_joint_target[j]; measured[j]=_latest_joint_status.position[j]; }
     const float pending=pendingDisplacement(anchor,measured,radii);
     input.jaw_sweep_valid=PX4_ISFINITE(_hover_context.jaw_clearance) && _hover_context.jaw_clearance>.016f;
-    input.close_ready=_hover_gate.close_geometry_ready && precisionPositionReady(_hover_context.hover_position_error) &&
+    input.close_ready=input.profile && _hover_gate.start_ready &&
+        fixedCloseGeometryReady(_hover_context.alignment_error,_hover_context.relative_speed,_hover_context.orientation_error,
+            _fixed_grasp.phase==FixedPhase::Close) &&
+        precisionPositionReady(_hover_context.hover_position_error) &&
         _fixed_unfold_complete && input.jaw_sweep_valid &&
         PX4_ISFINITE(pending) && _hover_context.jaw_clearance>.016f+pending+.0001f;
     input.unfold_complete=_fixed_unfold_complete;
@@ -24,7 +27,12 @@ void ArmControl::updateFixedGrasp(const arm_approach_request_s *request,const so
         const bool idle=!_fixed_grasp.owns();
         _fixed_grasp.request(request->request_id,request->action,
             {request->task_id,request->plan_id,request->target_id,request->scene_id},input);
-        if (idle && _fixed_grasp.owns()) _fixed_unfold_complete=false;
+        if (idle && _fixed_grasp.owns()) {
+            _fixed_unfold_complete=false;
+            // The fixed demo alone uses a 50 ms unfold command budget. The
+            // normal controller, joint limits and collision reserve are unchanged.
+            ScheduleOnInterval(50_ms);
+        }
     }
     const auto before=_fixed_grasp.phase;
     const auto action=_fixed_grasp.step(input);
@@ -35,6 +43,9 @@ void ArmControl::updateFixedGrasp(const arm_approach_request_s *request,const so
             (double)input.feedback.grasp_age,(double)input.feedback.other,(double)input.feedback.support_arm,(double)motion.joint_speed);
         PX4_ERR("fixed contract context=%u lease=%u hard_hover=%u binding=%u",unsigned(motion.context_fresh),
             unsigned(motion.lease_fresh),unsigned(motion.hard_hover_ok),unsigned(motion.binding==_fixed_grasp.binding));
+        PX4_ERR("fixed timing sample_age=%.4f receipt_age=%.4f denial=%u",
+            (double(now)-double(_hover_context.sample_time_us))*1e-6,
+            (double(now)-double(_hover_context.timestamp))*1e-6,unsigned(_hover_gate.denial));
     }
     if (action.stop) stopHoverMotion();
     if (action.send && !_fixed_unfold_complete) {
@@ -45,13 +56,16 @@ void ArmControl::updateFixedGrasp(const arm_approach_request_s *request,const so
         for (int j=0;j<ARM_DOF;++j) {
             command_error=std::max(command_error,fabsf(unfolded[j]-_joint_target[j]));
             feedback_error=std::max(feedback_error,fabsf(unfolded[j]-_latest_joint_status.position[j]));
-            desired[j]=_joint_target[j]+math::constrain(unfolded[j]-_joint_target[j],-.02f,.02f);
+            desired[j]=_joint_target[j]+math::constrain(unfolded[j]-_joint_target[j],
+                -action.max_joint_step,action.max_joint_step);
         }
         if (command_error<.001f && feedback_error<.03f && motion.joint_speed<.05f) {
             _fixed_unfold_complete=true;
-            // Only the explicitly owned SITL fine profile changes cadence.
-            // All per-step bounds below shrink by five; no rate/cap increase.
-            ScheduleOnInterval(20_ms);
+            // Smooth the existing joint trajectory at the 250Hz simulator
+            // transport cadence instead of delivering 20ms position stairs
+            // to the 1ms Gazebo PID. IK still has its >=16ms send interval;
+            // Cartesian/joint/jaw budgets use elapsed time, not call count.
+            ScheduleOnInterval(4_ms);
         }
         else if (command_error>=.001f) {
             const auto result=applyHoverJoints(desired);
