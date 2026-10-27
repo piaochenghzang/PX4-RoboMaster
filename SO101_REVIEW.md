@@ -3,7 +3,7 @@
 本文件合并原 INTERFACE、KINEMATICS、ELBOW_TRACKING、TARGET_SWITCH、
 GRASP 五份专项记录。后续修改和实验只维护本文；原记录可从 Git 历史恢复。
 以下历史章节描述各阶段当时的结果，“未提交”和“下一步”不代表当前状态。
-最新已验收抓取结果见第 36 节；纯 MID360S 路线见第 37 节，S1参数化几何预检见第38节。
+最新已验收抓取结果见第 36 节；纯 MID360S 路线见第 37 节，S1参数化/S2静态扫描见第38/39节。
 只使用 Ubuntu-20.04；历史章节的“未提交”“ROS 不提交”等仅描述当时状态。
 
 ## 目录与职责（2026-10-17）
@@ -3876,3 +3876,135 @@ python3 /home/pcz/super_ws/src/super_px4_bridge/tests/test_mid360s_s1.py \
 
 下一小步只做S2静态MID360S扫描与点云记录：由这份尺寸配置建立静态目标及雷达近似，
 核对1.5 m首选位与3 m备用位回波，再决定点云积累时长和分割参数；暂不增加飞行状态机或闭爪联调。
+
+## 39. S2：静态扫描、点时间/IMU与回波记录（2026-10-27）
+
+S2的静态仿真链已跑通：使用S1几何生成静态目标、支撑、中央机体/折叠臂/雷达安装盒和背景场景，
+在独立ROS/Gazebo端口记录原始点云、理想静态IMU和时钟。没有启动PX4、飞行管理或抓取控制。
+MID360S实测扫描/噪声校准仍待设备来源明确的bag，当前结果不能标为MID360S实机性能验收。
+
+### 39.1 实现文件与扫描近似
+
+实际包 `/home/pcz/super_ws/src/super_px4_bridge`，源码同时同步到ROS Git镜像：
+
+- `src/perception/mid360s_static_plugin.cpp`：Gazebo Classic/ODE任意方向射线，按仿真时间生成每点回波和200 Hz理想静态IMU。
+- `scripts/perception/run_static_scan.py`：复用S1参数/已有离线IK结果生成静态场景，依次录制和清理各实验，仅用源仿真时间判断采样结束。
+- `scripts/perception/scan_metrics.py`：坐标、逐点时间、IMU括号配对、表面回波/覆盖统计，使用独立真值评分。
+- `config/perception/mid360s_static.yaml`：扫描速率、采样窗口、噪声敏感性、随机种子、端口及数据来源/哈希。
+- `models/perception/mid360.csv.gz` 与 `LICENSE.livox`：保留官方扫描CSV原始内容与MIT许可，gzip用于减小仓库体积。
+- `tests/test_mid360s_static.py`：8项纯离线边界测试；CMake注册 `mid360s_static_math`。
+- `CMakeLists.txt/package.xml`：仅新增静态插件目标、zlib及记录bag/服务所需依赖；没有新消息定义。
+
+扫描轨迹来自 [Livox官方仿真仓库](https://github.com/Livox-SDK/livox_laser_simulation/tree/1cce1073633a062b92e30243a4c2920e45551bb5)，
+固定提交 `1cce1073633a062b92e30243a4c2920e45551bb5`，文件为 `scan_mode/mid360.csv`。
+解压内容SHA256为 `aa1fc08b6a4400608dbd6ee832b7ea3a9c3c37197e734f60f58fe5abf762269a`。
+
+该文件是**MID360轨迹代理**，不是MID360S实测轨迹。800000行第一列虽标Time/s，实际为1..800000序号，
+本实现不把它当物理秒；按声明的200000次射线/s排列，轨迹4 s后循环，帧率10 Hz。
+仰角按官方方向换算为 `90°-Zenith`，直接裁掉不在S1配置−7°..52°中的方向，不重映射或向目标补点。
+整个周期1742/800000条方向被裁掉，占0.21775%；200 k是裁剪前发射采样率，实际返回点数取决于场景。
+没有把VLP16改名，也没有对目标区域增加采样密度。
+
+场景全部刚性静止，光学窗口仅可视；低于原点的39.5 mm下壳保留碰撞盒，避免用完整外壳盒把雷达原点包在内部，
+导致射线误击自身。环境中的目标、支撑、机体和背景都有真实ODE射线遮挡。
+距离噪声为固定种子的独立高斯σ=0/10/20 mm敏感性实验；没有标定反射率、材质漏检、光斑、角误差或真实MID360S扫描相位。
+intensity=100、tag=0及line序号均为模拟占位，不代表实机反射率或已验证通道。
+插件只供本节静态场景使用，加载时拒绝动态模型；传感器移动或仿真时钟回退时停止发布，不承诺运动去畸变或自动恢复。
+
+### 39.2 点云、IMU与真值接口
+
+| 话题/字段 | 本轮约定 |
+|---|---|
+| `/mid360s_sim/points` | 原始PointCloud2，坐标为L=`mid360s_lidar`，不含目标类别/物体位姿 |
+| x/y/z/intensity/tag/line/timestamp | 前七字段沿用driver2 PointXYZRTLT的字段名、类型和偏移；额外添加offset_time |
+| PointCloud2.header.stamp | 本帧计划开始时刻，ROS秒/纳秒，来源为Gazebo仿真时钟 |
+| timestamp（FLOAT64） | **点的绝对时间，纳秒**；不是秒，也不是帧内偏移 |
+| offset_time（UINT32） | 相对帧header时刻的纳秒偏移；`point_ns=header_ns+offset_time` |
+| `/mid360s_sim/imu` | 200 Hz，sensor_msgs/Imu；L中理想静态比力m/s²、角速度rad/s，姿态未提供（orientation_covariance[0]=-1） |
+| `/mid360s_s2/ray_truth` | 仅评分：无噪声交点、碰撞部位标签、采样序号与点时间；不得作为S3感知或S4定位输入 |
+| `/clock` | 记录仿真时钟；墙上时间仅用于启动等待/超时退出，不决定实验积累时长 |
+
+接口参照 [driver2固定版本的lddc.cpp](https://github.com/Livox-SDK/livox_ros_driver2/blob/21445540f0d100dc86a7e6df312dd70bbdb4afdf/src/lddc.cpp)。
+PointCloud2.timestamp直接写入内部点纳秒时间；CustomMsg则使用timebase与相对offset_time。
+本轮先复核并修正了最初把PointCloud2.timestamp写成秒的实现，最终验收数据使用上述纳秒约定。
+这是字段/时间约定对照，尚未生成driver2 CustomMsg或接入本地仍依赖driver1的FAST-LIO。
+IMU采用与L重合的理想静态坐标，真实内部IMU外参、噪声、偏置和运动响应留到S4/实测标定。
+
+### 39.3 实验矩阵与最终结果
+
+最终数据：`/home/pcz/PX4-RoboMaster/build/mid360s_s2/static_matrix_20261027_03`。
+每组先跳过0.2 s，再按源时间取2.0 s/20帧，分别统计不重叠0.2/0.5/1.0 s窗口。
+原模型姿态与安装参数均继承S1；所有实验共用同一几何和固定随机种子19。
+
+| 实验 | 距离/条件 | 2秒目标总回波 | 结果 |
+|---|---|---:|---|
+| primary / primary_repeat | 1.5 m，σ=0 | 各373 | 通过，两次采样点字节哈希一致 |
+| backup | 3 m，雷达高出主体0.1 m，σ=0 | 120 | 通过，但小特征较稀疏 |
+| primary_noise / primary_noise2 | 1.5 m，σ=10/20 mm | 各373 | 接口/噪声注入通过，未进行物体位姿估计 |
+| backup_noise / backup_noise2 | 3 m，σ=10/20 mm | 各120 | 接口/噪声注入通过，未进行物体位姿估计 |
+| occluded | 1.5 m，中间放400 mm遮挡盒 | 0 | 符合预期，目标被遮挡 |
+| blind | S1抓取悬停位 | 0 | 符合预期，目标位于顶部正装雷达下视盲区 |
+
+全部9组静态用例通过。帧间隔100 ms、IMU间隔5 ms、点的时间单位/顺序与对应帧一致；
+所有点都有IMU源时间括号，最大单侧间隔5 ms。清洁交点回到场景表面的最大残差约1.15e-7 m，
+这只是射线坐标变换一致性，**不是毫米级感知精度证据**。
+σ=10/20 mm时绝对测距扰动P95分别约19.60/39.20 mm，符合声明的敏感性设置；未据此校准真实雷达噪声。
+
+| 窗口 | 1.5 m主体平均点数 | 1.5 m key平均点数 | 3 m主体平均点数 | 3 m key平均点数 |
+|---|---:|---:|---:|---:|
+| 0.2 s | 30.1 | 2.7 | 10.0 | 0.9 |
+| 0.5 s | 75.25 | 6.75 | 25.0 | 2.25 |
+| 1.0 s | 150.5 | 13.5 | 50.0 | 4.5 |
+
+3 m的0.2/0.5 s窗口出现过key零回波；因此几何可见并不保证有足够点约束姿态。
+1.5 m、1 s作为S3首轮静止目标积累条件，0.5 s作对照；3 m保留为较远观察/鲁棒性对照，暂不认定为精定位位。
+这是当前MID360代理的实验选择，实机MID360S需重新测量后决定。
+
+覆盖率采用5 mm面网格，在独立真值中统计“有交点的可见网格/几何可见网格”。
+1 s时1.5 m主体/key平均覆盖约17.82%/16.22%，3 m约6.80%/6.08%。
+该指标用无噪声交点评分，故本轮改变距离噪声不改变这项采样覆盖；不能用它证明带噪分割/配准准确或完整表面覆盖。
+
+### 39.4 历史实测bag接口对照与尚未验收项
+
+只读对照：`/home/pcz/rog_real_bags/R2/r2_formal_04_20260724_103919/r2_formal_04_0.bag`。
+其归档未给出可核实MID360S设备来源，不能作为MID360S性能/新目标抓取精度数据。
+只检查前约3 s：29帧driver2 CustomMsg，点数19392–20640/帧，29帧内offset_time均非单调，
+28帧最大偏移略超过100 ms；IMU源时间中位间隔5.036 ms，P95约5.896 ms。
+header与timebase差值为−173..146 ns，与绝对时间转换精度需一并考虑，不能要求它们字节一致。
+
+结论：模拟字段与真实CustomMsg时间单位可对应，但本节“严格有序固定100 ms”检查只用于理想静态仿真。
+S4接真实数据时，需处理实际帧跨度、点时序、header/timebase选择与精度，再作对应时刻配对/去畸变；不能直接套本节校验器。
+本轮未替换sim-vision、未启动LIO、未做目标分割/位姿估计；硬件入口与抓取能力判定均未放开。
+
+### 39.5 复现、验收与下一小步
+
+```bash
+source /opt/ros/noetic/setup.bash
+source /home/pcz/super_ws/devel/setup.bash
+cmake --build /home/pcz/super_ws/build --target so101_mid360s_static -- -j2
+
+# --output必须选新目录；省略--cases会执行完整9组矩阵。
+python3 /home/pcz/super_ws/src/super_px4_bridge/scripts/perception/run_static_scan.py \
+  --px4-root /home/pcz/PX4-RoboMaster \
+  --cases primary backup primary_noise backup_noise occluded blind \
+  --output /home/pcz/PX4-RoboMaster/build/mid360s_s2/my_static_run
+
+python3 /home/pcz/super_ws/src/super_px4_bridge/tests/test_mid360s_static.py -v
+cd /home/pcz/super_ws/build
+ctest -R mid360s_static_math --output-on-failure
+```
+
+加 `--gui` 可查看静态Gazebo场景；每组结束自动关闭本轮拥有的Gazebo进程。
+`--real-bag 路径`只读生成接口对照，不改变实测数据。ROS端口11411、Gazebo端口11355，已占用则拒绝启动，
+不会杀掉用户已有仿真。全部对象静止，不加载飞行或关节控制插件；本轮所启动的进程结束后均已清理。
+每组保留 `scene.world/scene.json/raw.bag/result.json/gazebo.log`，总目录保存配置快照、来源哈希、覆盖CSV和历史bag接口报告。
+同目录 `static_points.png` 展示1 s回波与点数对照；图中目标隔离、颜色及边框使用独立评分真值，不是分割识别效果。
+评分真值话题与原始点云分开，后续S3输入只能使用raw点云及允许的坐标/模型先验。
+
+插件编译通过，8项边界测试与CTest通过：错时间单位/重复点时间、错布局、缺帧、失去IMU括号、
+静态比力符号错误、表面位姿不符、预期/非预期目标缺失、场景全部静态及link内名称唯一。
+`first_primary`是修复场景重名前的探查，`static_matrix_..._01`是纳秒接口修正前的历史结果；最终以03及其manifest为准。
+S1/S2代码已分段提交；S2 ROS提交 `af0c4f1ac821f58448c865e250ca2c29e2cb31cd`，本轮未推送。
+
+下一小步为S3静态目标分割与模型位姿：先用1.5 m/1 s原始点云做支撑/背景剔除、目标聚类与模型配准，
+再统计位姿误差和拒绝用例；不先接飞行、闭爪或机械臂扰动控制。真实MID360S扫描/噪声校准继续保留为未验收项。
