@@ -52,6 +52,15 @@ def values(p):
     return [p.position.x,p.position.y,p.position.z,p.orientation.w,p.orientation.x,p.orientation.y,p.orientation.z]
 
 
+def speed_for_observation(row):
+    return float(np.linalg.norm(row['actual_v']))<.02 and float(np.linalg.norm(row['actual_w']))<.03
+
+
+def pose_matrix(value):
+    from known_target import pose
+    v=values(value);return pose(v[:3],v[3:])
+
+
 def stop(proc):
     if proc is None or proc.poll() is not None: return
     for sig,seconds in ((signal.SIGINT,5),(signal.SIGTERM,3),(signal.SIGKILL,2)):
@@ -174,7 +183,7 @@ class Sources:
             manager=manager,truth=truth,ages=ages,known_status=known,**physical)
 
 
-def make_world(folder,target,env,approach_guard=False,fixed_grasp=False,sim_vision=False,super_obstacle=False):
+def make_world(folder,target,env,approach_guard=False,fixed_grasp=False,sim_vision=False,super_obstacle=False,lidar_geometry=None):
     expanded=sp.check_output(['gz','sdf','-p',str(MODELS/'yhang550/yhang550.sdf')],
         env=env,text=True,timeout=30)
     model=ET.fromstring(expanded).find('model')
@@ -253,6 +262,9 @@ def make_world(folder,target,env,approach_guard=False,fixed_grasp=False,sim_visi
     ET.SubElement(plugin,'vehicleName').text='yhang550'; ET.SubElement(plugin,'targetName').text=target.name
     if approach_guard: ET.SubElement(plugin,'approachGuard').text='true'
     if fixed_grasp: ET.SubElement(plugin,'fixedGraspGuard').text='true'
+    if lidar_geometry is not None:
+        from lidar_grasp_demo import adapt_world
+        save(folder/'payload_physics.json',adapt_world(world,model,target,lidar_geometry))
     tree.write(folder/'scene.world',encoding='unicode',xml_declaration=True)
 
 
@@ -267,6 +279,7 @@ def main():
     p.add_argument('--sim-vision',action='store_true',help='Demo-only low-noise Gazebo odometry fused by EKF; original dynamics/guards retained')
     p.add_argument('--super-obstacle',action='store_true',
         help='Use Velodyne + existing SUPER planner through the bounded multi-obstacle course before fine grasp')
+    p.add_argument('--lidar-target',action='store_true',help='Observe the known body/key/handle shape from raw LiDAR before guarded grasp')
     p.add_argument('--gui',action='store_true',help='Show this owned Gazebo world in gzclient')
     p.add_argument('--hold-seconds',type=float,default=10.,
         help='Flight-only observation window, 10..60 sim seconds; does not change arrival or grasp guards')
@@ -282,15 +295,28 @@ def main():
         p.error('Choose permission, no-close approach OR explicit fixed grasp')
     if args.super_obstacle and not (args.execute_flight and args.execute_fixed_grasp and args.sim_vision):
         p.error('--super-obstacle currently requires --execute-flight --execute-fixed-grasp --sim-vision')
+    if args.lidar_target and (not args.execute_fixed_grasp or not args.sim_vision or args.super_obstacle):
+        p.error('--lidar-target requires fixed grasp + sim vision, first direct-flight case without SUPER')
     args.target=args.target or Path(__file__).with_name(
-        'known_target_obstacle.json' if args.super_obstacle else
+        'known_target_lidar.json' if args.lidar_target else 'known_target_obstacle.json' if args.super_obstacle else
         ('known_target_fixed.json' if args.execute_fixed_grasp else 'known_target.json'))
     template=None
     if args.execute_fixed_grasp:
         from fixed_demo_plan import FixedDemoPlan
-        template=FixedDemoPlan(args.target);precheck=template.preview();target=template.target
+        if args.lidar_target:
+            from lidar_grasp_demo import LidarDemoPlan
+            template=LidarDemoPlan(args.target)
+        else:template=FixedDemoPlan(args.target)
+        precheck=template.preview();target=template.target
         if not precheck['sampled_geometry_feasible']:p.error('Fixed demo numerical geometry rejected')
     else:target=KnownTarget(json.loads(args.target.read_text()))
+    lidar_geometry=None;observation_height=None
+    if args.lidar_target:
+        lidar_geometry=template.geometry_profile
+        lidar_geometry['target']['position_world_m']=target.object[:3,3].tolist()
+        from lidar_grasp_demo import transform,sensor_transform
+        part=next(p for p in lidar_geometry['target']['parts'] if p['name']=='body')
+        observation_height=(target.object@transform(part['xyz_rpy_deg']))[2,3]-sensor_transform(lidar_geometry)[2,3]
     if not args.execute_flight:
         if args.observe_hover_permit or args.execute_approach or args.execute_fixed_grasp: p.error('Execution requires --execute-flight')
         preview=target.preview();preview['sim_vision_requested']=args.sim_vision
@@ -317,7 +343,7 @@ def main():
     if args.sim_vision:
         env.update({'PX4_PARAM_'+key:str(value) for key,value in SIM_VISION_PARAMS.items()})
     env.pop('ROS_IP',None); make_world(folder,target,env,args.execute_approach or args.execute_fixed_grasp,
-        args.execute_fixed_grasp,args.sim_vision,args.super_obstacle)
+        args.execute_fixed_grasp,args.sim_vision,args.super_obstacle,lidar_geometry)
     # Leave the object out of the body planner's final safety envelope.  The
     # existing bounded handover covers the last 0.6 m to the grasp hover.
     planner_goal_world=(target.hover[:3,3]-.6*target.hover[:3,0]) if args.super_obstacle else target.hover[:3,3]
@@ -358,6 +384,15 @@ def main():
         files += [Path(__file__).with_name('fixed_demo_plan.py'),Path(__file__).with_name('fixed_grasp_probe.py'),
             Path(__file__).with_name('native_client.py'),
             ROOT/'src/modules/arm_control/grasp/FixedGrasp.hpp',ROOT/'src/modules/arm_control/grasp/FixedGraspAdapter.cpp']
+    if args.lidar_target:
+        from lidar_grasp_demo import PROFILE,PERCEPTION
+        files += [Path(__file__).with_name('lidar_grasp_demo.py'),PROFILE,
+            PERCEPTION/'static_target.py',PERCEPTION/'check_installation.py',PERCEPTION/'scan_metrics.py',
+            PERCEPTION/'run_static_scan.py',WS/'src/super_px4_bridge/config/perception/static_target.yaml',
+            WS/'src/super_px4_bridge/config/perception/mid360s_static.yaml',
+            WS/'src/super_px4_bridge/models/perception/mid360.csv.gz',
+            WS/'src/super_px4_bridge/src/perception/mid360s_static_plugin.cpp',
+            WS/'devel/lib/libso101_mid360s_static.so']
     if args.super_obstacle:
         files += [WS/'src/super_px4_bridge/config/px4_sim.yaml',
             WS/'src/super_px4_bridge/launch/super_navigation.launch',
@@ -380,6 +415,9 @@ def main():
         if name.startswith('PX4_PARAM_')}
     save(folder/'manifest.json',dict(stage=5 if args.execute_fixed_grasp else (4 if args.execute_approach else (3 if args.observe_hover_permit else 2)),
         flight_hold_seconds=args.hold_seconds,
+        lidar_target_snapshot=args.lidar_target,
+        perception_pose_source='SIM_BODY_WORLD_POSE' if args.lidar_target else None,
+        perception_model='body_key_handle' if args.lidar_target else None,
         sim_speed_factor=speed_factor,
         mavros_timesync_mode='PASSTHROUGH',
         no_close_approach=args.execute_approach,
@@ -401,6 +439,7 @@ def main():
             strategy='BASE_HOLD_AFTER_UNFOLD_THEN_WORLD_TCP_IK'),
         hashes={str(f):hashlib.sha256(f.read_bytes()).hexdigest() for f in files}))
     procs=[]; logs=[]; subscribers=None; publisher=None; planner_goal_pub=None; hover_probe=None
+    observation=None;lidar_locked=not args.lidar_target;observation_since=None
     def start(name,cmd,cwd=None):
         log=(folder/(name+'.log')).open('w'); logs.append(log)
         proc=sp.Popen(cmd,env=env,cwd=cwd,stdout=log,stderr=sp.STDOUT,start_new_session=True)
@@ -465,9 +504,9 @@ def main():
                 frame_alignment='GENERATED_WORLD_ORIGIN_AND_COMMON_ENU_AXES',origin_residual_m=origin_residual))
             if origin_residual>.02:raise RuntimeError('Sim vision world/local origin mismatch; no takeoff')
             print('Sim vision fusion verified; isolated demo parameters recorded in manifest.',flush=True)
-        takeoff_local=row['local'][2]+target.hover[2,3]-row['body'][2]
+        takeoff_local=row['local'][2]+(observation_height if args.lidar_target else target.hover[2,3])-row['body'][2]
         if not .3<=takeoff_local<=2.5: raise RuntimeError('Takeoff coordinate invalid')
-        horizontal_limit=6.0 if args.super_obstacle else 1.0
+        horizontal_limit=6.0 if (args.super_obstacle or args.lidar_target) else 1.0
         if np.linalg.norm(target.hover[:2,3]-np.array(row['body'][:2]))>horizontal_limit or not 1.0<=target.hover[2,3]<=2.0:
             raise RuntimeError('Flight fixture exceeds its bounded horizontal/height envelope')
         if args.observe_hover_permit:
@@ -483,11 +522,14 @@ def main():
                 raise RuntimeError('Known fixture geometry guard unavailable; no takeoff')
             from hover_approach_probe import HoverApproachProbe
             hover_probe=HoverApproachProbe(BUILD,env,subscribers,target,folder); hover_probe.start()
-        if args.execute_fixed_grasp:
+        if args.execute_fixed_grasp and not args.lidar_target:
             if not row['truth'].fixed_grasp_geometry_valid or row['truth'].fixed_grasp_forbidden_contact:
                 raise RuntimeError('Fine grasp geometry guard unavailable; no takeoff')
             from fixed_grasp_probe import FixedGraspProbe
             hover_probe=FixedGraspProbe(BUILD,env,subscribers,template,folder,expected_pid=px4_proc.pid);hover_probe.start()
+        if args.lidar_target:
+            from lidar_grasp_demo import TargetObservation
+            observation=TargetObservation(lidar_geometry,folder)
         if args.super_obstacle:
             start('super_navigation',['roslaunch','super_px4_bridge','super_navigation.launch',
                 'start_flight_manager:=false','planner_config:='+str(planner_config)])
@@ -518,7 +560,7 @@ def main():
                 tilt=max(abs(math.atan2(R[2,1],R[2,2])),abs(math.asin(np.clip(-R[2,0],-1,1))))
                 if armed_seen and tilt>math.radians(15): raise RuntimeError('Tilt guard exceeded')
                 fold_error=float(np.max(np.abs(row['joints']-[-.07,-1.175,1.45,1.3,-1.57,.3])))
-                if fold_error>.08 and not ((args.execute_approach or args.execute_fixed_grasp) and hover_probe.motion_started):
+                if fold_error>.08 and not ((args.execute_approach or args.execute_fixed_grasp) and hover_probe is not None and hover_probe.motion_started):
                     raise RuntimeError('Folded arm departed initial target before approach')
                 if now>(300 if (args.execute_approach or args.execute_fixed_grasp) else 120): raise RuntimeError('Simulation-time limit exceeded')
                 if args.super_obstacle and row['manager']=='TRACK_SUPER':planner_track_seen=True
@@ -538,7 +580,33 @@ def main():
                 if args.super_obstacle and route_start is None and row['manager']=='FINAL_HOVER':
                     route_start=now;route_point=body.copy()
                     print('SUPER terminal hover accepted; bounded precision handover begins.',flush=True)
-                if not args.super_obstacle and route_start is None and row['manager']=='HOVER_READY':
+                if args.lidar_target and not lidar_locked and row['manager']=='HOVER_READY':
+                    ready=speed_for_observation(row)
+                    if not ready:observation_since=None
+                    elif observation_since is None:observation_since=now
+                    locked=observation.poll(ready and observation_since is not None and now-observation_since>=2.)
+                    if locked:
+                        from lidar_grasp_demo import LidarDemoPlan,quaternion
+                        config=dict(template.config,object_position_world_m=locked['transform'][:3,3].tolist(),
+                            object_quaternion_world_wxyz=quaternion(locked['transform'][:3,:3]).tolist())
+                        source=locked['report']['source_observation']
+                        config['perception_source_window_ns']=[source['observation_start_ns'],source['observation_end_ns']]
+                        locked_file=folder/'perceived_target.json';save(locked_file,config)
+                        template=LidarDemoPlan(locked_file,lidar_geometry);target=template.target
+                        check=template.preview();save(folder/'perceived_plan_precheck.json',check)
+                        if not check['sampled_geometry_feasible']:raise RuntimeError('Perceived target geometry rejected; no arm motion')
+                        # Truth is evaluated only AFTER the estimate and plan exist.
+                        actual=pose_matrix(row['truth'].target_pose)
+                        save(folder/'perception_evaluation.json',dict(translation_error_m=float(np.linalg.norm(actual[:3,3]-locked['transform'][:3,3])),
+                            rotation_error_deg=math.degrees(math.acos(float(np.clip((np.trace(actual[:3,:3].T@locked['transform'][:3,:3])-1)/2,-1,1)))),
+                            object_truth_used_by_estimator=False,source_observation=locked['report']['source_observation']))
+                        from fixed_grasp_probe import FixedGraspProbe
+                        hover_probe=FixedGraspProbe(BUILD,env,subscribers,template,folder,expected_pid=px4_proc.pid);hover_probe.start()
+                        lidar_locked=True
+                        observation.close();observation=None
+                        print('LiDAR target locked from raw cloud; existing guarded flight/grasp begins.',flush=True)
+                        continue  # Re-read source time/body after the offline plan checks; never jump the route clock.
+                if not args.super_obstacle and lidar_locked and route_start is None and row['manager']=='HOVER_READY':
                     route_start=now; route_point=body.copy()
                     print('HOVER_READY: known world route begins; arm remains folded.',flush=True)
                 if route_start is not None and now-last_publish>=.02:
@@ -626,6 +694,9 @@ def main():
             except Exception as error:
                 result.update(success=False,hover_probe_error=str(error))
                 result['hover_prepare_events']=hover_probe.events
+        if observation:
+            try:observation.close()
+            except Exception as error:result.update(success=False,perception_cleanup_error=str(error))
         if publisher: publisher.unregister()
         if subscribers:
             for sub in subscribers.subscribers: sub.unregister()
@@ -634,7 +705,10 @@ def main():
         request_count=(hover_probe.approach_request_count if (args.execute_approach or args.execute_fixed_grasp) and hover_probe else
             result.get('fixed_grasp',{}).get('grasp_requests',0) if args.execute_fixed_grasp else
             result.get('hover_approach',{}).get('approach_request_count',0))
-        result.update(armed_seen=armed_seen,arm_motion_requests_sent=bool(request_count),
+        result.update(lidar_target_locked=bool(args.lidar_target and lidar_locked),
+            simulated_body_pose_for_perception=bool(args.lidar_target),
+            truth_assisted_fine_alignment=bool(args.execute_fixed_grasp),
+            armed_seen=armed_seen,arm_motion_requests_sent=bool(request_count),
             arm_approach_request_count=request_count,
             gripper_requests_sent=bool(args.execute_fixed_grasp and (
                 hover_probe.close_requested if hover_probe else result.get('fixed_grasp',{}).get('close_requested',False))),

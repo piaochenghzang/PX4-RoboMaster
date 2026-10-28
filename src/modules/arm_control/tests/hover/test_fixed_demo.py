@@ -19,6 +19,13 @@ class FixedDemoTests(unittest.TestCase):
     def setUpClass(cls):
         cls.plan=FixedDemoPlan(Path(__file__).with_name('known_target_fixed.json'))
 
+    def test_supported_closure_stays_world_fixed_until_verified_lift(self):
+        from fixed_grasp_probe import grasp_body_hold
+        for phase in (5,6,7):self.assertTrue(grasp_body_hold(phase))
+        for phase in (0,1,2,3,4,8,9):self.assertFalse(grasp_body_hold(phase))
+        # Contact retries keep the supported TCP in exactly the same frame.
+        self.assertEqual([grasp_body_hold(p) for p in (3,4,3,4)], [False]*4)
+
     def test_close_goal_removes_live_entry_residual_in_world_frame(self):
         R=np.array([[0.,-1.,0.],[1.,0.,0.],[0.,0.,1.]])
         tool=np.array([5.,0.,1.5]);local=OPEN_REFERENCE+[.001,.002,-.001]
@@ -353,6 +360,66 @@ class FixedDemoTests(unittest.TestCase):
         self.assertEqual(probe.checked_feedback,10)
         self.assertTrue(probe.frame_verified)
         self.assertEqual(len(probe.pending_feedback),1)
+
+
+class LidarPayloadTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        from lidar_grasp_demo import LidarDemoPlan
+        cls.plan=LidarDemoPlan(Path(__file__).with_name('known_target_lidar.json'))
+
+    def test_new_payload_inertia_and_grasp_origin_are_distinct(self):
+        from lidar_grasp_demo import add_payload,transform
+        world=ET.Element('world');r=add_payload(world,self.plan.target,self.plan.geometry_profile)
+        I=np.array(r['inertia_com_kg_m2']);e=np.linalg.eigvalsh(I)
+        self.assertTrue(np.all(e>0));self.assertLess(e[-1],sum(e[:2]))
+        self.assertAlmostEqual(r['mass_kg'],.01)
+        self.assertGreater(np.linalg.norm(r['com_object_m']),.05)
+        model=world.find("model[@name='test_cube']")
+        self.assertEqual(model.findtext('static'),'false')
+        parts={c.get('name'):c for c in model.findall('link/collision')}
+        self.assertEqual(set(parts),{'collision','body','key'})
+        self.assertEqual(parts['collision'].findtext('geometry/box/size'),'0.02 0.02 0.07')
+        self.assertEqual(parts['collision'].findtext('surface/contact/ode/kp'),'500')
+        self.assertIsNone(parts['body'].find('surface/contact/ode/kp'))
+        support=world.find("model[@name='cube_support']")
+        expected=self.plan.target.object@transform(self.plan.geometry_profile['target']['object_from_support_xyz_rpy_deg'])
+        np.testing.assert_allclose(np.fromstring(support.findtext('pose'),sep=' ')[:3],expected[:3,3])
+
+    def test_handle_close_seats_fixed_finger_inside_original_entry_budget(self):
+        from fixed_grasp_probe import centered_world_target
+        local=OPEN_REFERENCE.copy();tool=np.zeros(3);R=np.eye(3)
+        goal=centered_world_target(tool,R,local,self.plan.close_reference)
+        np.testing.assert_allclose(local-goal,self.plan.close_reference)
+        self.assertLess(np.linalg.norm(goal),.003)
+        self.assertAlmostEqual(self.plan.close_reference[0]-.01+.008,.0002)
+
+    def test_all_parts_guarded_and_only_handle_exempt_for_pads(self):
+        from fixed_demo_plan import PAD_NAMES
+        plan=self.plan
+        for unfold in (True,False):
+            rows=plan.geometry(plan.expected_q,.3,unfold)
+            for pad in PAD_NAMES:
+                obstacles={r['obstacle'] for r in rows if r['collision']==pad}
+                self.assertTrue({'body','key','support','ground/asphalt'}<=obstacles)
+                self.assertEqual('handle' in obstacles,unfold)
+                support=next(r for r in rows if r['collision']==pad and r['obstacle']=='support')
+                self.assertAlmostEqual(support['required'],.016 if unfold else .003)
+        self.assertGreater(min(r['distance']-r['required'] for r in plan.geometry(plan.expected_q,.04)),.020)
+
+    def test_estimated_orientation_is_preserved_and_wrong_orientation_rejected(self):
+        import json,tempfile
+        from lidar_grasp_demo import LidarDemoPlan,quaternion
+        from known_target import mount_transform
+        config=json.loads(Path(__file__).with_name('known_target_lidar.json').read_text())
+        R=self.plan.target.object[:3,:3]@mount_transform([0,0,0,0,0,.01])[:3,:3]
+        config['object_quaternion_world_wxyz']=quaternion(R).tolist()
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'estimate.json';path.write_text(json.dumps(config))
+            plan=LidarDemoPlan(path);np.testing.assert_allclose(plan.target.object[:3,:3],R,atol=1e-12)
+            config['object_quaternion_world_wxyz']=[1,0,0,0];path.write_text(json.dumps(config))
+            with self.assertRaisesRegex(ValueError,'incompatible'):LidarDemoPlan(path)
+
 
 
 if __name__=='__main__':unittest.main()

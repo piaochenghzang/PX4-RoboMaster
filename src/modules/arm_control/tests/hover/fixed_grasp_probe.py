@@ -98,9 +98,9 @@ def unfold_motion_ready(compensation,arm_error,joint_speed,body_error):
         compensation<=.020 and arm_error<=.003 and joint_speed<=.05 and body_error<=.005)
 
 
-def centered_world_target(tool,rotation,local):
+def centered_world_target(tool,rotation,local,reference=REFERENCE):
     """Correct the measured <=3mm entry residual before freezing the goal."""
-    return np.asarray(tool)+np.asarray(rotation)@(np.asarray(local)-REFERENCE)
+    return np.asarray(tool)+np.asarray(rotation)@(np.asarray(local)-np.asarray(reference))
 
 
 def insertion_goal(current,desired,rotation,local,relative_rotation,jaw,orientation_error):
@@ -120,6 +120,13 @@ def insertion_goal(current,desired,rotation,local,relative_rotation,jaw,orientat
     # Only a slow lateral correction is allowed, with the same native budgets.
     axis=np.asarray(rotation)[:,0];delta=np.asarray(desired)-current
     return np.asarray(current)+axis*float(delta@axis),float(gap),False
+
+
+def grasp_body_hold(phase):
+    # The target remains supported throughout Close/Verify. Keep the TCP fixed
+    # in WORLD during that closed chain; latch the body-relative carrying goal
+    # only after native verification succeeds and Lift actually starts.
+    return 5<=phase<=7
 
 
 def context_geometry(truth,unfold_complete,closing=False):
@@ -392,10 +399,10 @@ class FixedGraspProbe(NativeClient):
                 base_hold=phase==1 and self.unfold_anchor is not None and not self.unfold_settled
                 if base_hold:goal_world=(A@np.r_[self.unfold_anchor,1])[:3]
                 base=(inverse(A)@np.r_[goal_world,1])[:3]
-                # Track WORLD until both pads grip. Once native Verify confirms
-                # bilateral contact, stop pushing against the support through
-                # world-position corrections and hold relative to the body.
-                if 4<=phase<=7:
+                # Supported closure/verification share one world target. A
+                # Close/Verify retry must not change frames or drag the support.
+                body_hold=grasp_body_hold(phase)
+                if body_hold:
                     if self.grasp_base is None:self.grasp_base=base.copy()
                     base=self.grasp_base.copy()
                     goal_world=(A@np.r_[base,1])[:3]
@@ -429,7 +436,7 @@ class FixedGraspProbe(NativeClient):
                         hover_position_error=measured[3]),unfold_stability_ready=unfold_ready,
                     native_status_fresh=polled,
                     compensation_mode=('BASE_HOLD_FOR_UNFOLD_SETTLE' if base_hold else
-                        'BASE_HOLD_DURING_GRASP' if 4<=phase<=7 else 'WORLD_TCP'),
+                        'BASE_HOLD_DURING_GRASP' if body_hold else 'WORLD_TCP'),
                     unfold_hover_settled=self.unfold_settled,
                     waypoint_index=self.route_index,
                     planned_waypoint_world=desired_world.tolist(),world_progress_error_m=float(np.linalg.norm(desired_world-goal_world)),
@@ -471,7 +478,8 @@ class FixedGraspProbe(NativeClient):
                     # Use the live cube center, not the nominal endpoint or
                     # the lagging measured tool pose. Native slew/IK still
                     # bounds the <=3mm correction before actual closure.
-                    self.progress_world=centered_world_target(tool,G[:3,:3],local);self.last_progress_sim=now
+                    self.progress_world=centered_world_target(tool,G[:3,:3],local,
+                        getattr(self.template,'close_reference',REFERENCE));self.last_progress_sim=now
                     self.expected=state.get('last_request_id',0)
                     self.pickup_height=O[2];self.request('fixed_grasp_close');self.close_requested=True;self.stage='close_ack'
                     self.event('controlled_close_requested',row,alignment=measured[4],orientation=measured[6])
