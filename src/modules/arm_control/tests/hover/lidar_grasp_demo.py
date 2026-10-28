@@ -212,7 +212,7 @@ class TargetObservation:
             report['source_observation']=dict(observation_start_ns=begin,observation_end_ns=end,restamped=False,
                 frame='mid360s_lidar',body_world_at_reference=ref.tolist(),lidar_world_at_reference=M_L.tolist(),
                 localization='SIM_BODY_WORLD_POSE_NOT_TARGET_TRUTH',deskew_bin_s=.005,max_body_translation_m=max_motion,max_body_rotation_rad=max_angle,
-                moving_imu='ideal gravity/gyro cue; not a LIO accelerometer model')
+                moving_imu='stable-window specific-force direction; dynamics selected by scene profile')
             out=self.folder/('perception_attempt_'+str(self.attempts));out.mkdir()
             (out/'estimate.json').write_text(json.dumps(report,indent=2,allow_nan=False)+'\n')
             with rosbag.Bag(str(out/'observation.bag'),'w',compression='lz4') as bag:

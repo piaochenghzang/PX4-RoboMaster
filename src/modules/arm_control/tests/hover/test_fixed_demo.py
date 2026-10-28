@@ -422,6 +422,38 @@ class LidarPayloadTests(unittest.TestCase):
 
 
 
+class PillarCourseTests(unittest.TestCase):
+    def test_wide_posts_and_alternating_clear_openings(self):
+        from pillar_course import obstacles,GATE_X,LANE_Y,POST_SIZE,room
+        items=obstacles();self.assertEqual(len(items),6)
+        self.assertGreaterEqual(min(POST_SIZE[:2]),1.2)
+        self.assertEqual(len(room()),5)
+        for x,y in zip(GATE_X,LANE_Y):
+            same=[o for o in items if o['center'][0]==x]
+            self.assertEqual(len(same),2)
+            self.assertGreater(min(obstacle_clearance([x,y,1.25],o) for o in items),.30)
+        for o in (*items,*room()):self.assertTrue(o['name'].startswith('demo_obstacle_'))
+
+    def test_gate_audit_rejects_bypass_and_overflight(self):
+        from pillar_course import gate_crossings,GATE_X,LANE_Y
+        rows=[];t=0.
+        for x,y in zip(GATE_X,LANE_Y):
+            rows.extend([dict(sim_s=t,body_world=[x-.1,y,1.25]),dict(sim_s=t+.4,body_world=[x+.1,y,1.25])]);t+=2
+        self.assertTrue(gate_crossings(rows)['passed'])
+        self.assertFalse(gate_crossings(rows[:2])['passed'])
+        self.assertFalse(gate_crossings([dict(r,body_world=[r['body_world'][0],0.,1.25]) for r in rows])['passed'])
+        self.assertFalse(gate_crossings([dict(r,body_world=[*r['body_world'][:2],3.5]) for r in rows])['passed'])
+
+    def test_search_goals_end_before_target_grasp(self):
+        from pillar_course import observation_goals
+        from lidar_grasp_demo import LidarDemoPlan
+        plan=LidarDemoPlan(Path(__file__).with_name('known_target_pillars.json'))
+        goals=observation_goals(plan.target,1.25)
+        self.assertEqual(len(goals),4)
+        self.assertGreater(goals[-1][0],8.8)
+        self.assertAlmostEqual(plan.target.object[0,3]-goals[-1][0],1.5)
+        self.assertTrue(plan.preview()['sampled_geometry_feasible'])
+
 class CarryTests(unittest.TestCase):
     def test_smooth_bounded_carry(self):
         from carry_demo import CarryRoute

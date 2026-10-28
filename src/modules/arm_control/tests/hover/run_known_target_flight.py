@@ -193,7 +193,7 @@ class Sources:
             manager=manager,truth=truth,ages=ages,known_status=known,**physical)
 
 
-def make_world(folder,target,env,approach_guard=False,fixed_grasp=False,sim_vision=False,super_obstacle=False,lidar_geometry=None,fastlio=False):
+def make_world(folder,target,env,approach_guard=False,fixed_grasp=False,sim_vision=False,super_obstacle=False,lidar_geometry=None,fastlio=False,pillar_course=False):
     expanded=sp.check_output(['gz','sdf','-p',str(MODELS/'yhang550/yhang550.sdf')],
         env=env,text=True,timeout=30)
     model=ET.fromstring(expanded).find('model')
@@ -262,11 +262,15 @@ def make_world(folder,target,env,approach_guard=False,fixed_grasp=False,sim_visi
             ode=ET.SubElement(ET.SubElement(ET.SubElement(e,'surface'),'friction'),'ode')
             for coefficient in ('mu','mu2'):ET.SubElement(ode,coefficient).text='1.2'
     if super_obstacle:
-        for description in (LIDAR_DEMO_OBSTACLES if lidar_geometry is not None else DEMO_OBSTACLES):add_obstacle(world,description)
+        if pillar_course:
+            from pillar_course import obstacles
+            scene_obstacles=obstacles()
+        else:scene_obstacles=LIDAR_DEMO_OBSTACLES if lidar_geometry is not None else DEMO_OBSTACLES
+        for description in scene_obstacles:add_obstacle(world,description)
         gui=world.find('gui')
         if gui is None:gui=ET.SubElement(world,'gui',fullscreen='false')
         camera=ET.SubElement(gui,'camera',name='demo_camera')
-        ET.SubElement(camera,'pose').text='3 -8 5 0 0.4 1.57'
+        ET.SubElement(camera,'pose').text='5.5 -10 8 0 0.65 1.57' if pillar_course else '3 -8 5 0 0.4 1.57'
         ET.SubElement(camera,'view_controller').text='orbit'
     plugin=ET.SubElement(world,'plugin',name='coordinate_truth',filename='libso101_coordinate_truth.so')
     ET.SubElement(plugin,'vehicleName').text='yhang550'; ET.SubElement(plugin,'targetName').text=target.name
@@ -279,7 +283,11 @@ def make_world(folder,target,env,approach_guard=False,fixed_grasp=False,sim_visi
         save(folder/'payload_physics.json',physics_report)
     if fastlio:
         ET.SubElement(world.find("plugin[@name='demo_lidar']"),'demoLioImu').text='true'
-        for description in LIO_ROOM:add_obstacle(world,description)
+        if pillar_course:
+            from pillar_course import room
+            scene_room=room()
+        else:scene_room=LIO_ROOM
+        for description in scene_room:add_obstacle(world,description)
     tree.write(folder/'scene.world',encoding='unicode',xml_declaration=True)
 
 
@@ -295,6 +303,7 @@ def main():
     p.add_argument('--super-obstacle',action='store_true',
         help='Use Velodyne + existing SUPER planner through the bounded multi-obstacle course before fine grasp')
     p.add_argument('--lidar-target',action='store_true',help='Observe the known body/key/handle shape from raw LiDAR before guarded grasp')
+    p.add_argument('--pillar-course',action='store_true',help='Fly through six wide staggered posts before observing the target')
     p.add_argument('--fastlio-map',action='store_true',help='Continuous MID360 proxy + dynamic IMU -> FAST-LIO -> SUPER map; EKF remains explicitly sim-vision')
     p.add_argument('--carry-after-grasp',action='store_true',help='After lift/hold, fly the real payload along a bounded slow route')
     p.add_argument('--carry-to',nargs=3,type=float,metavar=('X','Y','Z'),help='Carry destination in Gazebo world metres; defaults to grasp hover + [0,.5,.12]')
@@ -316,12 +325,13 @@ def main():
     args.carry_after_grasp=bool(args.carry_after_grasp or args.carry_to)
     if args.super_obstacle and not (args.execute_flight and args.execute_fixed_grasp and args.sim_vision):
         p.error('--super-obstacle currently requires --execute-flight --execute-fixed-grasp --sim-vision')
+    if args.pillar_course and not (args.fastlio_map and args.super_obstacle and args.lidar_target):p.error('Pillar course requires MID360 + FAST-LIO + SUPER')
     if args.fastlio_map and not args.lidar_target:p.error('--fastlio-map requires --lidar-target')
     if args.super_obstacle and args.lidar_target and not args.fastlio_map:p.error('Combined MID360/SUPER demo requires --fastlio-map')
     if args.lidar_target and (not args.execute_fixed_grasp or not args.sim_vision):
         p.error('--lidar-target requires fixed grasp + sim vision')
     args.target=args.target or Path(__file__).with_name(
-        'known_target_lidar.json' if args.lidar_target else 'known_target_obstacle.json' if args.super_obstacle else
+        'known_target_pillars.json' if args.pillar_course else 'known_target_lidar.json' if args.lidar_target else 'known_target_obstacle.json' if args.super_obstacle else
         ('known_target_fixed.json' if args.execute_fixed_grasp else 'known_target.json'))
     template=None
     if args.execute_fixed_grasp:
@@ -369,12 +379,17 @@ def main():
     if args.sim_vision:
         env.update({'PX4_PARAM_'+key:str(value) for key,value in SIM_VISION_PARAMS.items()})
     env.pop('ROS_IP',None); make_world(folder,target,env,args.execute_approach or args.execute_fixed_grasp,
-        args.execute_fixed_grasp,args.sim_vision,args.super_obstacle,lidar_geometry,args.fastlio_map)
+        args.execute_fixed_grasp,args.sim_vision,args.super_obstacle,lidar_geometry,args.fastlio_map,args.pillar_course)
     # Leave the object out of the body planner's final safety envelope.  The
-    # existing bounded handover covers the last 0.6 m to the grasp hover.
+    # bounded handover covers the remaining, unobstructed precision approach.
     planner_goal_world=(target.hover[:3,3]-.6*target.hover[:3,0]) if args.super_obstacle else target.hover[:3,3]
     course=LIDAR_DEMO_OBSTACLES if args.lidar_target else DEMO_OBSTACLES
-    if args.super_obstacle and args.lidar_target:planner_goal_world=target.hover[:3,3]+[.2,1.9,0.]
+    if args.pillar_course:
+        from pillar_course import obstacles,observation_goals
+        course=obstacles()
+        search_goals=observation_goals(target,observation_height)
+        planner_goal_world=search_goals[0]
+    if args.super_obstacle and args.lidar_target and not args.pillar_course:planner_goal_world=target.hover[:3,3]+[.2,1.9,0.]
     if args.fastlio_map:
         lio_prefix=ROOT/'build/fastlio_ws/devel'
         if not (lio_prefix/'lib/fast_lio/fastlio_mapping').is_file():p.error('Build FAST-LIO simulation dependency first')
@@ -389,6 +404,9 @@ def main():
         if args.lidar_target:
             config['rog_map']['resolution']=.15;config['rog_map']['inflation_resolution']=.15
             config['rog_map']['inflation_step']=4
+        if args.pillar_course:
+            config['rog_map']['map_size']=[24,12,6];config['rog_map']['fix_map_origin']=[5.5,0,1.5]
+            config['rog_map']['virtual_ceil_height']=4.2 # ROG-Map also shrinks this bound for inflation.
         config['traj_opt']['boundary']['max_vel']=.5
         config['traj_opt']['boundary']['max_acc']=.6
         config['traj_opt']['exp_traj']['penna_t']=1.e5
@@ -436,6 +454,7 @@ def main():
             planner_config,
             WS/'src/super_px4_bridge/src/super_sensor_adapter.cpp',
             WS/'src/super_px4_bridge/src/super_mavros_bridge.cpp']
+    if args.pillar_course:files.append(Path(__file__).with_name('pillar_course.py'))
     if args.carry_after_grasp:
         files += [Path(__file__).with_name('carry_demo.py'),WS/'src/super_px4_bridge/include/super_px4_bridge/known_flight_handover.h']
     if args.fastlio_map:
@@ -458,7 +477,8 @@ def main():
         if name.startswith('PX4_PARAM_')}
     save(folder/'manifest.json',dict(stage=5 if args.execute_fixed_grasp else (4 if args.execute_approach else (3 if args.observe_hover_permit else 2)),
         flight_hold_seconds=args.hold_seconds,carry_after_grasp=args.carry_after_grasp,carry_destination_world_m=args.carry_to,
-        lidar_target_snapshot=args.lidar_target,fastlio_map=args.fastlio_map,
+        lidar_target_snapshot=args.lidar_target,fastlio_map=args.fastlio_map,pillar_course=args.pillar_course,
+        target_observation_after_navigation=args.pillar_course,
         perception_pose_source='SIM_BODY_WORLD_POSE' if args.lidar_target else None,
         perception_model='body_key_handle' if args.lidar_target else None,
         sim_speed_factor=speed_factor,
@@ -573,7 +593,7 @@ def main():
             print('Sim vision fusion verified; isolated demo parameters recorded in manifest.',flush=True)
         takeoff_local=row['local'][2]+(observation_height if args.lidar_target else target.hover[2,3])-row['body'][2]
         if not .3<=takeoff_local<=2.5: raise RuntimeError('Takeoff coordinate invalid')
-        horizontal_limit=6.0 if (args.super_obstacle or args.lidar_target) else 1.0
+        horizontal_limit=12.0 if args.pillar_course else (6.0 if (args.super_obstacle or args.lidar_target) else 1.0)
         if np.linalg.norm(target.hover[:2,3]-np.array(row['body'][:2]))>horizontal_limit or not 1.0<=target.hover[2,3]<=2.0:
             raise RuntimeError('Flight fixture exceeds its bounded horizontal/height envelope')
         if args.observe_hover_permit:
@@ -594,7 +614,7 @@ def main():
                 raise RuntimeError('Fine grasp geometry guard unavailable; no takeoff')
             from fixed_grasp_probe import FixedGraspProbe
             hover_probe=FixedGraspProbe(BUILD,env,subscribers,template,folder,expected_pid=px4_proc.pid,keep_after_done=args.carry_after_grasp);hover_probe.start()
-        if args.lidar_target:
+        if args.lidar_target and not args.pillar_course:
             from lidar_grasp_demo import TargetObservation
             observation=TargetObservation(lidar_geometry,folder)
         if args.fastlio_map:
@@ -617,6 +637,7 @@ def main():
         if args.super_obstacle:planner_goal_pub=rospy.Publisher('/planning/user_goal',PoseStamped,queue_size=1)
         route_start=None; route_point=None; stable_since=None; hold_since=None; last_publish=-math.inf
         planner_goal_sent=False;planner_goal_time=None;planner_track_seen=False;planner_start=None
+        search_index=0;search_complete=not args.pillar_course;leg_track_seen=False;navigation_events=[]
         min_obstacle_clearance=math.inf;max_direct_deviation=0.
         carry=None;carry_stable_since=None;carry_result=None;takeoff_since=None
         last_command=None # Audit only; never used as feedback or to renew a lease.
@@ -656,24 +677,42 @@ def main():
                 if row['manager']=='TAKEOFF':
                     if takeoff_since is None:takeoff_since=now
                     if now-takeoff_since>30:raise RuntimeError('Takeoff did not settle within 30 sim seconds; no route or grasp')
-                if args.super_obstacle and row['manager']=='TRACK_SUPER':planner_track_seen=True
-                if args.super_obstacle and not planner_goal_sent and row['manager']=='HOVER_READY' and lidar_locked and planner_goal_pub.get_num_connections():
+                if args.pillar_course and armed_seen and (body[2]>2.5 or abs(body[1])>1.9):
+                    raise RuntimeError('Pillar course body envelope exceeded')
+                if args.super_obstacle and row['manager']=='TRACK_SUPER':planner_track_seen=True;leg_track_seen=True
+                if args.super_obstacle and not planner_goal_sent and row['manager'] in ('HOVER_READY','FINAL_HOVER') and (lidar_locked or (args.pillar_course and not search_complete)) and planner_goal_pub.get_num_connections():
                     goal=PoseStamped();goal.header.stamp=rospy.Time.now();goal.header.frame_id='world'
                     goal.pose.position.x,goal.pose.position.y,goal.pose.position.z=map(float,planner_goal_world)
                     goal.pose.orientation.z=math.sin(target.yaw*.5);goal.pose.orientation.w=math.cos(target.yaw*.5)
-                    planner_goal_pub.publish(goal);planner_goal_sent=True;planner_goal_time=now;planner_start=body.copy()
+                    planner_goal_pub.publish(goal);planner_goal_sent=True;planner_goal_time=now;planner_start=body.copy();leg_track_seen=False
+                    navigation_events.append(dict(event='super_goal_sent',sim_s=now,goal_world_m=planner_goal_world.tolist(),search_leg=search_index if not search_complete else None))
                     print('HOVER_READY: multi-obstacle SUPER goal published; arm remains folded.',flush=True)
-                if args.super_obstacle and planner_goal_sent and not planner_track_seen and now-planner_goal_time>8:
+                if args.super_obstacle and planner_goal_sent and not leg_track_seen and now-planner_goal_time>8:
                     raise RuntimeError('SUPER did not produce an accepted trajectory; arm remains folded')
                 if args.super_obstacle and planner_goal_sent:
                     current_clearance=min(obstacle_clearance(body,o) for o in course)
                     min_obstacle_clearance=min(min_obstacle_clearance,current_clearance)
                     if route_start is None:max_direct_deviation=max(max_direct_deviation,line_deviation(body,planner_start,planner_goal_world))
                     if current_clearance<0:raise RuntimeError('Vehicle obstacle envelope intersected the demo course')
-                if args.super_obstacle and route_start is None and row['manager']=='FINAL_HOVER':
+                if args.pillar_course and not search_complete and planner_goal_sent and leg_track_seen and row['manager']=='FINAL_HOVER':
+                    navigation_events.append(dict(event='search_leg_arrived',sim_s=now,search_leg=search_index,body_world_m=body.tolist()))
+                    search_index+=1;planner_goal_sent=False;leg_track_seen=False
+                    if search_index<len(search_goals):
+                        planner_goal_world=search_goals[search_index]
+                        print('Pillar passage accepted; next SUPER search leg '+str(search_index+1),flush=True)
+                    else:
+                        from pillar_course import gate_crossings
+                        passages=gate_crossings(rows);save(folder/'pillar_passages.json',passages)
+                        if not passages['passed']:raise RuntimeError('Pillar passages were bypassed; target observation stays disabled')
+                        from lidar_grasp_demo import TargetObservation
+                        search_complete=True;observation=TargetObservation(lidar_geometry,folder)
+                        navigation_events.append(dict(event='target_observation_enabled',sim_s=now))
+                        print('All pillar passages finished; target observation now enabled.',flush=True)
+                    continue
+                if args.super_obstacle and route_start is None and row['manager']=='FINAL_HOVER' and lidar_locked and planner_goal_sent and leg_track_seen:
                     route_start=now;route_point=body.copy()
                     print('SUPER terminal hover accepted; bounded precision handover begins.',flush=True)
-                if args.lidar_target and not lidar_locked and row['manager']=='HOVER_READY':
+                if args.lidar_target and not lidar_locked and search_complete and observation is not None and row['manager'] in ('HOVER_READY','FINAL_HOVER'):
                     ready=speed_for_observation(row)
                     if not ready:observation_since=None
                     elif observation_since is None:observation_since=now
@@ -695,7 +734,13 @@ def main():
                             object_truth_used_by_estimator=False,source_observation=locked['report']['source_observation']))
                         from fixed_grasp_probe import FixedGraspProbe
                         hover_probe=FixedGraspProbe(BUILD,env,subscribers,template,folder,expected_pid=px4_proc.pid,keep_after_done=args.carry_after_grasp);hover_probe.start()
-                        if args.super_obstacle:planner_goal_world=target.hover[:3,3]+[.2,1.9,0.]
+                        if args.super_obstacle:
+                            if args.pillar_course:
+                                from pillar_course import GRASP_STANDBY_OFFSET
+                                planner_goal_world=target.hover[:3,3]+GRASP_STANDBY_OFFSET
+                            else:planner_goal_world=target.hover[:3,3]+[.2,1.9,0.]
+                            planner_goal_sent=False;leg_track_seen=False
+                        navigation_events.append(dict(event='target_locked',sim_s=now,observation=source))
                         lidar_locked=True
                         observation.close();observation=None
                         print('LiDAR target locked from raw cloud; existing guarded flight/grasp begins.',flush=True)
@@ -804,6 +849,15 @@ def main():
             result[key]=hover_probe.finish(); hover_probe=None
             if not result[key].get('grasp_validated' if args.execute_fixed_grasp else ('approach_validated' if args.execute_approach else 'hover_prepare_validated')):
                 raise RuntimeError('Hover PREPARE tests incomplete')
+        save(folder/'navigation_events.json',navigation_events)
+        if args.pillar_course:
+            from pillar_course import gate_crossings
+            passages=gate_crossings(rows);result['pillar_passages']=passages
+            if not passages['passed']:raise RuntimeError('Not every pillar opening was crossed')
+            enabled=next(e['sim_s'] for e in navigation_events if e['event']=='target_observation_enabled')
+            source=next(e['observation'] for e in navigation_events if e['event']=='target_locked')
+            if source['observation_start_ns']*1e-9<enabled:raise RuntimeError('Target snapshot predates pillar course arrival')
+            result['target_observation_after_pillars_validated']=True
         if args.fastlio_map:
             errors=[r['fastlio']['position_error_m'] for r in rows if r['fastlio']]
             result['fastlio']=dict(samples=len(errors),maximum_position_error_m=max(errors),mean_position_error_m=float(np.mean(errors)),
@@ -850,6 +904,7 @@ def main():
             grasp_tested=bool(args.execute_fixed_grasp and (
                 hover_probe.close_requested if hover_probe else result.get('fixed_grasp',{}).get('close_requested',False))),
             own_processes_stopped=True,wall_elapsed_s=time.monotonic()-started)
+        if 'navigation_events' in locals():save(folder/'navigation_events.json',navigation_events)
         save(folder/'result.json',result); print(json.dumps(result,indent=2,allow_nan=False),flush=True)
     return 0 if result['success'] else 2
 
