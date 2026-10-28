@@ -172,7 +172,7 @@ class FixedBinding(ApproachPlan):
 
 
 class FixedGraspProbe(NativeClient):
-    def __init__(self,build,env,sources,template,folder,*,expected_pid):
+    def __init__(self,build,env,sources,template,folder,*,expected_pid,keep_after_done=False):
         super().__init__(build,env,transport='unix',expected_pid=expected_pid)
         import sys
         scripts=Path('/home/pcz/super_ws/src/super_px4_bridge/scripts')
@@ -183,6 +183,7 @@ class FixedGraspProbe(NativeClient):
         self.template=template;self.sources=sources;self.target=template.target
         self.plan=FixedBinding(template,sources.read(require_odometry=False)['truth'])
         self.log=(folder/'fixed_grasp_status.jsonl').open('x')
+        self.keep_after_done=keep_after_done;self.carry_reference=None;self.carry_started=None;self.grasp_done_at=None
         self.events=[];self.complete=False;self.error=None;self.motion_started=False
         self.approach_request_count=0;self.close_requested=False
         self.stop_event=threading.Event();self.thread=threading.Thread(target=self.run,daemon=True)
@@ -208,7 +209,7 @@ class FixedGraspProbe(NativeClient):
         self.frame_error=None;self.pair_skew=None
         self.pending_feedback=deque(maxlen=12);self.seen_feedback=None
         self.last_pair_failure=None
-        self.last_geometry_valid=None
+        self.last_geometry_valid=None;self.invalid_geometry_since=None
 
     def event(self,name,row,**extra):
         self.events.append(dict(event=name,sim_s=row['now'],**extra))
@@ -321,6 +322,8 @@ class FixedGraspProbe(NativeClient):
                 O=pose_values(t.target_pose);local=(inverse(G)@np.r_[O[:3],1])[:3]
                 pos,angle=self.residual(A@self.fk_gripper(self.config,row['joints']),G)
                 measured=metrics(row,self.target,REFERENCE)
+                if self.carry_reference is not None:
+                    measured[3]=float(np.linalg.norm(np.asarray(row['body'][:3])-self.carry_reference))
                 phase=int(self.native.get('phase',0))
                 geometry,clearance=context_geometry(t,bool(self.native.get('unfold_complete')) and self.unfold_settled,3<=phase<=7)
                 valid=bool(geometry and clearance>.016 and pos<=.002 and angle<=.001 and frame_verified)
@@ -333,6 +336,11 @@ class FixedGraspProbe(NativeClient):
                         latest_feedback_sample_us=feedback.get('sample_time_us'),
                         paired_feedback_sequence=paired_sequence)
                 self.last_geometry_valid=valid
+                if self.streaming and not self.motion_started:
+                    if valid:self.invalid_geometry_since=None
+                    elif self.invalid_geometry_since is None:self.invalid_geometry_since=now
+                    elif now-self.invalid_geometry_since>=1.:
+                        raise RuntimeError('Fixed grasp scene geometry unavailable before arm start')
                 if not self.streaming and self.plan.matches(lease) and lease.terminal_hold and self.latest.get('native_heading_ready'):
                     self.streaming=True;self.event('fixed_task_bound',row,binding=self.plan.ids)
                 # The two designated pads may contact the designated cube in
@@ -410,7 +418,7 @@ class FixedGraspProbe(NativeClient):
                 timing=None
                 if self.streaming and source!=self.last_source:
                     self.last_source=source
-                    fresh=(self.plan.matches(lease) and lease.terminal_hold and lease.lease_valid and
+                    fresh=(self.plan.matches(lease) and (lease.terminal_hold or self.carry_started is not None) and lease.lease_valid and
                         -.02<=now-lease.header.stamp.to_sec()<=.1 and -.02<=now-lease.command_stamp.to_sec()<=.3)
                     stamp=min(lease.header.stamp.to_nsec(),lease.command_stamp.to_nsec())//1000 if lease else 0
                     fields=[self.plan.task,source[0],source[1],t.world_epoch,1,*measured,
@@ -487,17 +495,28 @@ class FixedGraspProbe(NativeClient):
                     self.stage='grasp' if state.get('request_result')==1 else 'approach'
                 if phase==5 and self.grasp_reference is None:
                     self.grasp_reference=local.copy();self.event('physical_lift_started',row)
-                if phase==7:
+                if phase==7 and not self.complete:
                     good=(self.pickup_height is not None and O[2]-self.pickup_height>=.025 and
                         t.fixed_grasp_bilateral_fraction>=.9 and t.fixed_grasp_support_fraction<=.001 and
                         valid and self.grasp_reference is not None and np.linalg.norm(local-self.grasp_reference)<=.045)
                     if not good:self.done_since=None
                     elif self.done_since is None:self.done_since=now
-                    elif now-self.done_since>=5:
-                        self.complete=True;self.stage='done';self.event('fixed_object_lift_held',row,
-                            actual_lift=O[2]-self.pickup_height);return
+                    elif now-self.done_since>=5 and not self.complete:
+                        self.grasp_done_at=now;self.complete=True;self.stage='done';self.event('fixed_object_lift_held',row,
+                            actual_lift=O[2]-self.pickup_height)
+                        if not self.keep_after_done:return
         except Exception as exc:self.error=str(exc)
         finally:self.log.close()
+
+    def carry_setpoint(self,position,now):
+        # Only the already independently validated payload can enter slow flight.
+        # Raw speed/angular/tilt/allocation/contact/clearance gates stay active.
+        position=np.asarray(position,dtype=float)
+        if not self.keep_after_done or not self.complete or self.error or self.native.get('phase')!=7 or self.native.get('paused'):
+            raise RuntimeError('Carry requires healthy completed native grasp')
+        if position.shape!=(3,) or not np.isfinite(position).all():raise ValueError('Invalid carry reference')
+        if self.carry_started is None:self.carry_started=now
+        self.carry_reference=position.copy()
 
     def start(self):self.feedback_thread.start();self.status_thread.start();self.thread.start()
 
@@ -506,7 +525,7 @@ class FixedGraspProbe(NativeClient):
         if any(t.is_alive() for t in (self.thread,self.feedback_thread,self.status_thread)):
             raise RuntimeError('Fixed grasp observer did not stop')
         if self.error:raise RuntimeError(self.error)
-        held=[r for r in self.samples if self.done_since is not None and r['sim_s']>=self.done_since]
+        held=[r for r in self.samples if self.done_since is not None and r['sim_s']>=self.done_since and (self.grasp_done_at is None or r['sim_s']<=self.grasp_done_at)]
         frames=sum(r['contact_frames'] for r in held)
         bilateral=sum(r['contact_frames']*r['bilateral'] for r in held)/max(1,frames)
         support=sum(r['contact_frames']*r['support'] for r in held)/max(1,frames)
@@ -519,4 +538,4 @@ class FixedGraspProbe(NativeClient):
             observed_hold_seconds=held[-1]['sim_s']-held[0]['sim_s'] if held else 0,
             final_native_status=self.native,grasp_requests=self.approach_request_count,
             close_requested=self.close_requested,vehicle_fixed=False,object_attached=False,
-            general_pose_or_carry_flight_tested=False)
+            general_pose_or_carry_flight_tested=False,carry_monitor_started=self.carry_started is not None)

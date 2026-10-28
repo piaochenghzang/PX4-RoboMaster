@@ -422,4 +422,37 @@ class LidarPayloadTests(unittest.TestCase):
 
 
 
+class CarryTests(unittest.TestCase):
+    def test_smooth_bounded_carry(self):
+        from carry_demo import CarryRoute
+        route=CarryRoute([1.,0.,1.9],[1.,.5,2.02],2.)
+        speeds=[]
+        for t in np.linspace(2.,2.+route.duration,1001):
+            p,v=route.sample(t);speeds.append(np.linalg.norm(v))
+            self.assertGreaterEqual(p[2],1.9-1e-10)
+        self.assertLessEqual(max(speeds),.030001)
+        np.testing.assert_allclose(route.sample(2.)[1],[0,0,0])
+        np.testing.assert_allclose(route.sample(2.+route.duration)[0],route.goal)
+        np.testing.assert_allclose(route.sample(2.+route.duration)[1],[0,0,0],atol=1e-10)
+        self.assertFalse(route.finished(2.));self.assertTrue(route.finished(2.+route.duration+.001))
+        with self.assertRaises(ValueError):route.sample(1.)
+
+    def test_reject_invalid_carry_endpoints(self):
+        from carry_demo import CarryRoute
+        for goal in ([0,0,1.], [0,0,2.01], [0,1.,2.2], [float('nan'),0,2.2], [0,0,3.]):
+            with self.assertRaises(ValueError):CarryRoute([0,0,2.],goal,0.)
+
+    def test_carry_requires_actual_transport_and_contact(self):
+        from carry_demo import carry_evidence
+        rows=[dict(sim_s=i*.1,contact_frames=100,bilateral=1.,support=0.,object_local=[0,0,0],
+            object_world=[i*.003,0,2.],phase=7,geometry_valid=True,forbidden_contact=False) for i in range(101)]
+        self.assertTrue(carry_evidence(rows,[0,0,0])['validated'])
+        self.assertFalse(carry_evidence([], [0,0,0])['validated'])
+        for key,bad in [('support',1.),('bilateral',0.),('geometry_valid',False),('phase',8),
+                        ('forbidden_contact',True),('object_local',[.05,0,0])]:
+            changed=[dict(r,**{key:bad}) for r in rows]
+            self.assertFalse(carry_evidence(changed,[0,0,0])['validated'])
+        self.assertFalse(carry_evidence([dict(r,object_world=[0,0,2.]) for r in rows],[0,0,0])['validated'])
+        self.assertFalse(carry_evidence(rows[:20],[0,0,0])['validated'])
+
 if __name__=='__main__':unittest.main()

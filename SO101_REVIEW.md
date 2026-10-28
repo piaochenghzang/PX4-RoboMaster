@@ -4302,3 +4302,70 @@ primary/primary_repeat均为20帧、373个目标回波，点云字节哈希完�
 启动时的场景核对、后续精接近居中及几何/接触许可仍沿用既有仿真真值反馈，飞行定位使用原SIM_VISION融合。
 因此当前通过的是雷达目标初始化、仿真定位与精接近辅助的抓取联调。
 本轮没有验收FAST-LIO定位、SUPER多障碍与该新目标的完整组合或携物飞行。
+
+## 43. 抓取后携物与 FAST-LIO / SUPER 联调（2026-10-28）
+
+目标链路：雷达观测目标 → FAST-LIO 建图 → SUPER 绕障到抓取位 → 现有 IK 接近、闭爪、抬起 → 携物飞到指定点。继续复用原生 arm_control，未新增 PX4 / ROS 自定义消息或抓取状态机。
+
+### 43.1 修改范围
+
+- `tests/hover/carry_demo.py`：分为先上升、后平移的短程轨迹；默认相对抓取悬停位平移 Y=0.5 m、上升 Z=0.12 m，命令峰值速度 0.03 m/s。支持 `--carry-to X Y Z`，限制在起点 0.9 m 范围内并至少上升 80 mm。
+- `fixed_grasp_probe.py`：通过抬起和 5 秒保持后，继续发送同任务的实时几何与接触反馈。携物时维持臂相对机体的姿态；已经通过的静态保持窗口冻结，不因后续接触波动被误清空。
+- ROS `super_flight_manager.cpp` / `known_flight_handover.h`：增加默认关闭的私有 `begin_slow_carry` 服务，供已验证抓取的协调器切换任务到慢速航段。沿用任务 ID、反馈时效和租约，航速上限 0.04 m/s、范围 1 m、超时 120 秒；原生抓取的 0.05 m/s、倾角、力矩分配及接触保护保持生效。
+- `fastlio_sim_adapter.py`、`fastlio_sim.yaml`、`fastlio_sim.launch`：保留逐点时间，将 offset_time 从纳秒转为秒，使用 FAST-LIO 既有 PointCloud2 接口。首次静止时仅用一次 MAVROS 位姿对齐地图原点，之后不使用真值持续修正 LIO。
+- 雷达仿真插件新增显式 `demoLioImu` 开关：在传感器安装点对速度作时间差分，输出含平动与杆臂运动的比力和角速度。原静态扫描及旧的重力提示模式保持默认行为。
+- 生成世界加入三处障碍与五个定位墙面。墙面使用已有 `demo_obstacle_` 名称契约，因此同样进入原有全臂 / 全夹爪行程的碰撞检查。小场景地图分辨率 0.15 m、膨胀 0.6 m，与 SUPER 的 0.5 m 机体半径一致。
+
+### 43.2 启动初始化
+
+原生成世界在机体 Z=0 时启动物理，起落架已经深入地面，可能产生不同的落地位置、偏航和起飞电机饱和。直接把 SDF 出生高度改为 0.45 m，又会使现有视觉定位插件把这个高度当作局部原点。
+
+当前流程在暂停状态加载零原点世界；确认 `/gazebo/default/yhang550/vision_odom` 已广告、视觉原点已经保存后，把整机设置到 Z=0.45 m，再解除暂停。仅发生在第一个物理步之前。预检仍要求世界 / 局部原点误差不超过 20 mm，起飞 30 秒未完成则退出。07 预检误差 0.545 mm，并正常起飞。
+
+### 43.3 已验收的独立携物实验
+
+结果：`build/known_target_flight/lidar_carry_20261028_02/result.json`，success=true。
+
+- 携物实际位移 0.5147 m；终点误差 2.062 mm，到位后保持 5 秒。
+- 43.726 秒携物观察、43747 个接触物理帧，双侧接触比例 1.0，支撑接触比例 0.0。
+- 物体相对夹爪的最大偏移约 4.25 mm。物体为自由动力学实体，无固定连接或抓取吸附。
+- 新增轨迹、携带证据和雷达时间格式检查已通过（33 个机械臂测试、2 个适配测试，以及任务绑定 C++ 检查）。
+
+### 43.4 运行与范围
+
+首次需要编译现有 FAST-LIO 仿真依赖：
+
+```bash
+bash /home/pcz/super_ws/src/super_px4_bridge/scripts/perception/build_fastlio_sim.sh
+```
+
+该脚本复用 `/home/pcz/FAST_LIO`，只从官方 Livox 源码提取既有消息定义作为编译依赖，不安装设备驱动。FAST-LIO 源码版本和 Livox 消息版本均固定记录；依赖和构建产物放在 PX4 的 build 目录。
+
+正式入口：
+
+```bash
+bash /home/pcz/super_ws/src/super_px4_bridge/scripts/start_lidar_grasp_demo.sh --gui
+# 可选：指定携物目的地（世界坐标，需满足短程上升与净空条件）
+# bash .../start_lidar_grasp_demo.sh --gui --carry-to 1.317 0.524 2.066
+```
+
+当前 FAST-LIO 为 SUPER 提供地图和里程计；PX4 EKF 仍保留已验证的仿真视觉定位。目标估计的坐标配对和末端精接近仍含仿真真值辅助。当前雷达是理想扫描 / IMU 代理，尚不能据此宣称 MID360S 实机精度或完成了纯雷达飞行定位。携物航段为有界低速点到点，不等同于长航程携物规划。
+
+参考依赖：[FAST-LIO](https://github.com/hku-mars/FAST_LIO)、[Livox ROS driver 消息定义](https://github.com/Livox-SDK/livox_ros_driver)。
+
+### 43.5 正式入口整链路验收
+
+正式入口案例：`build/known_target_flight/lidar_grasp_20261028_135132/result.json`。success、super_obstacle_navigation_validated、fixed_grasp.grasp_validated、carried_flight_validated 均为 true。所有自有进程已清理。
+
+| 项目 | 本轮实测 |
+| --- | --- |
+| 三障碍绕行 | 机体 0.45 m 保护包络至障碍最小净空 149.3 mm |
+| SUPER 航段 | 对起终点直线最大偏离 1.058 m，确认实际绕行 |
+| FAST-LIO 对独立真值的配对核对 | 3037 帧，平均位置误差 10.07 mm、最大 18.02 mm |
+| 抓取后保持 | 实际最小抬起 35.19 mm，保持 5.026 秒，双侧接触 1.0、支撑接触 0.0 |
+| 携物 | 机体位移 0.5135 m、物体位移 0.5118 m |
+| 携物到位 | 终点误差 0.809 mm，随后保持 5.003 秒 |
+| 携物反馈 | 43.726 秒、43747 物理接触帧，双侧 1.0、支撑 0.0，相对滑移最大 6.89 mm |
+| 指令源 | MAVROS 最终设定点只有一个发布者；地图与里程计的实际发布者均已核对为 FAST-LIO 链路 |
+
+ROS 配套提交：`09aec79685c02b37bf2e4bb80e6a60e0bc088f6e`。上表为一次正式整链路运行，加上 43.3 的独立携物正例；尚非长时间重复统计或实机验收。
