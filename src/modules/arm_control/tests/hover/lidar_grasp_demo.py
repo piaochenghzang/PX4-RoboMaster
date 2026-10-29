@@ -123,21 +123,52 @@ def adapt_world(world,vehicle,target,geometry):
     return dict(payload=inertia,lidar_mount_mass_kg=total,ideal_range_noise_m=0,moving_imu_is_gravity_cue_not_lio=True)
 
 
+def paired_pose_window(poses,begin_s,end_s,max_gap_s):
+    """Source-time brackets only; reject missing samples inside the observation."""
+    if not np.isfinite([begin_s,end_s,max_gap_s]).all() or begin_s>=end_s or max_gap_s<=0:
+        raise ValueError('Invalid pose pairing interval')
+    poses=sorted(poses,key=lambda row:row[0])
+    if len(poses)<2:raise ValueError('Body pose window is not bracketed')
+    stamps=np.array([row[0] for row in poses],dtype=float)
+    values=np.array([row[1] for row in poses],dtype=float)
+    if values.shape!=(len(poses),7) or not np.isfinite(stamps).all() or not np.isfinite(values).all():
+        raise ValueError('Nonfinite or malformed body pose')
+    if np.any(np.linalg.norm(values[:,3:],axis=1)<1e-8) or np.any(np.diff(stamps)<=0):
+        raise ValueError('Invalid quaternion or duplicate body timestamp')
+    lo=int(np.searchsorted(stamps,begin_s,side='right'))-1
+    hi=int(np.searchsorted(stamps,end_s,side='left'))
+    if lo<0 or hi>=len(poses):raise ValueError('Body pose window is not bracketed')
+    selected=poses[lo:hi+1]
+    if np.any(np.diff([row[0] for row in selected])>max_gap_s+1e-9):
+        raise ValueError('Body pose gap inside observation window')
+    return selected
+
+
 class TargetObservation:
-    """One stable hover snapshot paired to explicitly simulated body poses, never target truth."""
-    def __init__(self,geometry,folder):
+    """Stable raw-cloud snapshot paired to an explicitly selected body pose source."""
+    def __init__(self,geometry,folder,body_source='sim_truth'):
         import threading
         from collections import deque
         import rospy
         from sensor_msgs.msg import PointCloud2,Imu
         from nav_msgs.msg import Odometry
-        from super_px4_bridge.msg import CoordinateTruth
+        if body_source not in ('sim_truth','lio'):raise ValueError('Unknown body pose source')
+        self.body_source=body_source
+        self.body_frame='map' if body_source=='lio' else 'gazebo_world'
+        self.max_pose_gap=.125 if body_source=='lio' else .1
+        self.max_pose_skew=.125 if body_source=='lio' else .05
         self.geometry=geometry;self.folder=folder;self.lock=threading.RLock()
         self.clouds=deque(maxlen=40);self.imus=deque(maxlen=1000);self.body=deque(maxlen=1000)
         self.thread=None;self.result=None;self.error=None;self.attempts=0
+        self.last_window_end=None;self.last_window_check=None
         self.subscribers=[rospy.Subscriber(topic,typ,lambda m,k=key:self.receive(k,m),queue_size=1000,tcp_nodelay=True)
             for topic,typ,key in [('/mid360s_sim/points',PointCloud2,'clouds'),('/mid360s_sim/imu',Imu,'imus')]]
-        self.subscribers.append(rospy.Subscriber('/grasp_audit/truth',CoordinateTruth,self.body_pose,queue_size=1000,tcp_nodelay=True))
+        if body_source=='lio':
+            self.subscribers.append(rospy.Subscriber('/lidar_slam/odom',Odometry,
+                lambda m:self.receive('body',m),queue_size=1000,tcp_nodelay=True))
+        else:
+            from super_px4_bridge.msg import CoordinateTruth
+            self.subscribers.append(rospy.Subscriber('/grasp_audit/truth',CoordinateTruth,self.body_pose,queue_size=1000,tcp_nodelay=True))
 
     def body_pose(self,m):
         # Explicit simulation localization only. Object pose, labels and joints
@@ -160,10 +191,17 @@ class TargetObservation:
         if self.result:return self.result
         if not ready:return None
         with self.lock:
-            if len(self.clouds)<15 or len(self.body)<100:return None
+            if len(self.clouds)<15 or len(self.body)<(2 if self.body_source=='lio' else 100):return None
             clouds=list(self.clouds)[-12:-2];odom=list(self.body);imus=list(self.imus)
-        self.attempts+=1
-        if self.attempts>4:raise RuntimeError('No reliable LiDAR snapshot after four attempts; arm remains folded')
+            begin=clouds[0].header.stamp.to_sec();end=clouds[-1].header.stamp.to_sec()+.1
+            if min(m.header.stamp.to_sec() for m in odom)>begin or max(m.header.stamp.to_sec() for m in odom)<end:return None
+        if self.body_source=='lio':
+            # Waiting for an admissible window is not a failed target fit.
+            if self.last_window_end is not None and end<self.last_window_end+1.:return None
+            self.last_window_end=end
+        else:
+            self.attempts+=1
+            if self.attempts>4:raise RuntimeError('No reliable LiDAR snapshot after four attempts; arm remains folded')
         self.thread=threading.Thread(target=self.fit,args=(clouds,odom,imus),daemon=True);self.thread.start()
         return None
 
@@ -176,52 +214,66 @@ class TargetObservation:
             poses=[]
             for m in odom:
                 p=m.pose.pose
-                if m.header.frame_id!='gazebo_world' or m.child_frame_id!='base_link':raise ValueError('Unexpected simulated body frames')
+                if m.header.frame_id!=self.body_frame or m.child_frame_id!='base_link':raise ValueError('Unexpected body pose frames')
                 poses.append((m.header.stamp.to_sec(),[p.position.x,p.position.y,p.position.z,
                     p.orientation.w,p.orientation.x,p.orientation.y,p.orientation.z]))
-            poses=sorted(dict(poses).items())
+            # Keep the legacy source policy; the LIO path rejects duplicate samples.
+            if self.body_source=='sim_truth':poses=sorted(dict(poses).items())
             stamps=[m.header.stamp.to_nsec() for m in clouds]
             if len(stamps)!=10 or np.any(np.diff(stamps)!=100000000):raise ValueError('Incomplete LiDAR window')
             begin=stamps[0];end=stamps[-1]+100000000
+            poses=paired_pose_window(poses,begin*1e-9,end*1e-9,self.max_pose_gap)
             # Pair to source BODY poses, never to receipt time or object truth.
-            ref,_=interpolate_pose(poses,end*1e-9,.05);B_L=sensor_transform(self.geometry);M_L=ref@B_L
+            ref,_=interpolate_pose(poses,end*1e-9,self.max_pose_skew);B_L=sensor_transform(self.geometry);M_L=ref@B_L
             arrays=[];max_motion=0.;max_angle=0.
             for cloud in clouds:
                 if cloud.header.frame_id!='mid360s_lidar':raise ValueError('Unexpected cloud frame')
                 a=cloud_array(cloud);t=point_times(cloud,a,100000000);raw=xyz(a)
                 # The generator uses one pose per 1ms physics step. Deskew to
-                # a single L frame in 5ms source-time bins from the simulated body pose stream.
+                # a single L frame in 5ms bins, using bracketed source body poses.
+                # LIO poses are 10Hz; this interpolation is not a 200Hz pose estimate.
                 corrected=np.empty_like(raw)
                 for key in np.unique(t//5000000):
                     mask=t//5000000==key;stamp=float(np.mean(t[mask]))*1e-9
-                    B,_=interpolate_pose(poses,stamp,.05);delta=inverse(M_L)@B@B_L
+                    B,_=interpolate_pose(poses,stamp,self.max_pose_skew);delta=inverse(M_L)@B@B_L
                     corrected[mask]=raw[mask]@delta[:3,:3].T+delta[:3,3]
                     max_motion=max(max_motion,float(np.linalg.norm(B[:3,3]-ref[:3,3])))
                     max_angle=max(max_angle,math.acos(float(np.clip((np.trace(B[:3,:3].T@ref[:3,:3])-1)/2,-1,1))))
                 arrays.append(corrected)
-            if max_motion>.01 or max_angle>math.radians(1):return
+            stable=max_motion<=.01 and max_angle<=math.radians(1)
+            self.last_window_check=dict(observation_end_ns=end,stable=stable,
+                max_body_translation_m=max_motion,max_body_rotation_rad=max_angle)
+            if not stable:return
+            if self.body_source=='lio':
+                self.attempts+=1
+                if self.attempts>4:raise RuntimeError('No reliable LiDAR target after four stable windows')
             selected=[m for m in imus if begin<=m.header.stamp.to_nsec()<=end]
             if len(selected)<190:raise ValueError('Incomplete gravity cue window')
             ups=[]
             for m in selected:
-                a=m.linear_acceleration;B,_=interpolate_pose(poses,m.header.stamp.to_sec(),.05)
+                a=m.linear_acceleration;B,_=interpolate_pose(poses,m.header.stamp.to_sec(),self.max_pose_skew)
                 ups.append((inverse(M_L)@B@B_L)[:3,:3]@np.array([a.x,a.y,a.z]))
             up=np.median(ups,axis=0);up/=np.linalg.norm(up)
             cfg=yaml.safe_load((BRIDGE/'config/perception/static_target.yaml').read_text())
             report,_,_=estimate(np.concatenate(arrays),shape_from_geometry(self.geometry),cfg,up)
             report['source_observation']=dict(observation_start_ns=begin,observation_end_ns=end,restamped=False,
-                frame='mid360s_lidar',body_world_at_reference=ref.tolist(),lidar_world_at_reference=M_L.tolist(),
-                localization='SIM_BODY_WORLD_POSE_NOT_TARGET_TRUTH',deskew_bin_s=.005,max_body_translation_m=max_motion,max_body_rotation_rad=max_angle,
+                frame='mid360s_lidar',reference_frame=self.body_frame,
+                localization='FAST_LIO_BODY_MAP_POSE' if self.body_source=='lio' else 'SIM_BODY_WORLD_POSE_NOT_TARGET_TRUTH',
+                body_pose_max_gap_s=max(np.diff([row[0] for row in poses])),body_pose_gap_limit_s=self.max_pose_gap,
+                deskew_bin_s=.005,max_body_translation_m=max_motion,max_body_rotation_rad=max_angle,
                 moving_imu='stable-window specific-force direction; dynamics selected by scene profile')
+            suffix='map' if self.body_source=='lio' else 'world'
+            report['source_observation']['body_'+suffix+'_at_reference']=ref.tolist()
+            report['source_observation']['lidar_'+suffix+'_at_reference']=M_L.tolist()
             out=self.folder/('perception_attempt_'+str(self.attempts));out.mkdir()
             (out/'estimate.json').write_text(json.dumps(report,indent=2,allow_nan=False)+'\n')
             with rosbag.Bag(str(out/'observation.bag'),'w',compression='lz4') as bag:
-                for topic,items in [('/mid360s_sim/points',clouds),('/mid360s_sim/imu',selected),('/grasp_demo/sim_body_pose_snapshot',odom)]:
+                for topic,items in [('/mid360s_sim/points',clouds),('/mid360s_sim/imu',selected),('/lidar_slam/odom' if self.body_source=='lio' else '/grasp_demo/sim_body_pose_snapshot',odom)]:
                     for m in items:bag.write(topic,m,m.header.stamp)
             if not report['valid']:return
             best=report['best'];L_O=np.eye(4);L_O[:3,:3]=best['R'];L_O[:3,3]=best['position_lidar_m']
             M_O=M_L@L_O
-            self.result=dict(transform=M_O,report=report,path=out)
+            self.result=dict(transform=M_O,frame=self.body_frame,report=report,path=out)
         except Exception as exc:self.error='LiDAR observation failed: '+str(exc)
 
     def close(self):

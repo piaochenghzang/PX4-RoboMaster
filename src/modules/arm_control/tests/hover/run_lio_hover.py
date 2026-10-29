@@ -9,7 +9,7 @@ from mavros_msgs.msg import State,PositionTarget
 from std_msgs.msg import String
 from super_px4_bridge.msg import KnownFlightSetpoint
 from known_target import rotation,quintic_segment
-from lidar_grasp_demo import LidarDemoPlan
+from lidar_grasp_demo import LidarDemoPlan,TargetObservation
 from native_client import NativeClient
 from run_known_target_flight import ROOT,BUILD,WS,MODELS,make_world,save,stop,SIM_VISION_PARAMS
 
@@ -23,13 +23,17 @@ def score_recording(folder,begin,end,goal):
     # This function runs only AFTER every owned simulator/control process stops.
     import rosbag
     from grasp_audit.geometry import interpolate_pose
-    truth=[];estimated=[];alignment=None
+    truth=[];targets=[];estimated=[];alignment=None
     with rosbag.Bag(str(folder/'audit.bag')) as bag:
         for topic,m,_ in bag.read_messages():
             if topic=='/grasp_audit/truth':
                 i=list(m.link_names).index('yhang550_base::base_link');p=m.link_poses[i]
                 truth.append((m.header.stamp.to_sec(),[p.position.x,p.position.y,p.position.z,
                     p.orientation.w,p.orientation.x,p.orientation.y,p.orientation.z]))
+                if m.target_present:
+                    p=m.target_pose
+                    targets.append((m.header.stamp.to_sec(),[p.position.x,p.position.y,p.position.z,
+                        p.orientation.w,p.orientation.x,p.orientation.y,p.orientation.z]))
             elif topic=='/lidar_slam/odom':estimated.append(m)
             elif topic=='/fastlio_sim/alignment':alignment=json.loads(m.data)
     if not alignment or alignment['source']!='FIRST_LIO_BODY_POSE':raise RuntimeError('Unexpected LIO origin source')
@@ -50,14 +54,37 @@ def score_recording(folder,begin,end,goal):
         errors.append(float(np.linalg.norm(actual[:3,3]-model)))
         if t>=end-5:hold.append(float(np.linalg.norm(actual[:3,3]-(W_M@np.r_[goal,1])[:3])))
     if len(errors)<50 or len(hold)<30:raise RuntimeError('Offline scoring coverage insufficient')
-    return dict(independent_truth_used_after_shutdown_only=True,position_error_mean_m=float(np.mean(errors)),
+    result=dict(independent_truth_used_after_shutdown_only=True,position_error_mean_m=float(np.mean(errors)),
         position_error_max_m=max(errors),physical_final_goal_mean_error_m=float(np.mean(hold)),
         physical_final_goal_max_error_m=max(hold),samples=len(errors),alignment_source=alignment['source'],
         passed=max(hold)<.12)
+    observation=folder/'perceived_target_map.json'
+    if observation.exists():
+        detected=json.loads(observation.read_text())
+        source=detected['source_observation']
+        if detected['frame']!='map' or source['localization']!='FAST_LIO_BODY_MAP_POSE':
+            raise RuntimeError('Unexpected target coordinate source')
+        t=source['observation_end_ns']*1e-9
+        actual,_=interpolate_pose(targets,t,.03)
+        predicted=W_M@np.array(detected['map_from_object'])
+        translation=float(np.linalg.norm(predicted[:3,3]-actual[:3,3]))
+        angle=math.degrees(math.acos(float(np.clip((np.trace(predicted[:3,:3].T@actual[:3,:3])-1)/2,-1,1))))
+        body_actual,_=interpolate_pose(truth,t,.03)
+        body_estimate=np.array(source['body_map_at_reference'])
+        relative_estimate=np.linalg.inv(body_estimate)@np.array(detected['map_from_object'])
+        relative_actual=np.linalg.inv(body_actual)@actual
+        relative_error=float(np.linalg.norm(relative_estimate[:3,3]-relative_actual[:3,3]))
+        target_score=dict(position_error_m=translation,orientation_error_deg=angle,
+            body_relative_position_error_m=relative_error,
+            # First LIO target initialization check, not a fine-grasp permission.
+            passed=translation<.02 and relative_error<.02 and angle<5.,scoring_only_after_shutdown=True)
+        save(folder/'target_offline_score.json',target_score)
+        result['target']=target_score;result['passed']=result['passed'] and target_score['passed']
+    return result
 
 
 def main():
-    ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('name');ap.add_argument('--gui',action='store_true');args=ap.parse_args()
+    ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('name');ap.add_argument('--gui',action='store_true');ap.add_argument('--observe-target',action='store_true',help='LIO-paired target observation only; never move the arm');args=ap.parse_args()
     if not args.name.replace('_','').isalnum():ap.error('Use a unique safe name')
     if any(sp.run(['pgrep','-x',n],stdout=sp.DEVNULL).returncode==0 for n in ('px4','gzserver','gzclient','rosmaster','mavros_node','fastlio_mapping')):
         ap.error('Existing simulation; refusing to disturb it')
@@ -87,11 +114,11 @@ def main():
     cfg=yaml.safe_load((mavros/'px4_config.yaml').read_text());cfg['time']['timesync_mode']='PASSTHROUGH';cfg['conn']['timesync_rate']=0.
     save(folder/'mavros_config.json',cfg);launch=ET.parse(mavros/'px4.launch')
     launch.find("include/arg[@name='config_yaml']").set('value',str(folder/'mavros_config.json'));launch.write(folder/'mavros.launch')
-    save(folder/'manifest.json',dict(stage='LIO_LOCAL_FLIGHT_NO_ARM_MOTION',ground_truth_control_inputs=False,
+    save(folder/'manifest.json',dict(stage='LIO_TARGET_OBSERVATION_NO_ARM_MOTION' if args.observe_target else 'LIO_LOCAL_FLIGHT_NO_ARM_MOTION',ground_truth_control_inputs=False,
         gazebo_vision_plugin=False,lio_alignment_source='FIRST_LIO_BODY_POSE',ekf_parameters=PARAMS,
-        external_velocity_fused=False,planned_local_goal_m=[.3,0,.9],sim_speed_factor=speed))
+        target_observation=args.observe_target,external_velocity_fused=False,planned_local_goal_m=[.3,0,.9],sim_speed_factor=speed))
     os.environ.update(ROS_MASTER_URI=env['ROS_MASTER_URI'],ROS_HOSTNAME='localhost');os.environ.pop('ROS_IP',None)
-    procs=[];logs=[];subs=[];pub=None;latest={};result=dict(success=False);begin=end=None
+    procs=[];logs=[];subs=[];pub=None;latest={};result=dict(success=False);begin=end=None;observation=None
     def start(name,cmd,cwd=None):
         log=(folder/(name+'.log')).open('w');logs.append(log)
         p=sp.Popen(cmd,env=env,cwd=cwd,stdout=log,stderr=sp.STDOUT,start_new_session=True);procs.append(p);return p
@@ -164,22 +191,45 @@ def main():
                 good=active and route is not None and now-route>=6 and error<.05 and speed_now<.08
                 if not good:held=None
                 elif held is None:held=now
-                row=dict(sim_s=now,manager=manager.data,estimated_body=xyz.tolist(),goal_error_m=error,lio_age_s=now-lio.header.stamp.to_sec())
+                row=dict(sim_s=now,manager=manager.data,estimated_body=xyz.tolist(),goal_error_m=error,lio_age_s=now-lio.header.stamp.to_sec(),
+                    observation_window=observation.last_window_check if observation else None)
                 log.write(json.dumps(row)+'\n');log.flush()
-                if held is not None and now-held>=8:end=now;result.update(control_flight_completed=True,final_estimated_error_m=error);break
+                if held is not None and now-held>=8:
+                    result.update(control_flight_completed=True,final_estimated_error_m=error)
+                    if not args.observe_target:end=now;break
+                    if observation is None:
+                        observation=TargetObservation(plan.geometry_profile,folder,body_source='lio')
+                        graph=rosgraph.Master('/lio_hover_graph').getSystemState()
+                        save(folder/'graph_observation.json',dict(publishers=graph[0],subscribers=graph[1]))
+                        if any(node!='/lio_hover_audit_recorder' for topic,nodes in graph[1] if topic=='/grasp_audit/truth' for node in nodes):
+                            raise RuntimeError('Truth entered observation/control')
+                        print('Stable local flight; observing raw cloud with LIO body poses',flush=True)
+                if observation is not None:
+                    v=lio.twist.twist.linear
+                    estimate=observation.poll(good and np.linalg.norm([v.x,v.y,v.z])<.02)
+                    if estimate is not None:
+                        save(folder/'perceived_target_map.json',dict(frame=estimate['frame'],map_from_object=estimate['transform'].tolist(),
+                            source_observation=estimate['report']['source_observation'],estimate_path=str(estimate['path']/'estimate.json')))
+                        result['target_observation_completed']=True;end=now;break
                 if manager.data=='FAILSAFE_HOVER':raise RuntimeError('Manager input lease failed')
                 time.sleep(.005)
     except (Exception,KeyboardInterrupt) as e:result['error']=str(e) or type(e).__name__
     finally:
+        if observation is not None:
+            try:observation.close()
+            except Exception as e:result['observation_cleanup_error']=str(e)
         if pub:pub.unregister()
         for sub in subs:sub.unregister()
         for p in reversed(procs):stop(p)
         for log in logs:log.close()
-    if result.get('control_flight_completed'):
-        try:result['offline_score']=score_recording(folder,begin,end,goal);result['success']=result['offline_score']['passed']
+    if result.get('control_flight_completed') and (not args.observe_target or result.get('target_observation_completed')) and end is not None:
+        try:
+            result['offline_score']=score_recording(folder,begin,end,goal)
+            result['success']=result['offline_score']['passed'] and (not args.observe_target or result['offline_score'].get('target',{}).get('passed',False))
         except Exception as e:result['offline_score_error']=str(e)
     result.update(ground_truth_control_inputs=False,arm_motion_requested=False,
         own_processes_stopped=all(p.poll() is not None for p in procs),wall_elapsed_s=time.monotonic()-started)
+    if not result['own_processes_stopped'] or result.get('observation_cleanup_error'):result['success']=False
     save(folder/'result.json',result);print(json.dumps(result,indent=2),flush=True)
     return 0 if result['success'] else 2
 
