@@ -66,6 +66,7 @@ struct ApproachInput {
     bool context_fresh{false},lease_fresh{false},geometry_valid{false},arm_ready{false};
     bool hard_hover_ok{false},hover_ready{false},prepared{false};
     bool clearance_ready{false};
+    bool unfold_complete{true}; // Internal sequencing only; not another motion permission.
     float clearance{0},joint_speed{INFINITY},tool_relative_speed{INFINITY};
     Point goal,accepted,measured;
 };
@@ -119,12 +120,12 @@ public:
         // A world-fixed tool must compensate body motion with MOVING joints.
         // This 10 mm/s arrival test is for no-close offset approach only; the
         // separate close-geometry 5 mm/s gate and all joint limits are unchanged.
-        if (error<=.015f && i.tool_relative_speed<=.010f) {
+        if (i.unfold_complete && error<=.015f && i.tool_relative_speed<=.010f) {
             if (!stable_since) stable_since=i.now;
             if (i.now-stable_since>=1000000) phase=ApproachPhase::Holding;
         } else { stable_since=0; phase=ApproachPhase::Approaching; }
         const auto delta=i.goal-i.accepted; const float distance=delta.norm();
-        if (distance>.001f && (!last_send || i.now-last_send>=100000) &&
+        if (i.unfold_complete && distance>.001f && (!last_send || i.now-last_send>=100000) &&
             (i.accepted-i.measured).norm()<=.015f && i.joint_speed<=.10f) {
             last_send=i.now; send=true;
             return i.accepted+delta*(distance>.003f ? .003f/distance : 1.f);

@@ -1,4 +1,5 @@
 #include "../../grasp/HoverApproach.hpp"
+#include "../../grasp/WristUnfold.hpp"
 #include <cassert>
 #include <limits>
 using namespace so101_hover;
@@ -96,5 +97,52 @@ int main() {
       // Only arm slots are frozen; the jaw is not copied or retargeted.
       assert(sent[2]==.3f); float bad[2]{.4f,INFINITY};
       assert(!freezeCommand(bad,l,frozen) && frozen[0]==.4f && frozen[1]==.6f); ++count; }
-    return count==25 ? 0 : 1;
+    { Approach a; auto i=good(); i.unfold_complete=false; begin(a,i); bool send,stop;
+      i.measured=i.accepted=i.goal;
+      for(int k=0;k<20;++k) { a.step(i,send,stop); assert(!send && !stop); i.now+=100000; }
+      assert(a.phase==ApproachPhase::Approaching);
+      i.unfold_complete=true;
+      for(int k=0;k<12;++k) { a.step(i,send,stop); i.now+=100000; }
+      assert(a.phase==ApproachPhase::Holding); ++count; }
+    { Approach a; auto i=good(); i.unfold_complete=false; begin(a,i); bool send,stop;
+      a.step(i,send,stop); assert(!send && !stop);
+      i.context_fresh=false; a.step(i,send,stop);
+      assert(stop && !send && a.phase==ApproachPhase::Fault); ++count; }
+    { Approach a; auto i=good(); i.unfold_complete=false; begin(a,i); bool send,stop;
+      i.hover_ready=false; a.step(i,send,stop);
+      assert(stop && !send && a.phase==ApproachPhase::Paused);
+      a.request(2,3,i.binding,i); assert(a.phase==ApproachPhase::Canceled); ++count; }
+    { const float folded[5]{-.07f,-1.175f,1.45f,1.3f,-1.57f};
+      float measured[5]{-.07f,-1.175f,1.45f,1.3f,-1.57f};
+      assert(knownFoldedArm(folded,measured));
+      measured[3]=-1.3f; assert(!knownFoldedArm(folded,measured));
+      measured[3]=1.34f; assert(!knownFoldedArm(folded,measured));
+      measured[3]=NAN; assert(!knownFoldedArm(folded,measured)); ++count; }
+    { const float folded[5]{-.07f,-1.175f,1.45f,1.3f,-1.57f};float desired[5]{};
+      assert(wristUnfoldStep(folded,folded,0,.02f,desired)==UnfoldResult::Move);
+      for(int j=0;j<5;++j) assert(std::abs(desired[j]-folded[j])<=.020001f);
+      assert(desired[3]<folded[3]);
+      for(int j=0;j<5;++j) { if(j!=3) assert(desired[j]==folded[j]); }
+      ++count; }
+    { const float folded[5]{-.07f,-1.175f,1.45f,1.3f,-1.57f};float desired[5]{};
+      assert(wristUnfoldStep(folded,folded,0,.02f,desired,true)==UnfoldResult::Move);
+      assert(std::abs(desired[2]-1.449f)<1e-6f && desired[3]<folded[3]);
+      float inward[5]{-.07f,-1.175f,1.449f,1.0f,-1.57f};
+      assert(wristUnfoldStep(inward,inward,0,.02f,desired,false)==UnfoldResult::Move);
+      assert(std::abs(desired[2]-1.45f)<1e-6f); ++count; }
+    { const float unfolded[5]{-.07f,-1.175f,1.45f,-1.3f,-1.57f};
+      float measured[5]{-.07f,-1.175f,1.45f,-1.34f,-1.57f},desired[5]{};
+      assert(wristUnfoldStep(unfolded,measured,0,.02f,desired)==UnfoldResult::Wait);
+      measured[3]=-1.3f;
+      assert(wristUnfoldStep(unfolded,measured,.051f,.02f,desired)==UnfoldResult::Wait);
+      assert(wristUnfoldStep(unfolded,measured,.049f,.02f,desired)==UnfoldResult::Settled); ++count; }
+    { const float folded[5]{-.07f,-1.175f,1.45f,1.3f,-1.57f};float desired[5]{42,42,42,42,42};
+      const float invalid_steps[]{0.f,.03f,INFINITY};
+      for(float step:invalid_steps) {
+          assert(wristUnfoldStep(folded,folded,0,step,desired)==UnfoldResult::Invalid);
+          for(float value:desired) assert(value==42);
+      }
+      assert(wristUnfoldStep(folded,folded,NAN,.02f,desired)==UnfoldResult::Invalid);
+      ++count; }
+    return count==33 ? 0 : 1;
 }

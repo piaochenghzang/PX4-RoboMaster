@@ -20,7 +20,7 @@ float32[3] goal_base
 float32 goal_error
 float32 clearance
 float32 jaw_target
-# Fixed-point grasp diagnostics; zero/false in MODE_APPROACH.
+# Shared unfold progress; remaining grasp diagnostics stay false/zero in MODE_APPROACH.
 bool paused
 bool unfold_complete
 bool close_entry_ready

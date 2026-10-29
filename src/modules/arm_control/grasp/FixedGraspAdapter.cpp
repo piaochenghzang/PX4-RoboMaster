@@ -51,27 +51,9 @@ void ArmControl::updateFixedGrasp(const arm_approach_request_s *request,const so
     if (action.send && !_fixed_unfold_complete) {
         // Select the existing downward-facing IK branch by a fixed wrist
         // unfold. The SAME joint, workspace recovery and swept budget apply.
-        constexpr float unfolded[ARM_DOF]{-.07f,-1.175f,1.45f,-1.3f,-1.57f};
-        float desired[ARM_DOF]{};float command_error=0,feedback_error=0;
-        for (int j=0;j<ARM_DOF;++j) {
-            command_error=std::max(command_error,fabsf(unfolded[j]-_joint_target[j]));
-            feedback_error=std::max(feedback_error,fabsf(unfolded[j]-_latest_joint_status.position[j]));
-            desired[j]=_joint_target[j]+math::constrain(unfolded[j]-_joint_target[j],
-                -action.max_joint_step,action.max_joint_step);
-        }
-        if (command_error<.001f && feedback_error<.03f && motion.joint_speed<.05f) {
-            _fixed_unfold_complete=true;
-            // Smooth the existing joint trajectory at the 250Hz simulator
-            // transport cadence instead of delivering 20ms position stairs
-            // to the 1ms Gazebo PID. IK still has its >=16ms send interval;
-            // Cartesian/joint/jaw budgets use elapsed time, not call count.
-            ScheduleOnInterval(4_ms);
-        }
-        else if (command_error>=.001f) {
-            const auto result=applyHoverJoints(desired);
-            if (result==TargetResult::Rejected) { _fixed_grasp.fail(FixedFault::IK); stopHoverMotion(); }
-            else if (result==TargetResult::WaitClearance) { _fixed_grasp.paused=true; stopHoverMotion(); }
-        }
+        const auto result=applyHoverUnfold(action.max_joint_step,motion.joint_speed,_fixed_unfold_complete);
+        if (result==TargetResult::Rejected) { _fixed_grasp.fail(FixedFault::IK); stopHoverMotion(); }
+        else if (result==TargetResult::WaitClearance) { _fixed_grasp.paused=true; stopHoverMotion(); }
     } else if (action.send) {
         const auto result=applyHoverTarget(action.goal,action.max_joint_step);
         if (result==TargetResult::Rejected) { _fixed_grasp.fail(FixedFault::IK); stopHoverMotion(); }

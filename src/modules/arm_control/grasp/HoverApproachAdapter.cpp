@@ -1,4 +1,5 @@
 #include "../arm_control.hpp"
+#include "WristUnfold.hpp"
 #include <algorithm>
 
 void ArmControl::stopHoverMotion()
@@ -43,9 +44,10 @@ so101_hover::TargetResult ArmControl::applyHoverTarget(const so101_hover::Point 
     return applyHoverJoints(desired);
 }
 
-so101_hover::TargetResult ArmControl::applyHoverJoints(const float (&desired)[ARM_DOF])
+so101_hover::TargetResult ArmControl::applyHoverJoints(const float (&desired)[ARM_DOF],float unused_fraction)
 {
     using so101_hover::TargetResult;
+    if (!PX4_ISFINITE(unused_fraction) || unused_fraction<=0 || unused_fraction>1) return TargetResult::Rejected;
     float seed[ARM_DOF]{},candidate[ARM_DOF]{};
     for (int j=0;j<ARM_DOF;++j) seed[j]=_joint_target[j];
     // Triangle-chain upper bounds from production SDF, including all collision
@@ -61,7 +63,8 @@ so101_hover::TargetResult ArmControl::applyHoverJoints(const float (&desired)[AR
         PX4_WARN("hover clearance pause budget=%.5f pending=%.5f",(double)budget,(double)reserve);
         return TargetResult::WaitClearance;
     }
-    if (!so101_hover::boundJointBudget(desired,seed,measured,_joint_limits,radii,budget,candidate)) {
+    const float allowed=unused_fraction>=1.f ? budget : reserve+unused_fraction*(budget-reserve);
+    if (!so101_hover::boundJointBudget(desired,seed,measured,_joint_limits,radii,allowed,candidate)) {
         PX4_ERR("hover invalid joint budget candidate"); return TargetResult::Rejected;
     }
     const auto next=extractPosition(computeURDFFK(candidate));
@@ -80,6 +83,27 @@ so101_hover::TargetResult ArmControl::applyHoverJoints(const float (&desired)[AR
     _ee_target_position=next; _ee_target_valid=true; _has_last_ik_solution=false;
     ++_target_sequence; _arrival.reset();
     return TargetResult::Applied;
+}
+
+so101_hover::TargetResult ArmControl::applyHoverUnfold(float max_joint_step,float joint_speed,bool &complete,float unused_fraction)
+{
+    // .4f * .05f can round one float ULP above .02f. Accept only that
+    // numerical neighbourhood and cap the actual command at exactly .02f.
+    if (!PX4_ISFINITE(max_joint_step) || max_joint_step<=0 || max_joint_step>.020001f)
+        return so101_hover::TargetResult::Rejected;
+    max_joint_step=std::min(max_joint_step,.02f);
+    float anchor[ARM_DOF]{},measured[ARM_DOF]{},desired[ARM_DOF]{};
+    for (int j=0;j<ARM_DOF;++j) { anchor[j]=_joint_target[j]; measured[j]=_latest_joint_status.position[j]; }
+    const bool recovery=_hover_approach.moving() && _approach_unfold_selected &&
+        _ee_target_position(2)<_cartesian_limit.min_z+.002f;
+    const auto result=so101_hover::wristUnfoldStep(anchor,measured,joint_speed,max_joint_step,desired,recovery);
+    if (result==so101_hover::UnfoldResult::Invalid) return so101_hover::TargetResult::Rejected;
+    if (result==so101_hover::UnfoldResult::Settled) {
+        complete=true;
+        // Resume the existing fine trajectory cadence after measured settling.
+        ScheduleOnInterval(4_ms);
+    } else if (result==so101_hover::UnfoldResult::Move) return applyHoverJoints(desired,unused_fraction);
+    return so101_hover::TargetResult::Applied;
 }
 
 void ArmControl::updateHoverApproach()
@@ -118,13 +142,34 @@ void ArmControl::updateHoverApproach()
         if (!_grasp.owns() && !_fixed_grasp.owns() && !c.fixed_grasp && fresh(r.timestamp,300000)) {
             const bool was_idle=!_hover_approach.owns();
             _hover_approach.request(r.request_id,r.action,{r.task_id,r.plan_id,r.target_id,r.scene_id},in);
-            if (was_idle && _hover_approach.owns()) _approach_jaw_target=_joint_target[GRIPPER_INDEX];
+            if (was_idle && _hover_approach.owns()) {
+                _approach_jaw_target=_joint_target[GRIPPER_INDEX];
+                _approach_unfold_selected=so101_hover::knownFoldedArm(anchor,measured);
+                _approach_unfold_complete=false; _approach_unfold_last_send=0;
+                if (_approach_unfold_selected) ScheduleOnInterval(50_ms);
+            }
         }
 #endif
     }
+    in.unfold_complete=!_approach_unfold_selected || _approach_unfold_complete;
     bool send=false,stop=false; const auto p=_hover_approach.step(in,send,stop);
     if (stop || _approach_stop_pending) stopHoverMotion();
-    if (send) {
+    const bool unfold=_approach_unfold_selected && !_approach_unfold_complete;
+    if (_hover_approach.moving() && in.hover_ready && unfold &&
+        (!_approach_unfold_last_send || now-_approach_unfold_last_send>=50000)) {
+        // No catch-up increment: at most the existing .4 rad/s, .02 rad
+        // wrist-unfold budget per 50 ms, independently of callback cadence.
+        const float seconds=float(_approach_unfold_last_send ? std::min(uint64_t(50000),now-_approach_unfold_last_send) : 50000)*1e-6f;
+        _approach_unfold_last_send=now;
+        // Preserve half the free travel while leaving the known close-to-body
+        // folded posture; do not deliberately exhaust the pending-motion budget.
+        const auto outcome=applyHoverUnfold(.4f*seconds,in.joint_speed,_approach_unfold_complete,.5f);
+        if (outcome==so101_hover::TargetResult::WaitClearance) {
+            _hover_approach.pause(so101_hover::PauseReason::Clearance); stopHoverMotion();
+        } else if (outcome==so101_hover::TargetResult::Rejected) {
+            _hover_approach.fail(so101_hover::ApproachFault::IK); stopHoverMotion();
+        }
+    } else if (send) {
         const auto outcome=applyHoverTarget(p);
         if (outcome==so101_hover::TargetResult::WaitClearance) {
             _hover_approach.pause(so101_hover::PauseReason::Clearance); stopHoverMotion();
@@ -149,6 +194,7 @@ void ArmControl::updateHoverApproach()
     s.pause_reason=uint8_t(_hover_approach.pause_reason); s.resume_ready=_hover_approach.resumeReady(in);
     s.ownership_locked=_hover_approach.owns(); s.motion_authorized=_hover_approach.moving() && in.hover_ready;
     s.close_authorized=false; s.lease_valid=in.lease_fresh;
+    s.unfold_complete=_approach_unfold_selected && _approach_unfold_complete;
     s.goal_base[0]=in.goal.x; s.goal_base[1]=in.goal.y; s.goal_base[2]=in.goal.z;
     s.goal_error=(in.goal-in.measured).norm(); s.clearance=in.clearance;
     s.jaw_target=_joint_target[GRIPPER_INDEX]; _approach_status_pub.publish(s);

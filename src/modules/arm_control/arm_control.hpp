@@ -155,7 +155,8 @@ private:
     void stopHoverMotion();
     float hoverMotionClearance() const;
     so101_hover::TargetResult applyHoverTarget(const so101_hover::Point &target, float max_joint_step=.02f);
-    so101_hover::TargetResult applyHoverJoints(const float (&desired)[ARM_DOF]);
+    so101_hover::TargetResult applyHoverJoints(const float (&desired)[ARM_DOF],float unused_fraction=1.f);
+    so101_hover::TargetResult applyHoverUnfold(float max_joint_step,float joint_speed,bool &complete,float unused_fraction=1.f);
     so101_grasp::Input graspInput() const;
     void processGraspRequests(const so101_grasp::Input &input);
     void executeGraspAction(const so101_grasp::Action &action, const so101_grasp::Input &input);
@@ -232,6 +233,8 @@ private:
     so101_hover::Approach _hover_approach;
     so101_hover::FixedGrasp _fixed_grasp;
     bool _fixed_unfold_complete{false};
+    bool _approach_unfold_selected{false},_approach_unfold_complete{false};
+    uint64_t _approach_unfold_last_send{0};
     uORB::Subscription _approach_request_sub{ORB_ID(arm_approach_request)};
     uORB::Publication<arm_approach_status_s> _approach_status_pub{ORB_ID(arm_approach_status)};
     bool _approach_stop_pending{false};
