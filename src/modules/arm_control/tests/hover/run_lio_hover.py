@@ -272,7 +272,12 @@ def main():
                                 from lio_ik_inspection import inspect_native
                                 frozen_row=json.loads(json.dumps(row,allow_nan=False))
                                 def run_inspection():
-                                    try:inspection['result']=inspect_native(native,frozen_row,config,plan.geometry_profile,folder/'ik_inspection')
+                                    try:
+                                        checked=inspect_native(native,frozen_row,config,plan.geometry_profile,folder/'ik_inspection')
+                                        from candidate_hover import inspect_hover
+                                        checked['candidate_hover']=inspect_hover(native,frozen_row,config,plan.geometry_profile,
+                                            np.r_[plan.expected_q,frozen_row['joint_position_rad'][5]],folder/'candidate_hover')
+                                        inspection['result']=checked
                                     except Exception as e:inspection['error']=str(e)
                                 inspection_thread=threading.Thread(target=run_inspection,daemon=True);inspection_thread.start()
                                 print('Read-only native IK queries; flight hold lease continues',flush=True)
