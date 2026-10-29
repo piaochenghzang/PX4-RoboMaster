@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """LIO-only local flight input. Ground truth is recorded, then scored OFFLINE."""
 import argparse,json,math,os,subprocess as sp,time,threading,xml.etree.ElementTree as ET
+from collections import deque
 from pathlib import Path
 import numpy as np
 import rospy,rosgraph,yaml
 from nav_msgs.msg import Odometry
 from mavros_msgs.msg import State,PositionTarget
 from std_msgs.msg import String
+from sensor_msgs.msg import PointCloud2
 from super_px4_bridge.msg import KnownFlightSetpoint
-from known_target import rotation,quintic_segment
+from known_target import rotation,quintic_segment,pose
 from lidar_grasp_demo import LidarDemoPlan,TargetObservation
 from lio_tool_observer import LioToolObserver
 from native_client import NativeClient
@@ -18,6 +20,7 @@ PARAMS=dict(SIM_VISION_PARAMS,EKF2_EV_CTRL=11,EKF2_MAG_TYPE=5,EKF2_EVP_NOISE=.05
     EKF2_EVA_NOISE=.03,EKF2_DELAY_MAX=150,EKF2_TAU_VEL=.15,
     # Measured collective in the previous loaded-vehicle hover; experiment only.
     MPC_THR_HOVER=.84)
+NAV_TRACKING_BUDGET=.09  # Body tracking + measured folded-arm corner deviation.
 
 
 def score_recording(folder,begin,end,goal):
@@ -117,8 +120,9 @@ def score_recording(folder,begin,end,goal):
 
 
 def main():
-    ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('name');ap.add_argument('--gui',action='store_true');ap.add_argument('--observe-target',action='store_true',help='LIO-paired target and FK observation; never move the arm');ap.add_argument('--inspect-ik',action='store_true',help='Read-only native IK and local clearance checks after FK observation');args=ap.parse_args()
+    ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('name');ap.add_argument('--gui',action='store_true');ap.add_argument('--observe-target',action='store_true',help='LIO-paired target and FK observation; never move the arm');ap.add_argument('--inspect-ik',action='store_true',help='Read-only native IK and local clearance checks after FK observation');ap.add_argument('--navigate-candidate',action='store_true',help='Fly the folded vehicle to the LIO-derived candidate after read-only checks; no arm motion');args=ap.parse_args()
     if args.inspect_ik and not args.observe_target:ap.error('--inspect-ik requires --observe-target')
+    if args.navigate_candidate and not args.inspect_ik:ap.error('--navigate-candidate requires --observe-target --inspect-ik')
     if not args.name.replace('_','').isalnum():ap.error('Use a unique safe name')
     if any(sp.run(['pgrep','-x',n],stdout=sp.DEVNULL).returncode==0 for n in ('px4','gzserver','gzclient','rosmaster','mavros_node','fastlio_mapping')):
         ap.error('Existing simulation; refusing to disturb it')
@@ -148,13 +152,26 @@ def main():
     cfg=yaml.safe_load((mavros/'px4_config.yaml').read_text());cfg['time']['timesync_mode']='PASSTHROUGH';cfg['conn']['timesync_rate']=0.
     save(folder/'mavros_config.json',cfg);launch=ET.parse(mavros/'px4.launch')
     launch.find("include/arg[@name='config_yaml']").set('value',str(folder/'mavros_config.json'));launch.write(folder/'mavros.launch')
-    save(folder/'manifest.json',dict(stage='LIO_TARGET_OBSERVATION_NO_ARM_MOTION' if args.observe_target else 'LIO_LOCAL_FLIGHT_NO_ARM_MOTION',ground_truth_control_inputs=False,
+    save(folder/'manifest.json',dict(stage='LIO_CANDIDATE_NAVIGATION_NO_ARM_MOTION' if args.navigate_candidate else 'LIO_TARGET_OBSERVATION_NO_ARM_MOTION' if args.observe_target else 'LIO_LOCAL_FLIGHT_NO_ARM_MOTION',ground_truth_control_inputs=False,
         gazebo_vision_plugin=False,lio_alignment_source='FIRST_LIO_BODY_POSE',ekf_parameters=PARAMS,
-        target_observation=args.observe_target,encoder_fk_observation=args.observe_target,read_only_ik_inspection=args.inspect_ik,external_velocity_fused=False,planned_local_goal_m=[.3,0,.9],sim_speed_factor=speed))
+        target_observation=args.observe_target,encoder_fk_observation=args.observe_target,read_only_ik_inspection=args.inspect_ik,candidate_navigation=args.navigate_candidate,external_velocity_fused=False,observation_local_goal_m=[.3,0,.9],sim_speed_factor=speed))
     os.environ.update(ROS_MASTER_URI=env['ROS_MASTER_URI'],ROS_HOSTNAME='localhost');os.environ.pop('ROS_IP',None)
     procs=[];logs=[];subs=[];pub=None;latest={};result=dict(success=False);begin=end=None;observation=None
     tool_observer=None;tool_log=None;tool_start=None;tool_count=0
     inspection_thread=None;inspection={}
+    clouds=deque(maxlen=10);candidate_route=None;candidate_held=None;candidate_baseline=None
+    candidate_samples=[];last_tool_row=None
+    def odom_pose(message):
+        p=message.pose.pose;q=p.orientation
+        return pose([p.position.x,p.position.y,p.position.z],[q.w,q.x,q.y,q.z])
+    def check_online_graph():
+        graph=rosgraph.Master('/lio_hover_graph').getSystemState()
+        if any(node!='/lio_hover_audit_recorder' for topic,nodes in graph[1] if topic=='/grasp_audit/truth' for node in nodes):
+            raise RuntimeError('Truth entered observation/control')
+        for topic in ('/lidar_slam/odom','/cloud_registered','/mavros/vision_pose/pose_cov'):
+            if [nodes for name,nodes in graph[0] if name==topic]!=[['/fastlio_sim_adapter']]:
+                raise RuntimeError('Unexpected LIO data publisher: '+topic)
+        return dict(publishers=graph[0],subscribers=graph[1])
     def start(name,cmd,cwd=None):
         log=(folder/(name+'.log')).open('w');logs.append(log)
         p=sp.Popen(cmd,env=env,cwd=cwd,stdout=log,stderr=sp.STDOUT,start_new_session=True);procs.append(p);return p
@@ -183,6 +200,8 @@ def main():
         for topic,typ,key in [('/mavros/state',State,'state'),('/mavros/local_position/odom',Odometry,'odom'),
             ('/lidar_slam/odom',Odometry,'lio'),('/grasp_demo/flight_state',String,'manager')]:
             subs.append(rospy.Subscriber(topic,typ,lambda m,k=key:latest.__setitem__(k,m),queue_size=50,tcp_nodelay=True))
+        if args.navigate_candidate:
+            subs.append(rospy.Subscriber('/cloud_registered',PointCloud2,clouds.append,queue_size=5,tcp_nodelay=True))
         start('audit',['rosbag','record','--lz4','-O',str(folder/'audit.bag'),'/grasp_audit/truth','/lidar_slam/odom',
             '/mavros/local_position/odom','/mavros/state','/so101/joint_states','/fastlio_sim/alignment','/grasp_demo/known_setpoint','__name:=lio_hover_audit_recorder'])
         start('gazebo',['gzserver','--verbose','--seed','123','-s','libgazebo_ros_api_plugin.so',str(folder/'scene.world')])
@@ -213,14 +232,15 @@ def main():
         with (folder/'telemetry.jsonl').open('w') as log:
             while True:
                 health();now=rospy.Time.now().to_sec();odom=latest.get('odom');lio=latest.get('lio');state=latest.get('state');manager=latest.get('manager')
-                if now>110:raise RuntimeError('Simulation-time flight deadline')
+                if now>(170 if args.navigate_candidate else 110):raise RuntimeError('Simulation-time flight deadline')
                 if route is None and now-begin>30 and manager and manager.data!='HOVER_READY':
                     raise RuntimeError('Takeoff did not reach stable hover within 30 simulation seconds')
                 if not (odom and lio and state and manager):time.sleep(.01);continue
                 if not -.02<=now-lio.header.stamp.to_sec()<.2:raise RuntimeError('LIO input stale')
                 if not -.02<=now-odom.header.stamp.to_sec()<.2:raise RuntimeError('EKF output stale')
                 p=odom.pose.pose;q=p.orientation;R=rotation([q.w,q.x,q.y,q.z]);xyz=np.array([p.position.x,p.position.y,p.position.z])
-                if not np.isfinite(xyz).all() or abs(xyz[0])>1.2 or abs(xyz[1])>.8 or not -.2<xyz[2]<1.5 or R[2,2]<math.cos(math.radians(15)):raise RuntimeError('Estimated flight envelope exceeded')
+                xmax,zmax=(2.,2.) if args.navigate_candidate else (1.2,1.5)
+                if not np.isfinite(xyz).all() or abs(xyz[0])>xmax or abs(xyz[1])>.8 or not -.2<xyz[2]<zmax or R[2,2]<math.cos(math.radians(15)):raise RuntimeError('Estimated flight envelope exceeded')
                 v=odom.twist.twist.linear;speed_now=np.linalg.norm([v.x,v.y,v.z])
                 active=state.connected and state.armed and state.mode=='OFFBOARD' and -.02<=now-state.header.stamp.to_sec()<1.5
                 if manager.data in ('HOVER_READY','TRACK_KNOWN') and not active:raise RuntimeError('Active OFFBOARD state lost')
@@ -228,12 +248,13 @@ def main():
                     if ready is None:ready=now
                     elif now-ready>=5:route=now;origin=xyz.copy();print('LIO hover accepted; 0.3m local movement starts',flush=True)
                 if route is not None and now-last>=.02:
-                    wp,wv=quintic_segment(origin,goal,now-route,6.)
+                    if candidate_route is None:wp,wv=quintic_segment(origin,goal,now-route,6.);yaw=0.
+                    else:wp,wv,yaw=candidate_route.sample(now)
                     cmd=KnownFlightSetpoint();cmd.header.stamp=rospy.Time.now();cmd.header.frame_id='map';cmd.task_id=1
                     cmd.setpoint.header=cmd.header;cmd.setpoint.coordinate_frame=PositionTarget.FRAME_LOCAL_NED
                     cmd.setpoint.type_mask=PositionTarget.IGNORE_AFX|PositionTarget.IGNORE_AFY|PositionTarget.IGNORE_AFZ|PositionTarget.IGNORE_YAW_RATE
                     cmd.setpoint.position.x,cmd.setpoint.position.y,cmd.setpoint.position.z=map(float,wp)
-                    cmd.setpoint.velocity.x,cmd.setpoint.velocity.y,cmd.setpoint.velocity.z=map(float,wv);cmd.setpoint.yaw=0.;pub.publish(cmd);last=now
+                    cmd.setpoint.velocity.x,cmd.setpoint.velocity.y,cmd.setpoint.velocity.z=map(float,wv);cmd.setpoint.yaw=float(yaw);pub.publish(cmd);last=now
                 error=float(np.linalg.norm(xyz-goal))
                 good=active and route is not None and now-route>=6 and error<.05 and speed_now<.08
                 if not good:held=None
@@ -251,7 +272,7 @@ def main():
                         if any(node!='/lio_hover_audit_recorder' for topic,nodes in graph[1] if topic=='/grasp_audit/truth' for node in nodes):
                             raise RuntimeError('Truth entered observation/control')
                         print('Stable local flight; observing raw cloud with LIO body poses',flush=True)
-                if observation is not None:
+                if observation is not None and not result.get('target_observation_completed'):
                     v=lio.twist.twist.linear
                     estimate=observation.poll(good and np.linalg.norm([v.x,v.y,v.z])<.02)
                     if estimate is not None and not result.get('target_observation_completed'):
@@ -263,6 +284,7 @@ def main():
                 if result.get('target_observation_completed'):
                     row=tool_observer.sample(now)
                     if row is not None:
+                        last_tool_row=row
                         tool_log.write(json.dumps(row,allow_nan=False)+'\n');tool_log.flush();tool_count+=1
                         if tool_start is None:tool_start=row['stamp_s']
                         if row['stamp_s']-tool_start>=3. and tool_count>=20:
@@ -280,13 +302,92 @@ def main():
                                         from unfold_precheck import inspect_unfold
                                         checked['unfold_precheck']=inspect_unfold(native,frozen_row,config,plan.geometry_profile,
                                             np.r_[plan.expected_q,frozen_row['joint_position_rad'][5]],folder/'unfold_precheck')
+                                        if args.navigate_candidate:
+                                            from candidate_hover import derive_hover
+                                            from lio_candidate_route import CandidateRoute,check_frame_agreement
+                                            from lio_route_clearance import body_collision_boxes,check_route
+                                            from scan_metrics import cloud_array
+                                            from check_fixed_target_native import snapshot
+                                            if not checked['unfold_precheck']['native_unfold_branch_valid']:
+                                                raise RuntimeError('Unfold branch did not pass')
+                                            candidate=derive_hover(frozen_row['map_from_target'],config,
+                                                np.r_[plan.expected_q,frozen_row['joint_position_rad'][5]])
+                                            local=latest['odom'];mapped=latest['lio'];stamp=rospy.Time.now().to_sec()
+                                            if (abs(local.header.stamp.to_sec()-mapped.header.stamp.to_sec())>.125 or
+                                                max(stamp-local.header.stamp.to_sec(),stamp-mapped.header.stamp.to_sec())>.2):
+                                                raise RuntimeError('Candidate navigation pose pairing is stale')
+                                            agreement=check_frame_agreement(odom_pose(mapped),odom_pose(local))
+                                            if not agreement['valid']:raise RuntimeError('LIO / EKF local origins disagree')
+                                            start=odom_pose(local);desired=candidate['map_from_body_hover']
+                                            preview=CandidateRoute(start[:3,3],desired[:3,3],
+                                                math.atan2(start[1,0],start[0,0]),candidate['yaw_rad'],stamp)
+                                            scans=list(clouds)
+                                            if not scans or scans[-1].header.frame_id!='map' or not 0<=stamp-scans[-1].header.stamp.to_sec()<=.3:
+                                                raise RuntimeError('Fresh registered map returns required')
+                                            arrays=[]
+                                            for cloud in scans:
+                                                if cloud.header.frame_id!='map':raise RuntimeError('Registered cloud frame')
+                                                a=cloud_array(cloud);arrays.append(np.column_stack([a[k] for k in ('x','y','z')]))
+                                            points=np.concatenate(arrays)
+                                            if len(points)<1000:raise RuntimeError('Insufficient observed map returns')
+                                            # Voxel representatives retain a 20 mm per-axis cell error.
+                                            _,indices=np.unique(np.floor(points/.02).astype(np.int64),axis=0,return_index=True)
+                                            points=points[indices];np.save(folder/'candidate_map_returns.npy',points)
+                                            baseline=snapshot(native)
+                                            boxes=body_collision_boxes(folder/'scene.world',config,
+                                                baseline['arm_control_status']['joint_target'])
+                                            guard=check_route(preview,boxes,points,tracking_margin=NAV_TRACKING_BUDGET,point_margin=.04)
+                                            save(folder/'candidate_navigation_precheck.json',dict(frame_agreement=agreement,
+                                                observed_returns=guard,source='LIO_REGISTERED_CLOUD_PLUS_CONFIGURED_COLLISION_SHAPES',
+                                                latest_cloud_stamp_s=scans[-1].header.stamp.to_sec(),candidate_body_map=desired.tolist(),
+                                                route_start_map_m=preview.start.tolist(),start_yaw_rad=preview.start_yaw,goal_yaw_rad=candidate['yaw_rad']))
+                                            if not guard['valid']:raise RuntimeError('Observed navigation corridor is obstructed')
+                                            inspection.update(candidate=candidate,baseline=baseline,route=preview)
                                         inspection['result']=checked
                                     except Exception as e:inspection['error']=str(e)
                                 inspection_thread=threading.Thread(target=run_inspection,daemon=True);inspection_thread.start()
                                 print('Read-only native IK queries; flight hold lease continues',flush=True)
                 if args.inspect_ik and inspection_thread is not None and not inspection_thread.is_alive():
                     if 'error' in inspection:raise RuntimeError('Read-only IK inspection: '+inspection['error'])
-                    result['ik_inspection']=inspection['result'];end=now;break
+                    result['ik_inspection']=inspection['result']
+                    if not args.navigate_candidate:end=now;break
+                    from lio_candidate_route import CandidateRoute,check_frame_agreement
+                    from check_fixed_target_native import snapshot,assert_unchanged
+                    if candidate_route is None:
+                        save(folder/'graph_candidate_navigation.json',check_online_graph())
+                        desired=inspection['candidate']['map_from_body_hover'];goal=desired[:3,3].copy()
+                        # Keep the exact prechecked curve; shift only its clock.
+                        candidate_route=inspection['route'];candidate_route.began=now
+                        candidate_baseline=inspection['baseline']
+                        print('LIO-derived candidate accepted; folded vehicle climbs then translates',flush=True)
+                    if abs(lio.header.stamp.to_sec()-odom.header.stamp.to_sec())>.125:raise RuntimeError('LIO / EKF navigation pair gap')
+                    agreement=check_frame_agreement(odom_pose(lio),odom_pose(odom))
+                    if not agreement['valid']:raise RuntimeError('LIO / EKF frame disagreement during navigation')
+                    lio_pose=odom_pose(lio);error_lio=float(np.linalg.norm(lio_pose[:3,3]-goal))
+                    commanded,_,command_yaw=candidate_route.sample(now)
+                    tracking_error=float(np.linalg.norm(lio_pose[:3,3]-commanded))
+                    if last_tool_row is None or not 0<=now-last_tool_row['stamp_s']<=.2:raise RuntimeError('Folded arm feedback stale')
+                    joint_delta=np.abs(np.array(last_tool_row['joint_position_rad'])-
+                        candidate_baseline['arm_control_status']['joint_target'])
+                    arm_deviation=float(np.array([.51,.45,.33,.20,.13])@joint_delta[:5]+.13*joint_delta[5])
+                    c,s=math.cos(command_yaw),math.sin(command_yaw)
+                    desired_rotation=np.array([[c,-s,0],[s,c,0],[0,0,1]])
+                    rotation_error=math.degrees(math.acos(float(np.clip((np.trace(desired_rotation.T@lio_pose[:3,:3])-1)/2,-1,1))))
+                    if tracking_error+arm_deviation>NAV_TRACKING_BUDGET or rotation_error>5:raise RuntimeError('Candidate corridor tracking allowance exceeded')
+                    if not clouds or not 0<=now-clouds[-1].header.stamp.to_sec()<=.3:raise RuntimeError('Registered navigation returns lost')
+                    yaw_lio=math.atan2(lio_pose[1,0],lio_pose[0,0]);yaw_error=abs(math.atan2(math.sin(yaw_lio-inspection['candidate']['yaw_rad']),math.cos(yaw_lio-inspection['candidate']['yaw_rad'])))
+                    sample=dict(sim_s=now,error_lio_m=error_lio,error_ekf_m=float(np.linalg.norm(xyz-goal)),speed_m_s=float(speed_now),yaw_error_rad=yaw_error,
+                        frame_position_error_m=agreement['position_error_m'],tracking_error_m=tracking_error,arm_deviation_bound_m=arm_deviation,attitude_error_deg=rotation_error)
+                    candidate_samples.append(sample)
+                    ready=candidate_route.finished(now) and active and error_lio<.05 and sample['error_ekf_m']<.05 and speed_now<.05 and yaw_error<math.radians(5)
+                    if not ready:candidate_held=None
+                    elif candidate_held is None:candidate_held=now
+                    if candidate_held is not None and now-candidate_held>=5:
+                        invariants=assert_unchanged(candidate_baseline,snapshot(native))
+                        result['candidate_navigation']=dict(completed=True,goal_map_m=goal.tolist(),duration_s=now-candidate_route.began,
+                            final_sample=sample,invariants=invariants,ground_truth_control_inputs=False,arm_motion_requested=False)
+                        save(folder/'candidate_navigation_samples.json',candidate_samples)
+                        save(folder/'graph_candidate_completed.json',check_online_graph());end=now;break
                 if manager.data=='FAILSAFE_HOVER':raise RuntimeError('Manager input lease failed')
                 time.sleep(.005)
     except (Exception,KeyboardInterrupt) as e:result['error']=str(e) or type(e).__name__
@@ -303,6 +404,7 @@ def main():
         for sub in subs:sub.unregister()
         for p in reversed(procs):stop(p)
         for log in logs:log.close()
+        if candidate_samples:save(folder/'candidate_navigation_samples.json',candidate_samples)
     if result.get('control_flight_completed') and (not args.observe_target or result.get('fk_observation_completed')) and end is not None:
         try:
             result['offline_score']=score_recording(folder,begin,end,goal)
@@ -312,6 +414,7 @@ def main():
         own_processes_stopped=all(p.poll() is not None for p in procs),wall_elapsed_s=time.monotonic()-started)
     if not result['own_processes_stopped'] or result.get('observation_cleanup_error') or result.get('inspection_cleanup_error'):result['success']=False
     if args.inspect_ik and not result.get('ik_inspection',{}).get('inspection_verified'):result['success']=False
+    if args.navigate_candidate and not result.get('candidate_navigation',{}).get('completed'):result['success']=False
     save(folder/'result.json',result);print(json.dumps(result,indent=2),flush=True)
     return 0 if result['success'] else 2
 
