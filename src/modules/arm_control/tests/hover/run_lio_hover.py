@@ -10,6 +10,7 @@ from std_msgs.msg import String
 from super_px4_bridge.msg import KnownFlightSetpoint
 from known_target import rotation,quintic_segment
 from lidar_grasp_demo import LidarDemoPlan,TargetObservation
+from lio_tool_observer import LioToolObserver
 from native_client import NativeClient
 from run_known_target_flight import ROOT,BUILD,WS,MODELS,make_world,save,stop,SIM_VISION_PARAMS
 
@@ -23,12 +24,15 @@ def score_recording(folder,begin,end,goal):
     # This function runs only AFTER every owned simulator/control process stops.
     import rosbag
     from grasp_audit.geometry import interpolate_pose
-    truth=[];targets=[];estimated=[];alignment=None
+    truth=[];targets=[];grippers=[];estimated=[];alignment=None
     with rosbag.Bag(str(folder/'audit.bag')) as bag:
         for topic,m,_ in bag.read_messages():
             if topic=='/grasp_audit/truth':
                 i=list(m.link_names).index('yhang550_base::base_link');p=m.link_poses[i]
                 truth.append((m.header.stamp.to_sec(),[p.position.x,p.position.y,p.position.z,
+                    p.orientation.w,p.orientation.x,p.orientation.y,p.orientation.z]))
+                i=list(m.link_names).index('so101::gripper_link');p=m.link_poses[i]
+                grippers.append((m.header.stamp.to_sec(),[p.position.x,p.position.y,p.position.z,
                     p.orientation.w,p.orientation.x,p.orientation.y,p.orientation.z]))
                 if m.target_present:
                     p=m.target_pose
@@ -80,6 +84,35 @@ def score_recording(folder,begin,end,goal):
             passed=translation<.02 and relative_error<.02 and angle<5.,scoring_only_after_shutdown=True)
         save(folder/'target_offline_score.json',target_score)
         result['target']=target_score;result['passed']=result['passed'] and target_score['passed']
+    tool_file=folder/'tool_relative.jsonl'
+    if tool_file.exists():
+        from grasp_audit.geometry import inverse,rpy_transform,residual
+        config=json.loads((folder/'tool_geometry_used.json').read_text())
+        ref=np.eye(4);ref[:3,3]=config['reference_gripper']
+        tool=rpy_transform(config['tool_pose']);rows=[json.loads(line) for line in tool_file.read_text().splitlines()]
+        tcp_errors=[];reference_errors=[];relative_errors=[];fk_errors=[]
+        for row in rows:
+            t=row['stamp_s'];body_actual,_=interpolate_pose(truth,t,.03)
+            gripper_actual,_=interpolate_pose(grippers,t,.03);object_actual,_=interpolate_pose(targets,t,.03)
+            tcp_errors.append(residual(gripper_actual@tool,W_M@np.array(row['map_from_tcp'])))
+            reference_errors.append(residual(gripper_actual@ref,W_M@np.array(row['map_from_grasp_reference'])))
+            relative_errors.append(residual(inverse(gripper_actual@ref)@object_actual,np.array(row['grasp_reference_from_target'])))
+            fk_errors.append(residual(inverse(body_actual)@gripper_actual,
+                inverse(np.array(row['map_from_body']))@np.array(row['map_from_gripper'])))
+        if len(rows)<20 or rows[-1]['stamp_s']-rows[0]['stamp_s']<2.5:raise RuntimeError('Insufficient FK observation coverage')
+        if any(row['map_from_target']!=rows[0]['map_from_target'] for row in rows):raise RuntimeError('Locked target changed')
+        maxima=lambda values:dict(position_m=max(v[0] for v in values),rotation_deg=math.degrees(max(v[1] for v in values)))
+        fk_score=dict(samples=len(rows),duration_s=rows[-1]['stamp_s']-rows[0]['stamp_s'],
+            tcp_max_error=maxima(tcp_errors),grasp_reference_max_error=maxima(reference_errors),
+            reference_to_target_max_error=maxima(relative_errors),body_relative_fk_max_error=maxima(fk_errors),
+            max_pair_age_s=max(row['source_age_s'] for row in rows),target_unchanged=True,
+            joint_time_basis='ROS_SIM_CLOCK_APPROXIMATE_PHYSICS_SAMPLE',scoring_only_after_shutdown=True,
+            # Coordinate observation acceptance only; this does not enable motion.
+            passed=max(v[0] for v in tcp_errors+reference_errors+relative_errors)<.02 and
+                max(v[1] for v in tcp_errors+relative_errors)<math.radians(5) and
+                max(v[0] for v in fk_errors)<.002 and max(v[1] for v in fk_errors)<.001)
+        save(folder/'tool_offline_score.json',fk_score)
+        result['tool']=fk_score;result['passed']=result['passed'] and fk_score['passed']
     return result
 
 
@@ -116,9 +149,10 @@ def main():
     launch.find("include/arg[@name='config_yaml']").set('value',str(folder/'mavros_config.json'));launch.write(folder/'mavros.launch')
     save(folder/'manifest.json',dict(stage='LIO_TARGET_OBSERVATION_NO_ARM_MOTION' if args.observe_target else 'LIO_LOCAL_FLIGHT_NO_ARM_MOTION',ground_truth_control_inputs=False,
         gazebo_vision_plugin=False,lio_alignment_source='FIRST_LIO_BODY_POSE',ekf_parameters=PARAMS,
-        target_observation=args.observe_target,external_velocity_fused=False,planned_local_goal_m=[.3,0,.9],sim_speed_factor=speed))
+        target_observation=args.observe_target,encoder_fk_observation=args.observe_target,external_velocity_fused=False,planned_local_goal_m=[.3,0,.9],sim_speed_factor=speed))
     os.environ.update(ROS_MASTER_URI=env['ROS_MASTER_URI'],ROS_HOSTNAME='localhost');os.environ.pop('ROS_IP',None)
     procs=[];logs=[];subs=[];pub=None;latest={};result=dict(success=False);begin=end=None;observation=None
+    tool_observer=None;tool_log=None;tool_start=None;tool_count=0
     def start(name,cmd,cwd=None):
         log=(folder/(name+'.log')).open('w');logs.append(log)
         p=sp.Popen(cmd,env=env,cwd=cwd,stdout=log,stderr=sp.STDOUT,start_new_session=True);procs.append(p);return p
@@ -133,11 +167,22 @@ def main():
             time.sleep(.1)
         sp.run(['rosparam','set','/use_sim_time','true'],env=env,check=True)
         rospy.init_node('lio_hover_probe',disable_signals=True)
+        if args.observe_target:
+            from grasp_audit.geometry import rpy_transform
+            from check_installation import transform
+            config=yaml.safe_load((WS/'src/super_px4_bridge/config/grasp_frame_audit.yaml').read_text())
+            if not np.allclose(rpy_transform(config['mount_pose']),transform(plan.geometry_profile['vehicle']['body_from_arm_xyz_rpy_deg']),atol=1e-6):
+                raise RuntimeError('Arm mounting configurations disagree')
+            config={k:config[k] for k in ('joint_names','mount_pose','joint_origins','tool_pose')}
+            config['reference_gripper']=plan.geometry_profile['vehicle']['grasp_reference_gripper_m']
+            save(folder/'tool_geometry_used.json',config)
+            tool_observer=LioToolObserver(config,config['reference_gripper'])
+            tool_log=(folder/'tool_relative.jsonl').open('w')
         for topic,typ,key in [('/mavros/state',State,'state'),('/mavros/local_position/odom',Odometry,'odom'),
             ('/lidar_slam/odom',Odometry,'lio'),('/grasp_demo/flight_state',String,'manager')]:
             subs.append(rospy.Subscriber(topic,typ,lambda m,k=key:latest.__setitem__(k,m),queue_size=50,tcp_nodelay=True))
         start('audit',['rosbag','record','--lz4','-O',str(folder/'audit.bag'),'/grasp_audit/truth','/lidar_slam/odom',
-            '/mavros/local_position/odom','/mavros/state','/fastlio_sim/alignment','/grasp_demo/known_setpoint','__name:=lio_hover_audit_recorder'])
+            '/mavros/local_position/odom','/mavros/state','/so101/joint_states','/fastlio_sim/alignment','/grasp_demo/known_setpoint','__name:=lio_hover_audit_recorder'])
         start('gazebo',['gzserver','--verbose','--seed','123','-s','libgazebo_ros_api_plugin.so',str(folder/'scene.world')])
         if args.gui:start('gui',['gzclient'])
         px4=start('px4',[str(BUILD/'bin/px4'),'-d',str(BUILD/'etc')],folder/'rootfs')
@@ -207,10 +252,19 @@ def main():
                 if observation is not None:
                     v=lio.twist.twist.linear
                     estimate=observation.poll(good and np.linalg.norm([v.x,v.y,v.z])<.02)
-                    if estimate is not None:
-                        save(folder/'perceived_target_map.json',dict(frame=estimate['frame'],map_from_object=estimate['transform'].tolist(),
-                            source_observation=estimate['report']['source_observation'],estimate_path=str(estimate['path']/'estimate.json')))
-                        result['target_observation_completed']=True;end=now;break
+                    if estimate is not None and not result.get('target_observation_completed'):
+                        detected=dict(frame=estimate['frame'],map_from_object=estimate['transform'].tolist(),
+                            source_observation=estimate['report']['source_observation'],estimate_path=str(estimate['path']/'estimate.json'))
+                        save(folder/'perceived_target_map.json',detected)
+                        tool_observer.lock_target(detected);result['target_observation_completed']=True
+                        print('Target locked in LIO map; reading encoder FK for 3 seconds',flush=True)
+                if result.get('target_observation_completed'):
+                    row=tool_observer.sample(now)
+                    if row is not None:
+                        tool_log.write(json.dumps(row,allow_nan=False)+'\n');tool_log.flush();tool_count+=1
+                        if tool_start is None:tool_start=row['stamp_s']
+                        if row['stamp_s']-tool_start>=3. and tool_count>=20:
+                            result['fk_observation_completed']=True;end=now;break
                 if manager.data=='FAILSAFE_HOVER':raise RuntimeError('Manager input lease failed')
                 time.sleep(.005)
     except (Exception,KeyboardInterrupt) as e:result['error']=str(e) or type(e).__name__
@@ -218,14 +272,16 @@ def main():
         if observation is not None:
             try:observation.close()
             except Exception as e:result['observation_cleanup_error']=str(e)
+        if tool_observer is not None:tool_observer.close()
+        if tool_log is not None:tool_log.close()
         if pub:pub.unregister()
         for sub in subs:sub.unregister()
         for p in reversed(procs):stop(p)
         for log in logs:log.close()
-    if result.get('control_flight_completed') and (not args.observe_target or result.get('target_observation_completed')) and end is not None:
+    if result.get('control_flight_completed') and (not args.observe_target or result.get('fk_observation_completed')) and end is not None:
         try:
             result['offline_score']=score_recording(folder,begin,end,goal)
-            result['success']=result['offline_score']['passed'] and (not args.observe_target or result['offline_score'].get('target',{}).get('passed',False))
+            result['success']=result['offline_score']['passed'] and (not args.observe_target or result['offline_score'].get('target',{}).get('passed',False) and result['offline_score'].get('tool',{}).get('passed',False))
         except Exception as e:result['offline_score_error']=str(e)
     result.update(ground_truth_control_inputs=False,arm_motion_requested=False,
         own_processes_stopped=all(p.poll() is not None for p in procs),wall_elapsed_s=time.monotonic()-started)

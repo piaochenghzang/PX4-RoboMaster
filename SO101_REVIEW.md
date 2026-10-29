@@ -4514,3 +4514,44 @@ PX4_SIM_SPEED_FACTOR=.35 python3 src/modules/arm_control/tests/hover/run_lio_hov
 ```
 
 目标位置在 LIO 局部地图中，不能直接作为旧 `gazebo_world` 配置使用。下一步将末端相对关系改由 LIO 机体位姿、安装外参和编码器正运动学计算，再核对接近 / 净空判定；原生抓取反馈的真值来源限制、夹持和携物判断仍需单独替换。继续保留现有碰撞、净空和闭爪保护。
+
+## 47. LIO、安装外参与编码器正运动学（2026-10-29）
+
+完成折叠姿态下的只读末端坐标链：LIO 机体位姿 + 安装外参 + 关节角反馈 → 末端 / 抓取参考点相对已识别目标的位姿。未请求展开、IK 接近或闭爪，未新增 PX4 / ROS 消息、状态机或修改 PID；已有接触与净空保护未接管或放宽。
+
+### 47.1 修改及坐标定义
+
+- 新 `tests/hover/lio_tool_observer.py`：复用 ROS `grasp_audit.geometry` 的纯数学 FK，仅订阅 `/lidar_slam/odom` 和 `/so101/joint_states`。关节按六个名称重排；FK 仅用前五个转轴，夹爪开度不改变 `gripper_link`。
+- 配置复用 `grasp_frame_audit.yaml` 的 `joint_origins`、`mount_pose`、`tool_pose`；启动时核对机械臂安装外参与 MID360 profile 一致。抓取参考点明确使用 MID360 profile 的 `[0.0045, -0.000218, -0.104] m`，不使用旧方块的 reference_gripper。
+- 坐标链：`T_M_G = T_M_B(LIO) @ T_B_A @ T_A_G(q)`。LIO 输出已经是 `map → base_link`，不再次应用雷达外参。原生 TCP 为 `T_M_G @ tool_pose`；抓取参考点为 `T_M_G @ translation(reference_gripper)`，其方向沿用 gripper_link。两者明确分别输出，参考点不是随开度变化的实际双指中心。
+- 目标只从第 46 节的 `perceived_target_map.json` 锁定一次，矩阵复制并设为不可写。按关节消息源时间插值 LIO，要求前后样本包围、间隙 ≤0.125 秒、配对年龄 ≤0.2 秒；缺端点时等待，缺帧、过时、非有限值、重复 / 回退时间或错误坐标系拒绝，不外推。
+- JointState 当前在 Gazebo UpdateBegin 读取角度，但以 `ros::Time::now()` 标记时间；记录明确为 `ROS_SIM_CLOCK_APPROXIMATE_PHYSICS_SAMPLE`，不声称精确物理步同步。
+- `run_lio_hover.py --observe-target` 在目标锁定后追加 3 秒只读 FK 观察。输出 `tool_geometry_used.json`、`tool_relative.jsonl`；真实连杆 / 目标位姿只在停机后的 `tool_offline_score.json` 中核对，不反馈在线计算。
+
+### 47.2 实验与误差
+
+案例：`build/lio_hover/lio_fk_20261029_01/result.json`，success、target_observation_completed、fk_observation_completed 均为 true。采样 73.38–76.38 秒，共 31 帧；全部自有进程已退出，真值仅进入记录器。
+
+| 核对项目 | 本轮最大误差 |
+| --- | --- |
+| 地图中的原生 TCP | 2.725 mm / 0.0494° |
+| 地图中的抓取参考点 | 2.729 mm / 0.0494° |
+| 抓取参考点相对目标的估计 | 0.346 mm / 0.1308° |
+| 去除机体定位影响后的 FK 链 | 0.0106 mm / 0.00430° |
+| 配对消息年龄 | 0.110 秒 |
+
+目标矩阵在全部 31 帧中保持不变；运动与闭爪许可字段均为 false。最后一帧抓取参考点距目标约 **1.110 m**：相对位姿估计误差小，不等于实际已经对齐到目标。当前仍是折叠臂、远距观察姿态。
+
+独立评分使用同一消息参考时刻：实际连杆姿态加相同 TCP / 参考点外参，对照 LIO + 编码器 FK；参考点相对目标再用实际连杆与物体姿态独立计算。只作一次初始地图原点 / 偏航对齐，未逐帧修正。核对结果仅支持该理想传感器仿真的单次折叠姿态观测，不代表展开全工作空间、实机标定精度或抓取成功。
+
+检查：15 项新增数学 / 来源隔离 / 锁定与配对测试通过，12 项既有坐标测试通过，102 组原生 FK / SDF 姿态一致性检查通过（最大位置差 3.533 微米）。还未验证运动中的 ROS 关节时间误差预算。
+
+### 47.3 复现及下一步
+
+沿用第 45 节 ROS / PYTHONPATH 设置；关闭其他仿真后运行：
+
+```bash
+PX4_SIM_SPEED_FACTOR=.35 python3 src/modules/arm_control/tests/hover/run_lio_hover.py UNIQUE_CASE --observe-target --gui
+```
+
+下一步可将这组末端 / 目标相对关系用于现有 IK 输入核对与接近检查，先验证拒绝和净空判断。悬停许可、精接近几何、夹持 / 携物反馈中的原有真值依赖仍需逐项替换；本轮坐标结果不直接授予接近或闭爪许可。
