@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """LIO-only local flight input. Ground truth is recorded, then scored OFFLINE."""
-import argparse,json,math,os,subprocess as sp,time,xml.etree.ElementTree as ET
+import argparse,json,math,os,subprocess as sp,time,threading,xml.etree.ElementTree as ET
 from pathlib import Path
 import numpy as np
 import rospy,rosgraph,yaml
@@ -117,7 +117,8 @@ def score_recording(folder,begin,end,goal):
 
 
 def main():
-    ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('name');ap.add_argument('--gui',action='store_true');ap.add_argument('--observe-target',action='store_true',help='LIO-paired target observation only; never move the arm');args=ap.parse_args()
+    ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('name');ap.add_argument('--gui',action='store_true');ap.add_argument('--observe-target',action='store_true',help='LIO-paired target and FK observation; never move the arm');ap.add_argument('--inspect-ik',action='store_true',help='Read-only native IK and local clearance checks after FK observation');args=ap.parse_args()
+    if args.inspect_ik and not args.observe_target:ap.error('--inspect-ik requires --observe-target')
     if not args.name.replace('_','').isalnum():ap.error('Use a unique safe name')
     if any(sp.run(['pgrep','-x',n],stdout=sp.DEVNULL).returncode==0 for n in ('px4','gzserver','gzclient','rosmaster','mavros_node','fastlio_mapping')):
         ap.error('Existing simulation; refusing to disturb it')
@@ -149,10 +150,11 @@ def main():
     launch.find("include/arg[@name='config_yaml']").set('value',str(folder/'mavros_config.json'));launch.write(folder/'mavros.launch')
     save(folder/'manifest.json',dict(stage='LIO_TARGET_OBSERVATION_NO_ARM_MOTION' if args.observe_target else 'LIO_LOCAL_FLIGHT_NO_ARM_MOTION',ground_truth_control_inputs=False,
         gazebo_vision_plugin=False,lio_alignment_source='FIRST_LIO_BODY_POSE',ekf_parameters=PARAMS,
-        target_observation=args.observe_target,encoder_fk_observation=args.observe_target,external_velocity_fused=False,planned_local_goal_m=[.3,0,.9],sim_speed_factor=speed))
+        target_observation=args.observe_target,encoder_fk_observation=args.observe_target,read_only_ik_inspection=args.inspect_ik,external_velocity_fused=False,planned_local_goal_m=[.3,0,.9],sim_speed_factor=speed))
     os.environ.update(ROS_MASTER_URI=env['ROS_MASTER_URI'],ROS_HOSTNAME='localhost');os.environ.pop('ROS_IP',None)
     procs=[];logs=[];subs=[];pub=None;latest={};result=dict(success=False);begin=end=None;observation=None
     tool_observer=None;tool_log=None;tool_start=None;tool_count=0
+    inspection_thread=None;inspection={}
     def start(name,cmd,cwd=None):
         log=(folder/(name+'.log')).open('w');logs.append(log)
         p=sp.Popen(cmd,env=env,cwd=cwd,stdout=log,stderr=sp.STDOUT,start_new_session=True);procs.append(p);return p
@@ -264,11 +266,26 @@ def main():
                         tool_log.write(json.dumps(row,allow_nan=False)+'\n');tool_log.flush();tool_count+=1
                         if tool_start is None:tool_start=row['stamp_s']
                         if row['stamp_s']-tool_start>=3. and tool_count>=20:
-                            result['fk_observation_completed']=True;end=now;break
+                            result['fk_observation_completed']=True
+                            if not args.inspect_ik:end=now;break
+                            if inspection_thread is None:
+                                from lio_ik_inspection import inspect_native
+                                frozen_row=json.loads(json.dumps(row,allow_nan=False))
+                                def run_inspection():
+                                    try:inspection['result']=inspect_native(native,frozen_row,config,plan.geometry_profile,folder/'ik_inspection')
+                                    except Exception as e:inspection['error']=str(e)
+                                inspection_thread=threading.Thread(target=run_inspection,daemon=True);inspection_thread.start()
+                                print('Read-only native IK queries; flight hold lease continues',flush=True)
+                if args.inspect_ik and inspection_thread is not None and not inspection_thread.is_alive():
+                    if 'error' in inspection:raise RuntimeError('Read-only IK inspection: '+inspection['error'])
+                    result['ik_inspection']=inspection['result'];end=now;break
                 if manager.data=='FAILSAFE_HOVER':raise RuntimeError('Manager input lease failed')
                 time.sleep(.005)
     except (Exception,KeyboardInterrupt) as e:result['error']=str(e) or type(e).__name__
     finally:
+        if inspection_thread is not None:
+            inspection_thread.join(timeout=15)
+            if inspection_thread.is_alive():result['inspection_cleanup_error']='IK inspection worker did not stop'
         if observation is not None:
             try:observation.close()
             except Exception as e:result['observation_cleanup_error']=str(e)
@@ -285,7 +302,8 @@ def main():
         except Exception as e:result['offline_score_error']=str(e)
     result.update(ground_truth_control_inputs=False,arm_motion_requested=False,
         own_processes_stopped=all(p.poll() is not None for p in procs),wall_elapsed_s=time.monotonic()-started)
-    if not result['own_processes_stopped'] or result.get('observation_cleanup_error'):result['success']=False
+    if not result['own_processes_stopped'] or result.get('observation_cleanup_error') or result.get('inspection_cleanup_error'):result['success']=False
+    if args.inspect_ik and not result.get('ik_inspection',{}).get('inspection_verified'):result['success']=False
     save(folder/'result.json',result);print(json.dumps(result,indent=2),flush=True)
     return 0 if result['success'] else 2
 
