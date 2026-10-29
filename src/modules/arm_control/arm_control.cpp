@@ -254,13 +254,20 @@ int ArmControl::custom_command(int argc, char *argv[])
 #if !defined(CONFIG_ARCH_BOARD_PX4_SITL)
         PX4_ERR("IK inspection is local SITL only"); return PX4_ERROR;
 #else
-        if (argc!=4 || !get_instance()) return PX4_ERROR;
+        if ((argc!=4 && argc!=4+ARM_DOF) || !get_instance()) return PX4_ERROR;
         matrix::Vector3f target{};
         for (int i=0;i<3;++i) {
             char *end=nullptr; errno=0; target(i)=strtof(argv[i+1],&end);
             if (errno==ERANGE || end==argv[i+1] || *end!='\0' || !PX4_ISFINITE(target(i))) return PX4_ERROR;
         }
-        return get_instance()->previewCartesianIK(target);
+        float seed[ARM_DOF]{};
+        if (argc==4+ARM_DOF) {
+            for (int i=0;i<ARM_DOF;++i) {
+                char *end=nullptr; errno=0; seed[i]=strtof(argv[i+4],&end);
+                if (errno==ERANGE || end==argv[i+4] || *end!='\0' || !PX4_ISFINITE(seed[i])) return PX4_ERROR;
+            }
+        }
+        return get_instance()->previewCartesianIK(target,argc==4+ARM_DOF ? seed : nullptr);
 #endif
     }
     if (argc>0 && (!strcmp(argv[0],"target") || !strcmp(argv[0],"test_warm_start") ||
@@ -516,7 +523,7 @@ $ arm_control test_cartesian_ik
     PRINT_MODULE_USAGE_COMMAND("test_fk");
     PRINT_MODULE_USAGE_COMMAND_DESCR("target", "Queue x y z (base_link metres) and gripper (radians)");
 #if defined(CONFIG_ARCH_BOARD_PX4_SITL)
-    PRINT_MODULE_USAGE_COMMAND_DESCR("ik_check", "Read-only native position IK: x y z (SITL; no target publication)");
+    PRINT_MODULE_USAGE_COMMAND_DESCR("ik_check", "Read-only position IK: x y z [q0 q1 q2 q3 q4] (SITL; no target publication)");
 #endif
     PRINT_MODULE_USAGE_COMMAND_DESCR("grasp_start", "Queue fixed-bench grasp: bench_cube20 hold_seconds");
     PRINT_MODULE_USAGE_COMMAND("grasp_cancel");

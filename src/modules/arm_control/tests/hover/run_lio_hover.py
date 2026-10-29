@@ -277,6 +277,9 @@ def main():
                                         from candidate_hover import inspect_hover
                                         checked['candidate_hover']=inspect_hover(native,frozen_row,config,plan.geometry_profile,
                                             np.r_[plan.expected_q,frozen_row['joint_position_rad'][5]],folder/'candidate_hover')
+                                        from unfold_precheck import inspect_unfold
+                                        checked['unfold_precheck']=inspect_unfold(native,frozen_row,config,plan.geometry_profile,
+                                            np.r_[plan.expected_q,frozen_row['joint_position_rad'][5]],folder/'unfold_precheck')
                                         inspection['result']=checked
                                     except Exception as e:inspection['error']=str(e)
                                 inspection_thread=threading.Thread(target=run_inspection,daemon=True);inspection_thread.start()
