@@ -22,7 +22,7 @@ float ArmControl::hoverMotionClearance() const
     return _hover_context.clearance;
 }
 
-so101_hover::TargetResult ArmControl::applyHoverTarget(const so101_hover::Point &p,float max_joint_step)
+so101_hover::TargetResult ArmControl::applyHoverTarget(const so101_hover::Point &p,float max_joint_step,float unused_fraction)
 {
     using so101_hover::TargetResult;
     if (!PX4_ISFINITE(max_joint_step) || max_joint_step<=0 || max_joint_step>.02f) return TargetResult::Rejected;
@@ -41,7 +41,7 @@ so101_hover::TargetResult ArmControl::applyHoverTarget(const so101_hover::Point 
     const float scale=largest>max_joint_step ? max_joint_step/largest : 1.f;
     float desired[ARM_DOF]{};
     for (int j=0;j<ARM_DOF;++j) desired[j]=seed[j]+scale*(candidate[j]-seed[j]);
-    return applyHoverJoints(desired);
+    return applyHoverJoints(desired,unused_fraction);
 }
 
 so101_hover::TargetResult ArmControl::applyHoverJoints(const float (&desired)[ARM_DOF],float unused_fraction)
@@ -170,7 +170,7 @@ void ArmControl::updateHoverApproach()
             _hover_approach.fail(so101_hover::ApproachFault::IK); stopHoverMotion();
         }
     } else if (send) {
-        const auto outcome=applyHoverTarget(p);
+        const auto outcome=applyHoverTarget(p,.02f,.5f);
         if (outcome==so101_hover::TargetResult::WaitClearance) {
             _hover_approach.pause(so101_hover::PauseReason::Clearance); stopHoverMotion();
         } else if (outcome==so101_hover::TargetResult::Rejected) {

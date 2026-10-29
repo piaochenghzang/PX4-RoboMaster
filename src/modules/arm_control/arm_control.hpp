@@ -154,7 +154,7 @@ private:
     void updateFixedGrasp(const arm_approach_request_s *request, const so101_hover::ApproachInput &motion);
     void stopHoverMotion();
     float hoverMotionClearance() const;
-    so101_hover::TargetResult applyHoverTarget(const so101_hover::Point &target, float max_joint_step=.02f);
+    so101_hover::TargetResult applyHoverTarget(const so101_hover::Point &target, float max_joint_step=.02f, float unused_fraction=1.f);
     so101_hover::TargetResult applyHoverJoints(const float (&desired)[ARM_DOF],float unused_fraction=1.f);
     so101_hover::TargetResult applyHoverUnfold(float max_joint_step,float joint_speed,bool &complete,float unused_fraction=1.f);
     so101_grasp::Input graspInput() const;
