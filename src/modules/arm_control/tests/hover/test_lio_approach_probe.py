@@ -137,6 +137,77 @@ class LioCancellationTests(unittest.TestCase):
         self.assertFalse(cancellation_ack(state,dict(joint_target=[0.]*5+[float('nan')]),IDS,.3,100))
 
 
+class LioPrecisionTests(unittest.TestCase):
+    def geometry(self,name,*,support_x=.4,points=None,extra=None):
+        row=dict(map_from_body=np.eye(4),map_from_arm=np.eye(4),
+            map_from_target=np.eye(4),joint_position_rad=np.zeros(6),
+            prediction_translation_m=0.,prediction_rotation_rad=0.)
+        parts=[dict(name='handle',size_m=[.02]*3,xyz_rpy_deg=[0.]*6)]
+        if extra is not None:parts.append(extra)
+        geometry=dict(target=dict(parts=parts,support_size_m=[.02]*3,
+            object_from_support_xyz_rpy_deg=[support_x,0.,0.,0.,0.,0.]))
+        static=[('vehicle',rpy_transform([0.,.5,0.,0.,0.,0.]),np.array([.01]*3))]
+        cloud=np.array([[0.,0.,0.],[0.,.4,0.]]) if points is None else points
+        with patch.object(FixedDemoPlan,'boxes',return_value=[(name,np.eye(4),np.array([.01]*3))]):
+            return (approach_geometry(row,{},geometry,static,cloud),
+                approach_geometry(row,{},geometry,static,cloud,precision=True))
+
+    def test_only_designated_pads_may_contact_handle(self):
+        for name in ('gripper_fixed_finger_collision','moving_jaw_collision'):
+            ordinary,fine=self.geometry(name)
+            self.assertFalse(ordinary['valid']);self.assertTrue(fine['valid'])
+            self.assertEqual(fine['contact_exemptions'],[[name,'handle']])
+        self.assertFalse(self.geometry('gripper_body_collision')[1]['valid'])
+
+    def test_body_and_unclassified_return_still_refuse_contact(self):
+        extra=dict(name='body',size_m=[.02]*3,xyz_rpy_deg=[0.]*6)
+        self.assertFalse(self.geometry('gripper_fixed_finger_collision',extra=extra)[1]['valid'])
+        self.assertFalse(self.geometry('moving_jaw_collision',points=np.array([[.022,0.,0.]]))[1]['valid'])
+
+    def test_support_exception_reserves_three_mm_plus_localization(self):
+        # Two half-widths total20mm; x28mm leaves8mm physical separation.
+        _,fine=self.geometry('moving_jaw_collision',support_x=.028,points=np.array([[0.,.4,0.]]))
+        self.assertTrue(fine['valid']);self.assertAlmostEqual(fine['clearance_m'],.017)
+        _,fine=self.geometry('moving_jaw_collision',support_x=.026,points=np.array([[0.,.4,0.]]))
+        self.assertFalse(fine['valid'])
+
+    def test_full_stroke_reserves_motion_between_samples(self):
+        from lio_approach_probe import jaw_sweep_geometry
+        row=dict(joint_position_rad=np.zeros(6),map_from_arm=np.eye(4),map_from_gripper=np.eye(4))
+        with patch('lio_approach_probe.approach_geometry',return_value=dict(external_clearance_m=.03,arm_body_lower_bound_m=.04)) as measure:
+            result=jaw_sweep_geometry(row, {}, {}, [], [],precision=True)
+        self.assertEqual(measure.call_count,1)
+        moving=[b for b in measure.call_args.kwargs['boxes_override'] if b[0]=='moving_jaw_collision']
+        self.assertEqual(len(moving),53)
+        self.assertAlmostEqual(result['external_clearance_m'],.03-.11*.005)
+        self.assertAlmostEqual(result['arm_body_lower_bound_m'],.04-.11*.005)
+
+    def test_batched_stroke_matches_complete_production_scene_scalar_evaluations(self):
+        from lio_approach_probe import jaw_sweep_geometry
+        geometry=dict(target=dict(parts=[dict(name='handle',size_m=[.02]*3,xyz_rpy_deg=[0.]*6)],
+            support_size_m=[.02]*3,object_from_support_xyz_rpy_deg=[.2,0.,0.,0.,0.,0.]))
+        for q in ([0.,-.8,1.2,-1.,-.5,.3],[-.07,-1.175,1.45,1.3,-1.57,.3]):
+            row=dict(joint_position_rad=q,map_from_arm=np.eye(4),map_from_body=np.eye(4),
+                map_from_target=rpy_transform([.8,0.,.5,0.,0.,0.]),
+                prediction_translation_m=.001,prediction_rotation_rad=.002)
+            static=[('vehicle',rpy_transform([.1,.2,.1,0.,0.,0.]),np.array([.01]*3))]
+            points=np.array([[.5,.4,0.],[.8,0.,.5]])
+            for precision in (False,True):
+                with self.subTest(q=q,precision=precision):
+                    batch=jaw_sweep_geometry(row,{},geometry,static,points,precision=precision)
+                    scalar=[approach_geometry(row,{},geometry,static,points,precision=precision,jaw=v) for v in np.linspace(.04,.3,53)]
+                    for key in ('external_clearance_m','arm_body_lower_bound_m'):
+                        self.assertAlmostEqual(batch[key],min(x[key] for x in scalar)-.11*.005,places=12)
+
+    def test_contact_grasp_cancel_requires_fixed_mode_and_keeps_jaw_bias(self):
+        state=dict(zip(('task_id','plan_id','target_id','scene_id'),IDS),
+            mode=1,phase=9,close_authorized=False,request_result=1,last_request_id=101)
+        arm=dict(joint_target=[0.]*5+[.04])
+        self.assertTrue(cancellation_ack(state,arm,IDS,.04,100,grasp=True))
+        self.assertFalse(cancellation_ack(dict(state,mode=0),arm,IDS,.04,100,grasp=True))
+        self.assertFalse(cancellation_ack(dict(state,phase=7),arm,IDS,.04,100,grasp=True))
+
+
 class LioFinishTests(unittest.TestCase):
     def test_motion_fault_keeps_cancel_evidence_instead_of_reporting_cleanup_failure(self):
         with TemporaryDirectory() as directory:

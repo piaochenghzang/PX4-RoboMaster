@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""LIO-only local flight input. Ground truth is recorded, then scored OFFLINE."""
+"""LiDAR/LIO flight and native grasp demo; truth is scored only OFFLINE."""
 import argparse,json,math,os,signal,subprocess as sp,time,threading,xml.etree.ElementTree as ET
 from collections import deque
 from pathlib import Path
@@ -17,7 +17,7 @@ from native_client import NativeClient
 from sim_scene import ROOT,BUILD,WS,MODELS,make_world,save,stop,SIM_VISION_PARAMS
 
 PARAMS=dict(SIM_VISION_PARAMS,EKF2_EV_CTRL=11,EKF2_MAG_TYPE=5,EKF2_EVP_NOISE=.05,
-    EKF2_EVA_NOISE=.03,EKF2_DELAY_MAX=150,EKF2_TAU_VEL=.15,
+    EKF2_EVA_NOISE=.03,EKF2_DELAY_MAX=150,EKF2_TAU_VEL=.05,
     # Measured collective in the previous loaded-vehicle hover; experiment only.
     MPC_THR_HOVER=.84)
 LIO_VELOCITY_STD=.010  # PX4 EV minimum; ideal simulation, not hardware calibration.
@@ -120,12 +120,38 @@ def score_recording(folder,begin,end,goal):
     return result
 
 
+
+def score_payload_recording(folder,approach):
+    """Offline physical acceptance; never used to advance robot actions."""
+    import rosbag
+    close=next(e['sim_s'] for e in approach['events'] if e['event']=='lio_controlled_close_requested')
+    done=next(e['sim_s'] for e in approach['events'] if e['event']=='contact_hold_and_lio_fk_extraction_completed')
+    baseline=[];held=[]
+    with rosbag.Bag(str(folder/'audit.bag')) as bag:
+        for _,m,_ in bag.read_messages(topics=['/grasp_audit/truth']):
+            t=m.header.stamp.to_sec()
+            if not m.target_present:continue
+            z=m.target_pose.position.z
+            if close-.5<=t<=close:baseline.append(z)
+            if done-4.5<=t<=done:held.append((t,z,bool(m.fixed_grasp_forbidden_contact)))
+    if len(baseline)<10 or len(held)<100:raise RuntimeError('Offline payload scoring coverage insufficient')
+    initial=float(np.median(baseline));minimum=min(z-initial for _,z,_ in held)
+    result=dict(scoring_only_after_shutdown=True,ground_truth_control_inputs=False,
+        actual_payload_lift_min_m=minimum,held_duration_s=held[-1][0]-held[0][0],
+        forbidden_contact=any(x[2] for x in held),samples=len(held),
+        passed=minimum>=.025 and held[-1][0]-held[0][0]>=4.3 and not any(x[2] for x in held))
+    save(folder/'grasp_offline_score.json',result)
+    return result
+
+
 def main():
     ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('name');ap.add_argument('--gui',action='store_true');ap.add_argument('--observe-target',action='store_true',help='LIO-paired target and FK observation');ap.add_argument('--inspect-ik',action='store_true',help='Read-only native IK and local clearance checks after FK observation');ap.add_argument('--navigate-candidate',action='store_true',help='Fly folded to the LIO-derived candidate');ap.add_argument('--approach-lio',action='store_true',help='Includes observation, IK, navigation and velocity fusion; LIO/FK unfold and 40mm preapproach, never close')
+    ap.add_argument('--grasp-lio',action='store_true',help='Same LIO route, then native contact-only close, 40mm tool extraction and hold')
     ap.add_argument('--fuse-lio-velocity',action='store_true',help='Test source-midpoint LIO pose+velocity through standard MAVROS odometry')
     args=ap.parse_args()
     # A later stage includes its prerequisites. One LIO approach command
     # selects the validated pose+velocity transport and all read-only checks.
+    if args.grasp_lio:args.approach_lio=True
     if args.fuse_lio_velocity and not args.approach_lio:ap.error('--fuse-lio-velocity requires --approach-lio')
     if args.approach_lio:args.navigate_candidate=args.fuse_lio_velocity=True
     if args.navigate_candidate:args.inspect_ik=True
@@ -154,7 +180,10 @@ def main():
     model.find('pose').text='0 0 .45 0 0 0'
     bridge=model.find("plugin[@name='mavlink_interface']")
     for el in list(bridge):
-        if el.tag in ('enableArmGraspFeedback','send_odometry','visionSubTopic'):bridge.remove(el)
+        if el.tag in ('enableArmGraspFeedback','armGraspContactOnly','send_odometry','visionSubTopic'):bridge.remove(el)
+    if args.approach_lio:
+        ET.SubElement(bridge,'enableArmGraspFeedback').text='true'
+        ET.SubElement(bridge,'armGraspContactOnly').text='true'
     if any(e.get('filename')=='libgazebo_vision_plugin.so' for e in model.findall('plugin')):raise RuntimeError('Ground-truth localization source present')
     scene.write(folder/'scene.world',encoding='unicode',xml_declaration=True)
     mavros=Path(sp.check_output(['rospack','find','mavros'],env=env,text=True).strip())/'launch'
@@ -162,9 +191,9 @@ def main():
     if args.fuse_lio_velocity:cfg['odometry']['fcu']['odom_parent_id_des']='map'
     save(folder/'mavros_config.json',cfg);launch=ET.parse(mavros/'px4.launch')
     launch.find("include/arg[@name='config_yaml']").set('value',str(folder/'mavros_config.json'));launch.write(folder/'mavros.launch')
-    save(folder/'manifest.json',dict(stage='LIO_FK_NO_CLOSE_APPROACH' if args.approach_lio else 'LIO_CANDIDATE_NAVIGATION_NO_ARM_MOTION' if args.navigate_candidate else 'LIO_TARGET_OBSERVATION_NO_ARM_MOTION' if args.observe_target else 'LIO_LOCAL_FLIGHT_NO_ARM_MOTION',ground_truth_control_inputs=False,
+    save(folder/'manifest.json',dict(stage='LIO_CONTACT_FIXED_GRASP' if args.grasp_lio else 'LIO_FK_NO_CLOSE_APPROACH' if args.approach_lio else 'LIO_CANDIDATE_NAVIGATION_NO_ARM_MOTION' if args.navigate_candidate else 'LIO_TARGET_OBSERVATION_NO_ARM_MOTION' if args.observe_target else 'LIO_LOCAL_FLIGHT_NO_ARM_MOTION',ground_truth_control_inputs=False,
         gazebo_vision_plugin=False,lio_alignment_source='FIRST_LIO_BODY_POSE',ekf_parameters=parameters,
-        target_observation=args.observe_target,encoder_fk_observation=args.observe_target,read_only_ik_inspection=args.inspect_ik,candidate_navigation=args.navigate_candidate,lio_fk_approach=args.approach_lio,closing_allowed=False,external_velocity_fused=args.fuse_lio_velocity,
+        target_observation=args.observe_target,encoder_fk_observation=args.observe_target,read_only_ik_inspection=args.inspect_ik,candidate_navigation=args.navigate_candidate,lio_fk_approach=args.approach_lio,closing_allowed=args.grasp_lio,grasp_feedback_source='SIM_CONTACT_NO_OBJECT_POSE' if args.approach_lio else 'DISABLED',external_velocity_fused=args.fuse_lio_velocity,
         external_odometry_source='LIO_TWO_POSE_SOURCE_MIDPOINT' if args.fuse_lio_velocity else 'LIO_SCAN_END_POSE_ONLY',
         external_odometry_stddev=dict(position_m=.05,orientation_rad=.03,velocity_m_s=LIO_VELOCITY_STD,angular_velocity_rad_s=.05) if args.fuse_lio_velocity else None,
         observation_local_goal_m=[.3,0,.9],sim_speed_factor=speed))
@@ -224,7 +253,7 @@ def main():
     def health():
         if latest.get('external_error'):raise RuntimeError('LIO external odometry: '+latest['external_error'])
         if any(p.poll() is not None for p in procs):raise RuntimeError('Own process exited')
-        if time.monotonic()-started>(400 if args.approach_lio else 200)/speed:raise RuntimeError('Wall watchdog')
+        if time.monotonic()-started>(500 if args.grasp_lio else 400 if args.approach_lio else 200)/speed:raise RuntimeError('Wall watchdog')
     try:
         core=start('roscore',['roscore']);deadline=time.monotonic()+20
         while not rosgraph.is_master_online():
@@ -252,7 +281,7 @@ def main():
         if args.navigate_candidate:
             subs.append(rospy.Subscriber('/cloud_registered',PointCloud2,clouds.append,queue_size=5,tcp_nodelay=True))
         start('audit',['rosbag','record','--lz4','-O',str(folder/'audit.bag'),'/grasp_audit/truth','/lidar_slam/odom',
-            '/mavros/local_position/odom','/mavros/odometry/out','/mavros/state','/so101/joint_states','/fastlio_sim/alignment','/grasp_demo/known_setpoint','__name:=lio_hover_audit_recorder'])
+            '/clock','/mavros/local_position/odom','/mavros/odometry/out','/mavros/state','/so101/joint_states','/fastlio_sim/alignment','/grasp_demo/known_setpoint','__name:=lio_hover_audit_recorder'])
         start('gazebo',['gzserver','--verbose','--seed','123','-s','libgazebo_ros_api_plugin.so',str(folder/'scene.world')])
         if args.gui:start('gui',['gzclient'])
         px4=start('px4',[str(BUILD/'bin/px4'),'-d',str(BUILD/'etc')],folder/'rootfs')
@@ -292,6 +321,19 @@ def main():
         if any(node!='/lio_hover_audit_recorder' for topic,nodes in graph[1] if topic=='/grasp_audit/truth' for node in nodes):
             raise RuntimeError('Truth entered a control node')
         check_external_graph(graph)
+        if args.approach_lio:
+            from check_fixed_target_native import evidence_json
+            contact=native.status('arm_grasp_feedback')
+            unknown=[contact.get(k) for k in ('object_height_world','body_support_clearance','vertical_force_n')]
+            unknown+=contact.get('object_center_gripper',[])
+            if (contact.get('source')!=2 or contact.get('profile_id')!=1 or contact.get('target_id')!=1
+                    or not int(contact.get('capabilities',0))&1 or int(contact['capabilities'])&~3
+                    or len(unknown)!=6 or not all(isinstance(x,float) and math.isnan(x) for x in unknown)):
+                raise RuntimeError('Contact-only feedback contract failed')
+            age=(1e6*rospy.Time.now().to_sec()-contact['timestamp_sample'])*1e-6
+            if not -.02<=age<=.3:raise RuntimeError('Contact-only feedback stale')
+            save(folder/'contact_preflight.json',evidence_json(contact))
+            result['contact_only_feedback_verified']=True
         start('manager',['rosrun','super_px4_bridge','super_flight_manager_node','_known_goal_mode:=true','_auto_arm:=true',
             '_takeoff_height:=.9','_hover_stable_time:=2.0','__name:=lio_hover_manager'])
         pub=rospy.Publisher('/grasp_demo/known_setpoint',KnownFlightSetpoint,queue_size=1)
@@ -299,7 +341,7 @@ def main():
         with (folder/'telemetry.jsonl').open('w') as log:
             while True:
                 health();now=rospy.Time.now().to_sec();odom=latest.get('odom');lio=latest.get('lio');state=latest.get('state');manager=latest.get('manager')
-                if now>(320 if args.approach_lio else 170 if args.navigate_candidate else 110):raise RuntimeError('Simulation-time flight deadline')
+                if now>(400 if args.grasp_lio else 320 if args.approach_lio else 170 if args.navigate_candidate else 110):raise RuntimeError('Simulation-time flight deadline')
                 if route is None and now-begin>30 and manager and manager.data!='HOVER_READY':
                     raise RuntimeError('Takeoff did not reach stable hover within 30 simulation seconds')
                 if not (odom and lio and state and manager):time.sleep(.01);continue
@@ -394,7 +436,8 @@ def main():
                     row=tool_observer.sample(now)
                     if row is not None:
                         last_tool_row=row
-                        tool_log.write(json.dumps(row,allow_nan=False)+'\n');tool_log.flush();tool_count+=1
+                        if not result.get('fk_observation_completed'):
+                            tool_log.write(json.dumps(row,allow_nan=False)+'\n');tool_log.flush();tool_count+=1
                         if tool_start is None:tool_start=row['stamp_s']
                         if row['stamp_s']-tool_start>=3. and tool_count>=20:
                             result['fk_observation_completed']=True
@@ -531,8 +574,8 @@ def main():
                         from lio_approach_probe import LioApproachProbe
                         approach_probe=LioApproachProbe(native,tool_observer,config,plan.geometry_profile,
                             inspection['candidate'],inspection['result']['unfold_precheck']['final_q'],
-                            folder/'lio_approach',latest,folder/'scene.world',np.load(folder/'approach_map_returns.npy'))
-                        approach_probe.start();print('LIO/FK no-close approach adapter started; matching terminal flight binding follows',flush=True)
+                            folder/'lio_approach',latest,folder/'scene.world',np.load(folder/'approach_map_returns.npy'),grasp=args.grasp_lio)
+                        approach_probe.start();print('LIO/FK native '+('contact grasp' if args.grasp_lio else 'no-close approach')+' adapter started; matching terminal flight binding follows',flush=True)
                     if approach_probe is not None:
                         if approach_probe.error:raise RuntimeError('LIO approach: '+approach_probe.error)
                         if approach_probe.complete:
@@ -563,18 +606,24 @@ def main():
         for log in logs:log.close()
         if candidate_samples:save(folder/'candidate_navigation_samples.json',candidate_samples)
         signal.signal(signal.SIGINT,old_interrupt)
-    if result.get('control_flight_completed') and (not args.observe_target or result.get('fk_observation_completed')) and end is not None:
+    all_stopped=all(p.poll() is not None for p in procs)
+    if all_stopped and result.get('control_flight_completed') and (not args.observe_target or result.get('fk_observation_completed')) and end is not None:
         try:
             result['offline_score']=score_recording(folder,begin,end,goal)
             result['success']=result['offline_score']['passed'] and (not args.observe_target or result['offline_score'].get('target',{}).get('passed',False) and result['offline_score'].get('tool',{}).get('passed',False))
         except Exception as e:result['offline_score_error']=str(e)
     result.update(ground_truth_control_inputs=False,arm_motion_requested=bool(approach_probe and approach_probe.motion_requested),
         external_velocity_fused=args.fuse_lio_velocity,external_odometry_samples=external_count,external_odometry_max_age_s=external_max_age,
-        own_processes_stopped=all(p.poll() is not None for p in procs),wall_elapsed_s=time.monotonic()-started)
+        own_processes_stopped=all_stopped,wall_elapsed_s=time.monotonic()-started)
     if not result['own_processes_stopped'] or result.get('observation_cleanup_error') or result.get('inspection_cleanup_error'):result['success']=False
     if args.inspect_ik and not result.get('ik_inspection',{}).get('inspection_verified'):result['success']=False
     if args.navigate_candidate and not result.get('candidate_navigation',{}).get('completed'):result['success']=False
     if args.approach_lio and not result.get('lio_approach',{}).get('completed'):result['success']=False
+    if args.grasp_lio and all_stopped and result.get('lio_approach',{}).get('completed'):
+        try:
+            result['payload_offline_score']=score_payload_recording(folder,result['lio_approach'])
+            result['success']=result['success'] and result['payload_offline_score']['passed']
+        except Exception as e:result['success']=False;result['payload_offline_score_error']=str(e)
     save(folder/'result.json',result);print(json.dumps(result,indent=2),flush=True)
     return 0 if result['success'] else 2
 
