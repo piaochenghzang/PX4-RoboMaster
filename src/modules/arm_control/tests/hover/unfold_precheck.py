@@ -120,9 +120,14 @@ def inspect_unfold(client,row,config,geometry,q_reference,folder):
         return native
     try:
         route.append(dict(stage='folded_start',q=q.copy(),tcp_arm=tcp(q),geometry=geometry_at(q)))
-        # Exactly the existing first stage: wrist only, +1.3 -> -1.3.
-        for wrist in np.linspace(START[3],UNFOLDED[3],131)[1:]:
-            next_q=START.copy();next_q[3]=wrist;append('wrist_unfold',next_q)
+        # Same native unfold, including its tiny inward elbow co-motion while
+        # recovering from the known folded TCP below the workspace.
+        for _ in range(140):
+            target=UNFOLDED.copy()
+            if tcp(q)[2,3]<.022:target[2]-=.001
+            if np.max(np.abs(target-q))<1e-7:break
+            append('wrist_unfold',q+np.clip(target-q,-.02,.02))
+        else:raise RuntimeError('Read-only unfold did not converge')
         # Retain only the first existing transit waypoint. Later old waypoints
         # enter the contact region, outside this no-contact inspection.
         pre=candidate['pre_goal']['arm_from_desired_tcp']

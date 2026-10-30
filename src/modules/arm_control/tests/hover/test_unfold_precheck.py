@@ -124,5 +124,38 @@ class WorkspaceRecoveryTests(unittest.TestCase):
                 workspace_transition(start, end)
 
 
+class ProductionFoldRecoveryTests(unittest.TestCase):
+    def test_small_wrist_only_step_reproduces_outward_arc(self):
+        from fixed_demo_plan import START
+        from check_approach_route import fk
+        next_q=START.copy();next_q[3]-=.005
+        self.assertLess(fk(next_q)[2],fk(START)[2])
+        self.assertFalse(workspace_transition(fk(START),fk(next_q)))
+
+    def test_budget_scaled_coupled_first_steps_recover_inward(self):
+        from fixed_demo_plan import START
+        from check_approach_route import fk
+        for scale in (.01,.05,.1,.25,.5,1.):
+            next_q=START+scale*np.array([0.,0.,-.001,-.02,0.])
+            with self.subTest(scale=scale):
+                self.assertTrue(workspace_transition(fk(START),fk(next_q)))
+
+    def test_coupled_unfold_restores_exact_original_posture_inside_workspace(self):
+        from fixed_demo_plan import START,UNFOLDED
+        from check_approach_route import fk
+        for scale in (.05,.25,1.):
+            q=START.copy()
+            for _ in range(4000):
+                goal=UNFOLDED.copy()
+                if fk(q)[2]<.022:goal[2]-=.001
+                if np.max(np.abs(goal-q))<.001:break
+                following=q+scale*np.clip(goal-q,-.02,.02)
+                self.assertTrue(workspace_transition(fk(q),fk(following)))
+                q=following
+            else:self.fail('Coupled unfold did not converge')
+            self.assertLess(np.max(np.abs(q-UNFOLDED)),.001)
+            self.assertAlmostEqual(q[2],UNFOLDED[2],places=6)
+
+
 if __name__ == '__main__':
     unittest.main()
