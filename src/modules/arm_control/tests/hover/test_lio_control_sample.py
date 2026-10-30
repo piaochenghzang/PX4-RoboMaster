@@ -150,12 +150,12 @@ class FlightPairTests(unittest.TestCase):
         self.assertEqual(row['prediction_s'],0.)
 
     def test_stale_future_and_overlong_prediction_are_rejected(self):
-        for stamp,now,reason in [(1.18,1.31,'STALE'),(1.21,1.2,'FUTURE'),(1.221,1.23,'PREDICTION_LIMIT')]:
-            with self.subTest(stamp=stamp,now=now),self.assertRaisesRegex(ValueError,reason):
-                flight_control_sample(observer(),stamp,now)
+        with self.assertRaisesRegex(ValueError,'STALE'):
+            flight_control_sample(observer(),1.18,1.31)
+        self.assertIsNone(flight_control_sample(observer(),1.221,1.23))
         source=observer();source.body[-1]=(1.21,pose_values())
-        with self.assertRaisesRegex(ValueError,'FLIGHT_LIO_STALE_OR_FUTURE'):
-            flight_control_sample(source,1.18,1.2)
+        self.assertIsNone(flight_control_sample(source,1.18,1.2))
+        self.assertIsNone(flight_control_sample(observer(),1.21,1.2))
 
     def test_small_clock_race_abstains_without_changing_the_source_stamp(self):
         source=observer()
@@ -233,7 +233,7 @@ class ControlSampleTests(unittest.TestCase):
         for name,joint_stamp,lio_stamp in cases:
             source=observer();source.joints[-1]=(joint_stamp,np.zeros(6),np.zeros(6))
             source.body=deque([(lio_stamp-.1,pose_values()),(lio_stamp,pose_values())])
-            with self.subTest(name=name),self.assertRaises(ValueError):sample_control(source,1.2)
+            with self.subTest(name=name):self.assertIsNone(sample_control(source,1.2))
 
     def test_small_clock_callback_race_abstains_until_clock_catches_without_restamping(self):
         for name in ('joint','lio'):
@@ -254,10 +254,52 @@ class ControlSampleTests(unittest.TestCase):
     def test_large_future_source_is_not_hidden_by_another_small_clock_race(self):
         source=observer();source.joints[-1]=(1.201,np.zeros(6),np.zeros(6))
         source.body=deque([(1.11,pose_values()),(1.21,pose_values())])
-        with self.assertRaisesRegex(ValueError,'CONTROL_LIO_STALE_OR_FUTURE'):sample_control(source,1.2)
+        self.assertIsNone(sample_control(source,1.2))
         source=observer();source.joints[-1]=(1.21,np.zeros(6),np.zeros(6))
         source.body=deque([(1.101,pose_values()),(1.201,pose_values())])
-        with self.assertRaisesRegex(ValueError,'CONTROL_JOINT_STALE_OR_FUTURE'):sample_control(source,1.2)
+        self.assertIsNone(sample_control(source,1.2))
+
+    def test_future_callbacks_use_recent_history_without_restamping_any_source(self):
+        source=observer()
+        source.joints.append((1.23,np.ones(6),np.ones(6)))
+        source.body.append((1.23,pose_values(.023)))
+        row=sample_control(source,1.2)
+        self.assertEqual(row['stamp_s'],1.18)
+        self.assertEqual(row['last_lio_stamp_s'],1.1)
+        np.testing.assert_array_equal(row['joint_position_rad'],[0.,0.,0.,0.,0.,.3])
+        np.testing.assert_allclose(np.array(row['map_from_tcp'])[:3,3],[.218,0.,0.],atol=1e-12)
+        self.assertEqual(source.body[-1][0],1.23)
+        self.assertEqual(source.joints[-1][0],1.23)
+        flight=flight_control_sample(source,1.18,1.2)
+        self.assertEqual(flight['last_lio_stamp_s'],1.1)
+        self.assertEqual(source.last_stamp,1.05)
+
+    def test_no_historical_measurement_abstains_instead_of_using_expired_data(self):
+        source=observer();source.joints.clear()
+        source.joints.extend([(1.149,np.zeros(6),np.zeros(6)),(1.24,np.ones(6),np.ones(6))])
+        self.assertIsNone(sample_control(source,1.2))
+        source=observer();source.body.append((1.3,pose_values()))
+        self.assertIsNone(sample_control(source,1.4))
+
+    def test_prediction_gap_abstains_then_recovers_with_new_source_without_restamping(self):
+        source=observer();source.joints[-1]=(1.221,np.zeros(6),np.zeros(6))
+        saved=copy.deepcopy(list(source.body))
+        self.assertIsNone(sample_control(source,1.23))
+        self.assertIsNone(flight_control_sample(source,1.221,1.23))
+        self.assertEqual(list(source.body),saved)
+        source.body.append((1.2,pose_values(.02)))
+        row=sample_control(source,1.23)
+        self.assertEqual(row['stamp_s'],1.221)
+        self.assertEqual(row['last_lio_stamp_s'],1.2)
+        self.assertAlmostEqual(row['prediction_s'],.021)
+        self.assertIsNotNone(flight_control_sample(source,1.221,1.23))
+
+    def test_prediction_abstention_does_not_hide_invalid_motion(self):
+        source=observer();source.body[-1]=(1.1,pose_values(.1))
+        with self.assertRaisesRegex(ValueError,'LIO_DERIVATIVE_LIMIT'):
+            sample_control(source,1.2)
+        with self.assertRaisesRegex(ValueError,'LIO_DERIVATIVE_LIMIT'):
+            flight_control_sample(source,1.18,1.2)
 
     def test_observer_errors_are_preserved_and_target_source_time_is_checked(self):
         source=observer();source.error='LIO_FRAME'

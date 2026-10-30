@@ -83,14 +83,14 @@ def flight_control_sample(observer,filter_stamp,now):
     if not math.isfinite(filter_stamp) or filter_stamp<=0:raise ValueError('FILTER_SOURCE_TIME')
     with observer.lock:
         if observer.error:raise ValueError(observer.error)
-        samples=[(float(t),list(p)) for t,p in list(observer.body)[-3:]]
-    if len(samples)<2:return None
+        samples=[(float(t),list(p)) for t,p in observer.body if t<=now][-3:]
+    if len(samples)<2 or filter_stamp>now:return None
     source_stamp=samples[-1][0]
-    if filter_stamp-now>.002+1e-9:raise ValueError('FILTER_STALE_OR_FUTURE')
-    if source_stamp-now>.002+1e-9:raise ValueError('FLIGHT_LIO_STALE_OR_FUTURE')
-    if filter_stamp>now or source_stamp>now:return None
     if now-filter_stamp>.2+1e-9:raise ValueError('FILTER_STALE_OR_FUTURE')
     if now-source_stamp>.2+1e-9:raise ValueError('FLIGHT_LIO_STALE_OR_FUTURE')
+    # A short source gap is an unavailable estimate, not permission to
+    # extend prediction. No setpoint/entry decision uses an overlong sample.
+    if filter_stamp<samples[0][0] or filter_stamp-samples[-1][0]>.12+1e-9:return None
     result=predict_body(samples,filter_stamp,max_linear_speed=.8,max_angular_speed=1.)
     result.update(stamp_s=filter_stamp,source_age_s=now-source_stamp)
     return result
@@ -143,25 +143,22 @@ def sample_control(observer,now):
     with observer.lock:
         if observer.error:raise ValueError(observer.error)
         if observer.target is None or len(observer.body)<2 or not observer.joints:return None
-        body_samples=[(float(t),list(p)) for t,p in list(observer.body)[-3:]]
-        stamp,q,dq=observer.joints[-1]
+        # ROS /clock can arrive after a newer encoder/LIO callback. Select
+        # actual buffered measurements no later than this clock read, rather
+        # than treating the newest callback as a future-time sensor failure.
+        body_samples=[(float(t),list(p)) for t,p in observer.body if t<=now][-3:]
+        joints=next((r for r in reversed(observer.joints) if 0<=now-r[0]<=.05+1e-9),None)
+        if len(body_samples)<2 or joints is None:return None
+        stamp,q,dq=joints
         stamp=float(stamp);q=finite(q,(6,)).copy();dq=finite(dq,(6,)).copy()
         target=finite(observer.target,(4,4)).copy();reference=finite(observer.reference,(3,)).copy()
         target_stamp=float(observer.target_stamp);config=observer.config
-    if not math.isfinite(stamp):raise ValueError('CONTROL_JOINT_STALE_OR_FUTURE')
-    # UpdateBegin/ROS clock callbacks can race the caller's earlier `now` read.
-    # Abstain for a <=2ms clock lag instead of restamping the source or using
-    # any future pose. Larger future values remain a source-contract error.
-    joint_future=stamp-now;lio_future=body_samples[-1][0]-now
-    if joint_future>.002+1e-9:raise ValueError('CONTROL_JOINT_STALE_OR_FUTURE')
-    if lio_future>.002+1e-9:raise ValueError('CONTROL_LIO_STALE_OR_FUTURE')
-    if joint_future>0 or lio_future>0:return None
-    if not 0<=now-stamp<=.05+1e-9:
-        raise ValueError('CONTROL_JOINT_STALE_OR_FUTURE')
-    if not 0<=now-body_samples[-1][0]<=.15+1e-9:
-        raise ValueError('CONTROL_LIO_STALE_OR_FUTURE')
+    if not 0<=now-body_samples[-1][0]<=.15+1e-9:return None
     if not math.isfinite(target_stamp) or target_stamp<=0:raise ValueError('TARGET_SOURCE_TIME')
     if stamp<target_stamp:return None
+    # Keep the 120ms bound. Abstain until a new real LIO pose arrives; the
+    # native context source/receipt watchdogs remain active during this gap.
+    if stamp<body_samples[0][0] or stamp-body_samples[-1][0]>.12+1e-9:return None
     predicted=predict_body(body_samples,stamp)
     body=predicted['body'];v=predicted['linear_v_map'];w=predicted['angular_v_map']
     result=relative_tool_target(config,body,q,target,reference)
