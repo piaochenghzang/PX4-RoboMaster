@@ -8,6 +8,7 @@ uint32 target_id
 uint8 source_system
 uint8 source_component
 uint8 SOURCE_SIM_GROUND_TRUTH = 1
+uint8 SOURCE_SIM_CONTACT = 2
 uint8 source
 uint16 CAP_CONTACT = 1
 uint16 CAP_FORCE = 2
@@ -25,7 +26,7 @@ float32 other_fraction
 float32 support_arm_fraction
 float32 fixed_normal_n
 float32 moving_normal_n
-float32 vertical_force_n
+float32 vertical_force_n # source 1 world diagnostic only; unknown for contact-only source 2
 float32[3] object_center_gripper # m, actual gripper_link frame, not FK tool frame
 float32 object_height_world # m, simulation ground truth only
 float32 body_support_clearance # m, signed world +Y separation for this bench

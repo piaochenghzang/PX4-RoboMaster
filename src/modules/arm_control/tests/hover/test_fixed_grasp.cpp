@@ -15,6 +15,14 @@ FixedInput healthy()
     f.frames=100;f.sequence=1;f.epoch=1;f.source_identity=42;f.object_height=1.5f;f.jaw_speed=0;
     return v;
 }
+FixedInput contactInput(uint16_t capabilities=1)
+{
+    auto v=healthy();v.contact_only=true;v.feedback.capabilities=capabilities;
+    v.feedback.object_height=v.feedback.clearance=NAN;
+    v.feedback.object_local=v.feedback.alignment_delta_base={NAN,NAN,NAN};
+    if (!(capabilities&2)) v.feedback.fixed_force=v.feedback.moving_force=NAN;
+    return v;
+}
 FixedAction tick(FixedGrasp &g,FixedInput &v)
 {
     v.motion.now+=100000;++v.feedback.sequence;return g.step(v);
@@ -163,5 +171,105 @@ int main()
     { auto v=healthy();FixedGrasp g;closeAndLift(g,v);v.jaw_sweep_valid=false;
       auto a=tick(g,v);assert(g.phase==FixedPhase::Fault && g.fault==FixedFault::Geometry && a.stop);
       ++cases; } // Full-stroke loss while carrying is NOT ignored.
+    { auto v=contactInput();FixedGrasp g;
+      g.request(1,4,v.motion.binding,v);assert(g.phase==FixedPhase::Approach && std::isnan(g.actual_lift));
+      g.request(2,5,v.motion.binding,v);for(int n=0;n<12;++n)tick(g,v);assert(g.phase==FixedPhase::Close);
+      // Contact fractions alone, even bilateral=1, do not claim force.
+      v.feedback.bilateral=1;for(int n=0;n<20;++n)tick(g,v);
+      assert(g.phase==FixedPhase::Close && std::isnan(g.actual_lift));++cases;
+    }
+    { auto v=contactInput();FixedGrasp g;
+      g.request(1,4,v.motion.binding,v);g.request(2,5,v.motion.binding,v);
+      for(int n=0;n<12;++n)tick(g,v);
+      v.feedback.bilateral=1;v.feedback.fixed_force=v.feedback.moving_force=.1f;
+      tick(g,v);assert(g.phase==FixedPhase::Close); // Unclaimed force values cannot authorize Verify.
+      v.feedback.capabilities=3;tick(g,v);assert(g.phase==FixedPhase::Verify);
+      for(int n=0;n<12;++n)tick(g,v);
+      assert(g.phase==FixedPhase::Lift && std::isnan(g.actual_lift) && g.tool_progress==0);++cases;
+    }
+    { auto v=contactInput(3);FixedGrasp g;closeAndLift(g,v);
+      v.motion.measured=v.motion.accepted=v.lift_goal;
+      for(int n=0;n<12;++n)tick(g,v);assert(g.phase==FixedPhase::Hold);
+      for(int n=0;n<52;++n)tick(g,v);
+      assert(g.phase==FixedPhase::Done && std::isnan(g.actual_lift));
+      assert(std::abs(g.tool_progress-.04f)<1e-6f && std::isnan(v.feedback.object_height));++cases;
+    } // Contact retention plus measured tool extraction is not object-height observation.
+    { auto v=contactInput(3);FixedGrasp g;closeAndLift(g,v);
+      // A changed body/arm frame moves all current coordinates together; it
+      // does not constitute tool extraction from the map-fixed grasp goal.
+      v.motion.goal={.31f,.11f,.19f};v.lift_goal={.35f,.11f,.19f};
+      v.motion.measured=v.motion.accepted=v.motion.goal;
+      for(int n=0;n<15;++n)tick(g,v);
+      assert(g.phase==FixedPhase::Lift && std::abs(g.tool_progress)<1e-6f && std::isnan(g.actual_lift));
+      // Rotate the current lift axis too: the same 40mm progress is invariant
+      // under that common frame change, unlike a stored arm-frame TCP delta.
+      v.motion.measured=v.motion.accepted=v.lift_goal;
+      for(int n=0;n<12;++n)tick(g,v);
+      assert(g.phase==FixedPhase::Hold && std::abs(g.tool_progress-.04f)<1e-6f);++cases;
+    }
+    { auto v=contactInput(3);FixedGrasp g;
+      v.motion.measured.z-=.002f;closeAndLift(g,v);
+      tick(g,v);assert(std::abs(g.tool_progress)<1e-6f);
+      v.motion.measured=v.motion.accepted=v.lift_goal;tick(g,v);
+      assert(std::abs(g.tool_progress-.038f)<1e-6f && std::isnan(g.actual_lift));++cases;
+    } // The Verify projection offset is the baseline, not an assumed zero error.
+    { auto v=contactInput(3);FixedGrasp g;
+      g.request(1,4,v.motion.binding,v);g.request(2,5,v.motion.binding,v);
+      for(int n=0;n<12;++n)tick(g,v);
+      v.feedback.bilateral=1;v.feedback.fixed_force=.1f;v.feedback.moving_force=0;
+      for(int n=0;n<12;++n)tick(g,v);assert(g.phase==FixedPhase::Close);
+      v.feedback.moving_force=.1f;tick(g,v);assert(g.phase==FixedPhase::Verify);++cases;
+    }
+    { auto v=contactInput(3);v.feedback.fixed_force=NAN;FixedGrasp g;
+      g.request(1,4,v.motion.binding,v);assert(!g.owns());++cases;
+    } // A declared force capability still rejects nonfinite claimed force.
+    { auto v=contactInput(3);FixedGrasp g;g.request(1,4,v.motion.binding,v);
+      v.feedback.moving_force=NAN;auto a=tick(g,v);
+      assert(g.phase==FixedPhase::Fault && a.stop);++cases;
+    }
+    { auto v=contactInput();v.feedback.bilateral=NAN;FixedGrasp g;
+      g.request(1,4,v.motion.binding,v);assert(!g.owns());++cases;
+    } // Declared contact evidence is checked even when force is unavailable.
+    { for(uint16_t cap:{uint16_t(0),uint16_t(2),uint16_t(7),uint16_t(15),uint16_t(31)}) {
+          auto v=contactInput(cap);FixedGrasp g;g.request(1,4,v.motion.binding,v);assert(!g.owns());
+      } ++cases;
+    } // Contact-only may not claim object, clearance or bench capabilities.
+    { for(uint16_t cap:{uint16_t(1),uint16_t(3),uint16_t(7)}) {
+          auto v=healthy();v.feedback.capabilities=cap;FixedGrasp g;
+          g.request(1,4,v.motion.binding,v);assert(!g.owns());
+      } ++cases;
+    } // The old source does not inherit contact-only's reduced capability set.
+    { auto v=contactInput(3);FixedGrasp g;g.request(1,4,v.motion.binding,v);
+      auto changed=healthy();changed.motion=v.motion;
+      g.request(2,5,v.motion.binding,changed);assert(g.phase==FixedPhase::Approach && g.request_result==3);
+      auto a=tick(g,changed);assert(g.phase==FixedPhase::Fault && g.fault==FixedFault::Feedback && a.stop);++cases;
+    }
+    { auto v=healthy();FixedGrasp g;g.request(1,4,v.motion.binding,v);
+      auto changed=contactInput(3);changed.motion=v.motion;
+      auto a=tick(g,changed);assert(g.phase==FixedPhase::Fault && g.fault==FixedFault::Feedback && a.stop);++cases;
+    } // Either source-category change after ownership is rejected, despite same IDs.
+    { auto v=contactInput(3);FixedGrasp g;closeAndLift(g,v);
+      v.feedback.capabilities=1;v.feedback.fixed_force=v.feedback.moving_force=NAN;
+      v.motion.hover_ready=false;for(int n=0;n<8;++n)tick(g,v);
+      assert(g.phase==FixedPhase::Fault && g.fault==FixedFault::Lost && std::isnan(g.actual_lift));++cases;
+    } // Losing force/contact evidence is monitored even while arm motion is paused.
+    { auto v=contactInput(3);FixedGrasp g;closeAndLift(g,v);
+      v.feedback.grasp_age=.31f;auto a=tick(g,v);
+      assert(g.phase==FixedPhase::Fault && g.fault==FixedFault::Feedback && a.stop);++cases;
+    }
+    { auto v=contactInput(3);FixedGrasp g;closeAndLift(g,v);
+      g.request(3,6,v.motion.binding,v);auto a=tick(g,v);
+      assert(g.phase==FixedPhase::Canceled && a.stop && !a.jaw && std::isnan(g.actual_lift));++cases;
+    }
+    { auto v=contactInput(3);FixedGrasp g;closeAndLift(g,v);
+      v.feedback.support=.1f;v.motion.measured=v.motion.accepted=v.lift_goal;
+      for(int n=0;n<15;++n)tick(g,v);assert(g.phase==FixedPhase::Lift);
+      v.feedback.support=0;for(int n=0;n<12;++n)tick(g,v);assert(g.phase==FixedPhase::Hold);
+      v.feedback.support=.1f;auto a=tick(g,v);
+      assert(g.phase==FixedPhase::Fault && g.fault==FixedFault::Support && a.stop);++cases;
+    } // Tool motion alone is insufficient when the object still touches support.
+    { auto v=healthy();FixedGrasp g;closeAndLift(g,v);v.feedback.object_local.x+=.046f;
+      auto a=tick(g,v);assert(g.phase==FixedPhase::Fault && g.fault==FixedFault::Lost && a.stop);++cases;
+    } // The old source retains its directly measured relative-object loss check.
     std::printf("PASS: %u fixed-grasp logic cases (synthetic; not physical grasp proof)\n",cases);
 }

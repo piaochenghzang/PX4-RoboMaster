@@ -32,20 +32,38 @@ so101_grasp::Input ArmControl::graspInput() const
     in.capabilities=f.capabilities; in.frames=f.contact_frames;
     in.bilateral=f.bilateral_fraction; in.support=f.support_fraction;
     in.other=f.other_fraction; in.support_arm=f.support_arm_fraction;
-    in.fixed_force=f.fixed_normal_n; in.moving_force=f.moving_normal_n;
-    in.object_height=f.object_height_world; in.clearance=f.body_support_clearance;
-    in.object_local={f.object_center_gripper[0],f.object_center_gripper[1],f.object_center_gripper[2]};
-    // FK tool frame differs from actual gripper_link by the fixed tool transform.
-    const float error[]{in.object_local.x-.0025f,in.object_local.y+.000218f,in.object_local.z+.088f};
-    float base_error[3]{};
-    for (int row=0; row<3; ++row) {
-        for (int col=0; col<3; ++col) {
-            for (int k=0; k<3; ++k) base_error[row]+=_measured_ee_pose.rotation(row,k)*_tool_tf(col,k)*error[col];
+    const bool force=f.capabilities&arm_grasp_feedback_s::CAP_FORCE;
+    const bool object=f.capabilities&arm_grasp_feedback_s::CAP_OBJECT;
+    const bool clearance=f.capabilities&arm_grasp_feedback_s::CAP_CLEARANCE;
+    in.fixed_force=force ? f.fixed_normal_n : NAN; in.moving_force=force ? f.moving_normal_n : NAN;
+    in.object_height=object ? f.object_height_world : NAN;
+    in.clearance=clearance ? f.body_support_clearance : NAN;
+    in.object_local=object ? so101_grasp::Point{f.object_center_gripper[0],f.object_center_gripper[1],f.object_center_gripper[2]} :
+        so101_grasp::Point{NAN,NAN,NAN};
+    in.alignment_delta_base={NAN,NAN,NAN};
+    if (object) {
+        // FK tool frame differs from actual gripper_link by the fixed tool transform.
+        const float error[]{in.object_local.x-.0025f,in.object_local.y+.000218f,in.object_local.z+.088f};
+        float base_error[3]{};
+        for (int row=0; row<3; ++row) {
+            for (int col=0; col<3; ++col) {
+                for (int k=0; k<3; ++k) base_error[row]+=_measured_ee_pose.rotation(row,k)*_tool_tf(col,k)*error[col];
+            }
         }
+        in.alignment_delta_base={base_error[0],base_error[1],base_error[2]};
     }
-    in.alignment_delta_base={base_error[0],base_error[1],base_error[2]};
-    in.finite=in.accepted_target.finite() && in.object_local.finite() && in.alignment_delta_base.finite()
-        && PX4_ISFINITE(in.position_error) && PX4_ISFINITE(in.jaw_speed) && PX4_ISFINITE(in.object_height);
+    const bool contact_source=f.source==arm_grasp_feedback_s::SOURCE_SIM_CONTACT;
+    in.finite=in.accepted_target.finite() && PX4_ISFINITE(in.position_error) && PX4_ISFINITE(in.jaw_speed) &&
+        (!contact_source || f.capabilities==arm_grasp_feedback_s::CAP_CONTACT ||
+            f.capabilities==(arm_grasp_feedback_s::CAP_CONTACT|arm_grasp_feedback_s::CAP_FORCE));
+    if (f.capabilities&arm_grasp_feedback_s::CAP_CONTACT) {
+        const float fractions[]{f.fixed_fraction,f.moving_fraction,in.bilateral,in.support,in.other,in.support_arm};
+        for (const float fraction:fractions) in.finite=in.finite && PX4_ISFINITE(fraction);
+    }
+    if (force) in.finite=in.finite && PX4_ISFINITE(in.fixed_force) && PX4_ISFINITE(in.moving_force) &&
+        (contact_source || PX4_ISFINITE(f.vertical_force_n));
+    if (object) in.finite=in.finite && in.object_local.finite() && in.alignment_delta_base.finite() && PX4_ISFINITE(in.object_height);
+    if (clearance) in.finite=in.finite && PX4_ISFINITE(in.clearance);
     in.strict_arrived=_arrival.arrived;
     return in;
 }

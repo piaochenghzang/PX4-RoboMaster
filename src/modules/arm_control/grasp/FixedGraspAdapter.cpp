@@ -6,7 +6,9 @@ void ArmControl::updateFixedGrasp(const arm_approach_request_s *request,const so
     using namespace so101_hover;
     FixedInput input{}; input.motion=motion; input.feedback=graspInput();
 #if defined(CONFIG_ARCH_BOARD_PX4_SITL)
-    input.profile=_hover_context.fixed_grasp && _grasp_feedback.source==arm_grasp_feedback_s::SOURCE_SIM_GROUND_TRUTH;
+    input.contact_only=_grasp_feedback.source==arm_grasp_feedback_s::SOURCE_SIM_CONTACT;
+    input.profile=_hover_context.fixed_grasp &&
+        (_grasp_feedback.source==arm_grasp_feedback_s::SOURCE_SIM_GROUND_TRUTH || input.contact_only);
 #endif
     constexpr float radii[ARM_DOF]{.51f,.45f,.33f,.20f,.13f};
     float anchor[ARM_DOF]{},measured[ARM_DOF]{};

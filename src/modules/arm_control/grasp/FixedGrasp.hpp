@@ -30,6 +30,7 @@ struct FixedInput {
     ApproachInput motion;
     so101_grasp::Input feedback;
     bool profile{false},close_ready{false},unfold_complete{false},jaw_sweep_valid{false};
+    bool contact_only{false}; // Source category, independent of the current force capability.
     Point lift_goal;
 };
 struct FixedAction {
@@ -42,14 +43,19 @@ public:
     bool carrying() const { return phase>=FixedPhase::Lift && phase<=FixedPhase::Done; }
     bool safe(const FixedInput &v) const {
         const auto &i=v.motion; const auto &f=v.feedback;
-        const float values[]{f.bilateral,f.support,f.other,f.support_arm,f.fixed_force,f.moving_force,f.object_height,f.jaw_speed};
+        const float values[]{f.bilateral,f.support,f.other,f.support_arm,f.jaw_speed};
         for(float x:values)if(!std::isfinite(x))return false;
+        if (!feedbackCapabilities(v) || (owns() && v.contact_only!=contact_mode)) return false;
+        if ((f.capabilities&2) && (!std::isfinite(f.fixed_force) || !std::isfinite(f.moving_force) ||
+                f.fixed_force<0 || f.moving_force<0)) return false;
+        if (!v.contact_only && (!std::isfinite(f.object_height) || !f.object_local.finite())) return false;
         return (!(phase>=FixedPhase::Close && phase<=FixedPhase::Done) || v.jaw_sweep_valid) &&
             v.profile && i.binding.valid() && i.context_fresh && i.lease_fresh && i.arm_ready &&
             i.geometry_valid && i.hard_hover_ok && std::isfinite(i.clearance) && i.clearance>.016f &&
             i.goal.finite() && i.accepted.finite() && i.measured.finite() && v.lift_goal.finite() &&
             std::abs((v.lift_goal-i.goal).norm()-fixedLiftDistance)<.001f &&
-            f.finite && f.capabilities==15 && f.profile==1 && f.target_id==1 &&
+            (!v.contact_only || std::isfinite(toolProjection(v))) &&
+            f.finite && f.profile==1 && f.target_id==1 &&
             f.joint_age<.2f && f.grasp_age<.3f && f.other>=0 && f.other<1e-6f &&
             f.support_arm>=0 && f.support_arm<1e-6f &&
             std::isfinite(i.joint_speed) && i.joint_speed>=0 &&
@@ -72,6 +78,7 @@ public:
         if (action!=4 || owns() || !b.valid() || !(b==v.motion.binding) || !safe(v) ||
             !v.motion.hover_ready || !v.motion.prepared) return;
         binding=b; epoch=v.feedback.epoch; identity=v.feedback.source_identity;
+        contact_mode=v.contact_only; actual_lift=contact_mode ? NAN : 0.f; tool_progress=NAN;
         enter(FixedPhase::Approach,v.motion.now); started=v.motion.now; request_result=1;
     }
     void fail(FixedFault why) {
@@ -89,7 +96,8 @@ public:
             else if (!(binding==i.binding) || !v.profile || !i.context_fresh || !i.lease_fresh || !i.hard_hover_ok)
                 fail(FixedFault::Contract);
             else if (!i.arm_ready || f.joint_age>=.2f || f.grasp_age>=.3f || !f.finite ||
-                f.capabilities!=15 || f.profile!=1 || f.target_id!=1 || f.epoch!=epoch || f.source_identity!=identity)
+                !feedbackCapabilities(v) || v.contact_only!=contact_mode ||
+                f.profile!=1 || f.target_id!=1 || f.epoch!=epoch || f.source_identity!=identity)
                 fail(FixedFault::Feedback);
             else if (!safe(v)) fail(FixedFault::Geometry);
             else if (i.now-started>240000000) fail(FixedFault::Timeout);
@@ -100,11 +108,19 @@ public:
         if (!i.hover_ready && !paused) { paused=true; stable_since=0; out.stop=true; return out; }
         const bool fresh=f.sequence!=last_sequence;
         if (fresh) last_sequence=f.sequence;
-        const bool both=f.frames && f.bilateral>=.9f && f.fixed_force>.01f && f.moving_force>.01f;
+        const bool both=(f.capabilities&2) && f.frames && f.bilateral>=.9f && f.fixed_force>.01f && f.moving_force>.01f;
         const bool unsupported=f.support<=.001f;
         if (carrying()) {
-            actual_lift=f.object_height-initial_height;
-            if ((f.object_local-grasp_reference).norm()>.045f) fail(FixedFault::Lost);
+            if (contact_mode) {
+                // This is tool extraction relative to the CURRENT world-fixed
+                // goal, expressed in the current arm frame. It is not a payload
+                // height measurement or a fabricated object pose.
+                tool_progress=toolProjection(v)-initial_tool_projection;
+                actual_lift=NAN;
+            } else {
+                actual_lift=f.object_height-initial_height;
+                if ((f.object_local-grasp_reference).norm()>.045f) fail(FixedFault::Lost);
+            }
             if (!both) {
                 if (!lost_since) lost_since=i.now;
                 if (i.now-lost_since>500000) fail(FixedFault::Lost);
@@ -127,15 +143,17 @@ public:
         } else if (phase==FixedPhase::Verify) {
             if (!both) enter(FixedPhase::Close,i.now);
             else if (fresh && dwell(both && std::abs(f.jaw_speed)<.02f,i.now,1000000)) {
-                initial_height=f.object_height; grasp_reference=f.object_local;
+                if (contact_mode) {
+                    initial_tool_projection=toolProjection(v); tool_progress=0.f; actual_lift=NAN;
+                } else { initial_height=f.object_height; grasp_reference=f.object_local; }
                 enter(FixedPhase::Lift,i.now);
             }
         } else if (phase==FixedPhase::Lift) {
-            if (dwell(actual_lift>=.025f && unsupported && both &&
+            if (dwell((contact_mode ? tool_progress : actual_lift)>=.025f && unsupported && both &&
                 (v.lift_goal-i.measured).norm()<=.005f,i.now,1000000)) enter(FixedPhase::Hold,i.now);
             if (i.now-entered>45000000) fail(FixedFault::Timeout);
         } else if (phase==FixedPhase::Hold) {
-            if (actual_lift<.025f || !both || !unsupported) { stable_since=0; }
+            if ((contact_mode ? tool_progress : actual_lift)<.025f || !both || !unsupported) { stable_since=0; }
             else if (dwell(true,i.now,5000000)) enter(FixedPhase::Done,i.now);
         }
         if (stop_pending) { stop_pending=false; out.stop=true; return out; }
@@ -159,10 +177,18 @@ public:
     }
     FixedPhase phase{FixedPhase::Idle}; FixedFault fault{FixedFault::None}; Binding binding;
     bool paused{false}; uint64_t last_id{0}; uint8_t request_result{0}; float actual_lift{0};
+    float tool_progress{NAN}; // Internal extraction estimate; never published as object lift.
 private:
     uint64_t entered{0},started{0},last_now{0},last_send{0},stable_since{0},lost_since{0};
     uint32_t epoch{0},last_sequence{0}; uint16_t identity{0};
-    bool stop_pending{false}; float initial_height{0}; Point grasp_reference;
+    bool stop_pending{false},contact_mode{false}; float initial_height{0},initial_tool_projection{0}; Point grasp_reference;
+    static bool feedbackCapabilities(const FixedInput &v) {
+        return v.contact_only ? (v.feedback.capabilities==1 || v.feedback.capabilities==3) : v.feedback.capabilities==15;
+    }
+    static float toolProjection(const FixedInput &v) {
+        const auto axis=v.lift_goal-v.motion.goal,offset=v.motion.measured-v.motion.goal;
+        return (axis.x*offset.x+axis.y*offset.y+axis.z*offset.z)/axis.norm();
+    }
     void enter(FixedPhase p,uint64_t now) { phase=p; entered=now; stable_since=0; }
     bool dwell(bool good,uint64_t now,uint64_t duration) {
         if (!good) { stable_since=0; return false; }
