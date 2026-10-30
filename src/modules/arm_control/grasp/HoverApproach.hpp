@@ -101,7 +101,7 @@ public:
     }
     void fail(ApproachFault f) { if (owns()) { fault=f; phase=ApproachPhase::Fault; stop_pending=true; } }
     Point step(const ApproachInput &i,bool &send,bool &stop) {
-        send=stop=false;
+        send=stop=false; max_joint_step=0;
         if (!owns()) return {};
         if (moving() || phase==ApproachPhase::Paused) {
             if (!(binding==i.binding)) fail(ApproachFault::BindingChanged);
@@ -125,16 +125,26 @@ public:
             if (i.now-stable_since>=1000000) phase=ApproachPhase::Holding;
         } else { stable_since=0; phase=ApproachPhase::Approaching; }
         const auto delta=i.goal-i.accepted; const float distance=delta.norm();
-        if (i.unfold_complete && distance>.001f && (!last_send || i.now-last_send>=100000) &&
+        // Smooth the old 3 mm/100 ms allowance without raising its 30 mm/s
+        // speed. Late callbacks and long pauses never accumulate catch-up
+        // travel. Keep last_send across pauses so a short resume cannot claim
+        // another first-step allowance before the 16 ms minimum interval.
+        const uint64_t elapsed=last_send ? i.now-last_send : 20000;
+        if (i.unfold_complete && distance>.001f && elapsed>=16000 &&
             (i.accepted-i.measured).norm()<=.015f && i.joint_speed<=.10f) {
+            const float seconds=float(elapsed>20000 ? 20000 : elapsed)*1e-6f;
+            const float travel=.03f*seconds;
+            // Preserve the old generic .02 rad/100 ms joint-target slew too.
+            max_joint_step=.2f*seconds;
             last_send=i.now; send=true;
-            return i.accepted+delta*(distance>.003f ? .003f/distance : 1.f);
+            return i.accepted+delta*(distance>travel ? travel/distance : 1.f);
         }
         return {};
     }
     Binding binding; ApproachPhase phase{ApproachPhase::Idle}; ApproachFault fault{ApproachFault::None};
     PauseReason pause_reason{PauseReason::None};
     uint64_t last_id{0}; uint8_t request_result{0}; float error{INFINITY};
+    float max_joint_step{0}; // Budget for this emitted step only; zero otherwise.
 private:
     uint64_t started{0},last_now{0},last_send{0},stable_since{0}; bool stop_pending{false};
 };

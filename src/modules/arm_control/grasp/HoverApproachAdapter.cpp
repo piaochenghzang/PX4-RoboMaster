@@ -100,8 +100,9 @@ so101_hover::TargetResult ArmControl::applyHoverUnfold(float max_joint_step,floa
     if (result==so101_hover::UnfoldResult::Invalid) return so101_hover::TargetResult::Rejected;
     if (result==so101_hover::UnfoldResult::Settled) {
         complete=true;
-        // Resume the existing fine trajectory cadence after measured settling.
-        ScheduleOnInterval(4_ms);
+        // Generic no-close compensation runs every 20 ms after unfolding;
+        // the existing fixed-grasp cadence remains 4 ms.
+        ScheduleOnInterval(_hover_approach.moving() ? 20_ms : 4_ms);
     } else if (result==so101_hover::UnfoldResult::Move) return applyHoverJoints(desired,unused_fraction);
     return so101_hover::TargetResult::Applied;
 }
@@ -146,7 +147,7 @@ void ArmControl::updateHoverApproach()
                 _approach_jaw_target=_joint_target[GRIPPER_INDEX];
                 _approach_unfold_selected=so101_hover::knownFoldedArm(anchor,measured);
                 _approach_unfold_complete=false; _approach_unfold_last_send=0;
-                if (_approach_unfold_selected) ScheduleOnInterval(50_ms);
+                ScheduleOnInterval(_approach_unfold_selected ? 50_ms : 20_ms);
             }
         }
 #endif
@@ -170,7 +171,7 @@ void ArmControl::updateHoverApproach()
             _hover_approach.fail(so101_hover::ApproachFault::IK); stopHoverMotion();
         }
     } else if (send) {
-        const auto outcome=applyHoverTarget(p,.02f,.5f);
+        const auto outcome=applyHoverTarget(p,_hover_approach.max_joint_step,.5f);
         if (outcome==so101_hover::TargetResult::WaitClearance) {
             _hover_approach.pause(so101_hover::PauseReason::Clearance); stopHoverMotion();
         } else if (outcome==so101_hover::TargetResult::Rejected) {

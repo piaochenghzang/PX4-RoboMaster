@@ -1,5 +1,6 @@
 #include "../../grasp/HoverApproach.hpp"
 #include "../../grasp/WristUnfold.hpp"
+#include <algorithm>
 #include <cassert>
 #include <limits>
 using namespace so101_hover;
@@ -17,7 +18,8 @@ int main() {
     { Approach a; auto i=good(); i.prepared=false; a.request(1,1,i.binding,i); assert(!a.owns()); ++count; }
     { Approach a; auto i=good(); auto b=i.binding; ++b.plan; a.request(1,1,b,i); assert(!a.owns()); ++count; }
     { Approach a; auto i=good(); begin(a,i); bool send,stop; auto p=a.step(i,send,stop);
-      assert(send && !stop && (p-i.accepted).norm()<=.003001f && p.z>i.accepted.z); ++count; }
+      assert(send && !stop && std::abs((p-i.accepted).norm()-.0006f)<2e-8f && p.z>i.accepted.z);
+      assert(std::abs(a.max_joint_step-.004f)<1e-8f); ++count; }
     { Approach a; auto i=good(); begin(a,i); bool send,stop; i.hover_ready=false; a.step(i,send,stop);
       assert(stop && !send && a.phase==ApproachPhase::Paused);
       i.hover_ready=true; i.now+=3000000; a.step(i,send,stop); assert(!send && a.phase==ApproachPhase::Paused);
@@ -38,8 +40,10 @@ int main() {
     { Approach a; auto i=good(); begin(a,i); bool send,stop; i.arm_ready=false; a.step(i,send,stop);
       assert(stop && a.phase==ApproachPhase::Fault); ++count; }
     { Approach a; auto i=good(); begin(a,i); auto wrong=i.binding; ++wrong.scene;
+      bool send,stop; a.step(i,send,stop); assert(send && a.max_joint_step>0);
       a.request(2,3,wrong,i); assert(a.moving()); a.request(3,3,i.binding,i);
-      assert(a.phase==ApproachPhase::Canceled); ++count; }
+      a.step(i,send,stop);
+      assert(a.phase==ApproachPhase::Canceled && stop && !send && a.max_joint_step==0); ++count; }
     { Approach a; auto i=good(); begin(a,i); bool send,stop;
       i.measured=i.accepted=i.goal; for(int k=0;k<12;++k) { a.step(i,send,stop); i.now+=100000; }
       assert(a.phase==ApproachPhase::Holding); ++count; }
@@ -144,5 +148,84 @@ int main() {
       }
       assert(wristUnfoldStep(folded,folded,NAN,.02f,desired)==UnfoldResult::Invalid);
       ++count; }
-    return count==33 ? 0 : 1;
+    // Callback timing changes command granularity, never the existing speed.
+    { Approach a; auto i=good(); begin(a,i); bool send,stop;
+      auto p=a.step(i,send,stop); assert(send); i.accepted=i.measured=p;
+      i.now+=15999; a.step(i,send,stop);
+      assert(!send && !stop && a.max_joint_step==0);
+      ++i.now; p=a.step(i,send,stop);
+      assert(send && std::abs((p-i.accepted).norm()-.00048f)<2e-8f);
+      assert(std::abs(a.max_joint_step-.0032f)<1e-8f); ++count; }
+    { Approach a; auto i=good(); begin(a,i); bool send,stop;
+      auto p=a.step(i,send,stop); assert(send); i.accepted=i.measured=p;
+      i.now+=19000; p=a.step(i,send,stop);
+      assert(send && std::abs((p-i.accepted).norm()-.00057f)<2e-8f);
+      assert(std::abs(a.max_joint_step-.0038f)<1e-8f); ++count; }
+    // A delayed callback or temporarily ineligible joint speed grants only
+    // one 20 ms allowance. It must not deliver the missed trajectory in a burst.
+    { Approach a; auto i=good(); begin(a,i); bool send,stop;
+      auto p=a.step(i,send,stop); assert(send); i.accepted=i.measured=p;
+      i.now+=20000; i.joint_speed=.101f; a.step(i,send,stop);
+      assert(!send && a.max_joint_step==0);
+      i.now+=1000000; i.joint_speed=0; p=a.step(i,send,stop);
+      assert(send && std::abs((p-i.accepted).norm()-.0006f)<2e-8f);
+      assert(std::abs(a.max_joint_step-.004f)<1e-8f);
+      i.accepted=i.measured=p; ++i.now; a.step(i,send,stop);
+      assert(!send && a.max_joint_step==0); ++count; }
+    // Rapid explicit pause/resume must retain the last send time: otherwise
+    // each resume could reissue a full first-step budget in less than 16 ms.
+    { Approach a; auto i=good(); begin(a,i); bool send,stop;
+      auto p=a.step(i,send,stop); assert(send); i.accepted=i.measured=p;
+      i.now+=1000; i.hover_ready=false; a.step(i,send,stop);
+      assert(stop && !send && a.max_joint_step==0);
+      i.now+=1000; i.hover_ready=true; a.request(2,2,i.binding,i); a.step(i,send,stop);
+      assert(a.moving() && !send && !stop && a.max_joint_step==0);
+      i.now+=14000; p=a.step(i,send,stop);
+      assert(send && std::abs((p-i.accepted).norm()-.00048f)<2e-8f);
+      assert(std::abs(a.max_joint_step-.0032f)<1e-8f); ++count; }
+    { Approach a; auto i=good(); begin(a,i); bool send,stop;
+      auto p=a.step(i,send,stop); assert(send); i.accepted=i.measured=p;
+      i.now+=20000; i.hover_ready=false; a.step(i,send,stop); assert(stop && !send);
+      i.now+=3000000; i.hover_ready=true; a.step(i,send,stop);
+      assert(!send && a.phase==ApproachPhase::Paused && a.max_joint_step==0);
+      a.request(2,2,i.binding,i); p=a.step(i,send,stop);
+      assert(send && std::abs((p-i.accepted).norm()-.0006f)<2e-8f);
+      assert(std::abs(a.max_joint_step-.004f)<1e-8f); ++count; }
+    // Finishing the wrist unfold starts a fresh bounded Cartesian allowance,
+    // regardless of how long the internal unfold took.
+    { Approach a; auto i=good(); i.unfold_complete=false; begin(a,i); bool send,stop;
+      a.step(i,send,stop); assert(!send && a.max_joint_step==0);
+      i.now+=20000000; i.unfold_complete=true; auto p=a.step(i,send,stop);
+      assert(send && std::abs((p-i.accepted).norm()-.0006f)<2e-8f);
+      assert(std::abs(a.max_joint_step-.004f)<1e-8f); ++count; }
+    // Reusing an old instance through a clean value reset must erase
+    // cadence history; a clock reversal without reset remains a latched fault.
+    { Approach a; auto i=good(); begin(a,i); bool send,stop;
+      a.step(i,send,stop); assert(send);
+      --i.now; a.step(i,send,stop);
+      assert(stop && !send && a.fault==ApproachFault::Timeout && a.max_joint_step==0);
+      a=Approach{}; i=good(); begin(a,i); auto p=a.step(i,send,stop);
+      assert(send && !stop && std::abs((p-i.accepted).norm()-.0006f)<2e-8f);
+      assert(std::abs(a.max_joint_step-.004f)<1e-8f); ++count; }
+    // A deterministic jitter stream verifies cumulative Cartesian/joint slew
+    // from the first allowance, including missed callbacks and 16 ms sends.
+    { Approach a; auto i=good(); i.goal={1.f,0,0}; i.accepted=i.measured={0,0,0}; begin(a,i);
+      const uint64_t began=i.now; bool send,stop; float travel=0,joint_travel=0;
+      const uint64_t intervals[]{1000,3000,12000,3000,16000,17000,19000,20000,21000,100000};
+      uint64_t previous=0;
+      for (int k=0;k<1000;++k) {
+        auto p=a.step(i,send,stop); assert(!stop);
+        if (send) {
+          const float moved=(p-i.accepted).norm();
+          if (previous) assert(i.now-previous>=16000);
+          const float seconds=float(previous ? std::min(uint64_t(20000),i.now-previous) : 20000)*1e-6f;
+          assert(moved<=.03f*seconds+3e-8f && a.max_joint_step<=.2f*seconds+1e-8f);
+          travel+=moved; joint_travel+=a.max_joint_step; previous=i.now;
+          i.accepted=i.measured=p;
+        } else assert(a.max_joint_step==0);
+        const float available=float(i.now-began+20000)*1e-6f;
+        assert(travel<=.03f*available+1e-6f && joint_travel<=.2f*available+1e-5f);
+        i.now+=intervals[k%10];
+      } ++count; }
+    return count==41 ? 0 : 1;
 }
