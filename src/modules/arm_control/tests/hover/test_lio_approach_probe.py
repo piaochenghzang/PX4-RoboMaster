@@ -60,6 +60,24 @@ class LioContextTests(unittest.TestCase):
         self.assertEqual(fields[16:18],[1,1])
         self.assertEqual(fields[21],.05)
 
+    def test_seated_grasp_alignment_uses_one_fixed_reference_not_the_transit_waypoint(self):
+        row=sample();saved=copy.deepcopy(row)
+        reference=np.array(row['map_from_target'])[:3,3]+[.0023,0.,0.]
+        row['map_from_grasp_reference'][:3,3]=reference+[.002,0.,0.]
+        outputs=[]
+        for transit in ([1.,2.,3.],[1.3,2.2,3.15]):
+            goal=np.eye(4);goal[:3,3]=transit
+            fields=context_values(row,goal,row['map_from_body'],lease(),IDS,
+                dict(valid=True,clearance_m=.05),12.36,alignment_target_map=reference)
+            self.assertAlmostEqual(fields[9],.002)
+            outputs.append(fields)
+        self.assertEqual(outputs[0][5:12],outputs[1][5:12])
+        ordinary=context_values(row,np.eye(4),row['map_from_body'],lease(),IDS,
+            dict(valid=True,clearance_m=.05),12.36)
+        self.assertAlmostEqual(ordinary[9],.0043)
+        np.testing.assert_array_equal(row['map_from_target'],saved['map_from_target'])
+        self.assertEqual(outputs[0][10:12],ordinary[10:12])
+
     def test_relative_speed_uses_the_larger_reference_or_tcp_speed(self):
         row=sample();row['tcp_velocity_map_m_s']=[0.,0.,.025]
         self.assertAlmostEqual(context(row)[10],.025)

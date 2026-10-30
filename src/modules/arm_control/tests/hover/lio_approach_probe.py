@@ -132,7 +132,7 @@ def jaw_sweep_geometry(row,config,geometry,static_boxes,points,*,precision=False
         arm_body_lower_bound_m=measured['arm_body_lower_bound_m']-.11*.005)
 
 
-def context_values(row,goal_map,candidate,lease,ids,geometry,now,goal_velocity_map=None):
+def context_values(row,goal_map,candidate,lease,ids,geometry,now,goal_velocity_map=None,*,alignment_target_map=None):
     if row['frame']!='map':raise ValueError('APPROACH_FRAME')
     body=np.array(row['map_from_body']);arm=np.array(row['map_from_arm']);grip=np.array(row['map_from_gripper'])
     goal=(inverse(arm)@np.r_[goal_map[:3,3],1])[:3]
@@ -140,10 +140,11 @@ def context_values(row,goal_map,candidate,lease,ids,geometry,now,goal_velocity_m
     goal_velocity=np.zeros(3) if goal_velocity_map is None else finite(goal_velocity_map,(3,))
     speed=max(np.linalg.norm(np.array(row['tcp_velocity_map_m_s'])-goal_velocity),
         np.linalg.norm(np.array(row['reference_velocity_map_m_s'])-goal_velocity))
+    alignment_target=np.array(row['map_from_target'])[:3,3] if alignment_target_map is None else finite(alignment_target_map,(3,))
     metrics=[float(np.linalg.norm(v)),float(np.linalg.norm(w)),
         math.acos(float(np.clip(body[2,2],-1,1))),
         float(np.linalg.norm(body[:3,3]-candidate[:3,3])),
-        float(np.linalg.norm(np.array(row['map_from_grasp_reference'])[:3,3]-np.array(row['map_from_target'])[:3,3])),
+        float(np.linalg.norm(np.array(row['map_from_grasp_reference'])[:3,3]-alignment_target)),
         float(speed),math.radians(angle_deg(grip[:3,:3],np.array(row['map_from_target'])[:3,:3]))]
     matching=lease is not None and [int(lease.task_id),int(lease.plan_id),int(lease.target_id),int(lease.scene_id)]==ids
     lease_good=matching and lease.header.frame_id=='map' and lease.terminal_hold and lease.lease_valid and -.02<=now-lease.header.stamp.to_sec()<=.1 and -.02<=now-lease.command_stamp.to_sec()<=.3
@@ -181,12 +182,16 @@ class LioApproachProbe:
         # Align at 55mm instead, then retain the unchanged 40mm endpoint.
         far=pre.copy();far[:3,3]+=np.array(candidate['map_from_target'])[:3,2]*.015
         self.goals=[first,far,pre]
+        self.alignment_target=None
         if self.grasp:
             final=np.array(candidate['final_goal']['map_from_desired_tcp']).copy()
             # Reuse the tested 2.3mm fixed-pad seating correction. This is a
             # target derived from the observed object, not its simulator pose.
             final[:3,3]+=np.array(candidate['map_from_target'])[:3,0]*.0023
             self.goals.append(final)
+            # Compare the measured OPEN reference to its one fixed seated
+            # destination. Never use a moving far/pre waypoint as close target.
+            self.alignment_target=np.array(candidate['map_from_target'])[:3,3]+np.array(candidate['map_from_target'])[:3,0]*.0023
         self.segment=None
         self.index=0;self.stage='prepare';self.expected=0;self.last_stamp=0.;self.last_status=0.;self.poll_index=0
         self.native={};self.hover={};self.arm={};self.error=None;self.complete=False;self.motion_requested=False
@@ -233,10 +238,10 @@ class LioApproachProbe:
                     if row['stamp_s']==self.last_stamp:continue
                     self.last_stamp=row['stamp_s']
                     geometry_started=time.perf_counter()
-                    # Precision starts at the 55->40mm approach in grasp mode.
+                    # Precision starts at the 55mm alignment in grasp mode.
                     # Only the already approved pad/handle contact pair changes;
                     # NoClose and every other 16mm pair remain independent.
-                    fine=self.grasp and self.index>=2
+                    fine=self.grasp and self.index>=1
                     geo=approach_geometry(row,self.config,self.geometry,self.static,self.points,precision=fine)
                     sweep=jaw_sweep_geometry(row,self.config,self.geometry,self.static,self.points,precision=True) if fine else None
                     jaw_clearance=0. if self.grasp else None
@@ -251,7 +256,8 @@ class LioApproachProbe:
                     geo['computation_age_s']=compute_age;geo['computation_transport_reserve_m']=float(transport)
                     if sweep is not None:jaw_clearance=min(sweep['external_clearance_m']-float(transport),sweep['arm_body_lower_bound_m'])
                     goal,goal_velocity,segment_finished=self.goal_at(row,now)
-                    fields=context_values(row,goal,self.candidate['map_from_body_hover'],lease,self.ids,geo,now,goal_velocity)
+                    fields=context_values(row,goal,self.candidate['map_from_body_hover'],lease,self.ids,geo,now,goal_velocity,
+                        alignment_target_map=self.alignment_target)
                     if self.grasp:
                         lift=(inverse(np.array(row['map_from_arm']))@np.r_[goal[:3,3]+[0.,0.,.04],1])[:3]
                         fields.extend([*map(float,lift),jaw_clearance])
