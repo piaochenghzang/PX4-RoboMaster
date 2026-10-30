@@ -25,6 +25,7 @@ import xml.etree.ElementTree as ET
 import numpy as np
 from auto_grasp_case import run_auto_case
 from mavlink_fault_proxy import FaultProxy
+from sim_model import remove_lidar, set_pad_patch
 
 HERE=Path(__file__).resolve().parent
 ROOT=HERE.parents[4]
@@ -69,21 +70,6 @@ def box_bounds(position,R,local_center,half_size):
     extent=np.abs(R)@np.asarray(half_size)
     return center-extent,center+extent
 
-def set_pad_patch(collision,radius_mm):
-    """Finite, force-dependent torsional pad friction, not an attachment.
-
-    ODE combines patch radii by MAX and torsional coefficients by MIN.
-    Only the two finger surfaces are changed; cube/support torsion stays
-    at its zero-radius default. 4 mm is a demo pad model, not a calibration.
-    """
-    friction=collision.find('surface/friction')
-    if friction is None: raise RuntimeError('pad friction element missing')
-    torsion=friction.find('torsional')
-    if torsion is None: torsion=ET.SubElement(friction,'torsional')
-    for name,value in [('coefficient','.8'),('use_patch_radius','true'),('patch_radius',str(radius_mm*.001))]:
-        element=torsion.find(name)
-        if element is None: element=ET.SubElement(torsion,name)
-        element.text=value
 
 def contact_summary(data):
     """Weight windows by received physics frames, not by CSV row count."""
@@ -127,16 +113,6 @@ def stop(p):
         try: p.wait(timeout=5)
         except sp.TimeoutExpired:
             p.kill();p.wait(timeout=5)
-
-def remove_lidar(model):
-    """Remove only the expanded lidar links/mounts in this experiment copy."""
-    lidar=[link for link in model.findall('link') if link.get('name','').startswith('velodyne::')]
-    if not lidar: raise RuntimeError('cannot identify expanded velodyne links for no-lidar scene')
-    names={link.get('name') for link in lidar}
-    for joint in list(model.findall('joint')):
-        if joint.findtext('parent') in names or joint.findtext('child') in names:
-            model.remove(joint)
-    for link in lidar: model.remove(link)
 
 
 def build_world(folder,env,calibration,iterations=40,cube_mm=20,gripper_p=None,solver='quick',patch_radius_mm=0,grasp_feedback=False,gui=False,no_lidar=False):
