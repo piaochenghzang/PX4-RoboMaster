@@ -14,6 +14,27 @@ void step(Gate &g,Input &v) { v.now+=50000; v.received=v.sample=v.now; ++v.seque
 void ready(Gate &g,Input &v) { g.update(v); for(int i=0;i<40;++i) step(g,v); assert(g.start_ready); }
 int main() {
     unsigned n=0;
+    LocalHeading h; h.now=2000000; h.flags_stamp=1000000;
+    h.received=1960000; h.sample=1900000; h.fused=h.frame_frd=true; h.yaw_fault=false;
+    h.heading=1.57f; h.variance=.00019f; h.ev_variance=.0009f;
+    h.q[0]=std::cos(h.heading/2); h.q[1]=h.q[2]=0; h.q[3]=std::sin(h.heading/2);
+    assert(localHeadingReady(h)); ++n; // Local FRD does not require north alignment.
+    { auto v=h; v.heading+=.09f; assert(!localHeadingReady(v)); ++n; }
+    { auto v=h; v.heading-=6.28318530718f; assert(localHeadingReady(v)); ++n; }
+    { auto v=h; v.flags_stamp=v.now-1200001; assert(!localHeadingReady(v)); ++n; }
+    { auto v=h; v.received=v.now-300001; assert(!localHeadingReady(v)); ++n; }
+    { auto v=h; v.sample=v.now-250001; assert(!localHeadingReady(v));
+      v.sample=v.now+1; assert(!localHeadingReady(v)); ++n; }
+    { auto v=h; v.fused=false; assert(!localHeadingReady(v));
+      v=h; v.yaw_fault=true; assert(!localHeadingReady(v));
+      v=h; v.frame_frd=false; assert(!localHeadingReady(v)); ++n; }
+    { auto v=h; v.variance=.01f; assert(!localHeadingReady(v));
+      v=h; v.ev_variance=NAN; assert(!localHeadingReady(v)); ++n; }
+    { auto v=h; v.q[1]=NAN; assert(!localHeadingReady(v));
+      v=h; v.q[0]=0; assert(!localHeadingReady(v)); ++n; }
+    { Gate g; auto v=good(); ready(g,v); v.flight_safe=localHeadingReady(h);
+      step(g,v); assert(g.start_ready); auto lost=h; lost.fused=false;
+      v.flight_safe=localHeadingReady(lost); step(g,v); assert(g.denial&Flight); ++n; }
     { Gate g; Input v; g.update(v); assert(!g.start_ready && (g.denial&Missing)); ++n; }
     { Gate g; auto v=good(); ready(g,v); assert(!g.close_geometry_ready);
       v.alignment_error=.002f; v.relative_speed=.001f; v.orientation_error=.01f; step(g,v);
@@ -62,5 +83,5 @@ int main() {
       p.request(2,1,1,true,true); assert(!p.prepared_task && p.result==3);
       p.request(1,1,1,true,true); assert(!p.prepared_task && p.result==3); ++n; }
     { Preparation p; p.request(0,1,1,true,true); assert(!p.prepared_task && !p.last_request); ++n; }
-    return n==26 ? 0 : 1;
+    return n==36 ? 0 : 1;
 }

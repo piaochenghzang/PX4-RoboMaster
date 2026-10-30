@@ -55,6 +55,9 @@
 #include <uORB/topics/arm_hover_status.h>
 #include <uORB/topics/vehicle_status.h>
 #include <uORB/topics/vehicle_local_position.h>
+#include <uORB/topics/vehicle_odometry.h>
+#include <uORB/topics/estimator_status_flags.h>
+#include <uORB/topics/estimator_selector_status.h>
 #include <uORB/topics/vehicle_land_detected.h>
 #include <uORB/topics/control_allocator_status.h>
 #include <uORB/topics/actuator_motors.h>
@@ -223,6 +226,9 @@ private:
     uORB::Subscription _hover_request_sub{ORB_ID(arm_hover_request)};
     uORB::Subscription _hover_vehicle_sub{ORB_ID(vehicle_status)};
     uORB::Subscription _hover_position_sub{ORB_ID(vehicle_local_position)};
+    uORB::Subscription _hover_external_odometry_sub{ORB_ID(vehicle_visual_odometry)};
+    uORB::Subscription _hover_estimator_flags_sub{ORB_ID(estimator_status_flags)};
+    uORB::Subscription _hover_estimator_selector_sub{ORB_ID(estimator_selector_status)};
     uORB::Subscription _hover_land_sub{ORB_ID(vehicle_land_detected)};
     uORB::Subscription _hover_allocator_sub{ORB_ID(control_allocator_status)};
     uORB::Subscription _hover_motors_sub{ORB_ID(actuator_motors)};

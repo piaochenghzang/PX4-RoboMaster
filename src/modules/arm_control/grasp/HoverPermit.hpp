@@ -6,6 +6,33 @@ enum Denial : uint16_t {
     Missing=1, Stale=2, Invalid=4, Flight=8, Allocation=16, Position=32,
     Speed=64, Angular=128, Tilt=256, Reset=512, Dwelling=1024
 };
+// LOCAL_FRD EV yaw is locally usable without declaring alignment to true north.
+// Keep this separate from PX4's global heading_good_for_control flag.
+struct LocalHeading {
+    uint64_t now{0},flags_stamp{0},received{0},sample{0};
+    bool fused{false},yaw_fault{true},frame_frd{false};
+    float heading{NAN},variance{NAN},ev_variance{NAN};
+    float q[4]{NAN,NAN,NAN,NAN};
+};
+inline bool localHeadingReady(const LocalHeading &v) {
+    auto fresh=[&v](uint64_t stamp,uint64_t age) {
+        return stamp && stamp<=v.now && v.now-stamp<=age;
+    };
+    // Flags publish on change or at 1 Hz; odometry still has its own short lease.
+    if (!v.fused || v.yaw_fault || !v.frame_frd || !fresh(v.flags_stamp,1200000) ||
+        !fresh(v.received,300000) || !fresh(v.sample,250000)) return false;
+    constexpr float bound=.0872665f; // Existing 5-degree attitude/close bound.
+    if (!std::isfinite(v.heading) || !std::isfinite(v.variance) || v.variance<0 ||
+        v.variance>bound*bound || !std::isfinite(v.ev_variance) || v.ev_variance<0 ||
+        v.ev_variance>bound*bound) return false;
+    float norm=0;
+    for (float x:v.q) { if (!std::isfinite(x)) return false; norm+=x*x; }
+    if (std::fabs(norm-1.f)>.01f) return false;
+    const float yaw=std::atan2(2.f*(v.q[0]*v.q[3]+v.q[1]*v.q[2]),
+        norm-2.f*(v.q[2]*v.q[2]+v.q[3]*v.q[3]));
+    const float error=std::atan2(std::sin(v.heading-yaw),std::cos(v.heading-yaw));
+    return std::fabs(error)<=bound;
+}
 struct Input {
     uint64_t now{0},received{0},sample{0},task{0},reset_key{0};
     uint32_t sequence{0},epoch{0};
