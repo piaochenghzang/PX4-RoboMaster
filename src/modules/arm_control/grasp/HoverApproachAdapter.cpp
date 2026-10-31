@@ -184,8 +184,10 @@ void ArmControl::updateHoverApproach()
     }
     // Exactly one motion owner publishes the shared status. The explicit mode
     // preserves the old no-close phase/authorization contract.
-    updateFixedGrasp(requested && r.action>=4 ? &r : nullptr,in);
-    if (_fixed_grasp.owns()) return;
+    if (!_hover_approach.owns()) {
+        updateFixedGrasp(requested && r.action>=4 ? &r : nullptr,in);
+        if (_fixed_grasp.reportsStatus(c.fixed_grasp)) return;
+    }
     arm_approach_status_s s{}; s.timestamp=now;
     s.mode=arm_approach_status_s::MODE_APPROACH;
     const auto &b=_hover_approach.binding;

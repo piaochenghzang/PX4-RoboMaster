@@ -42,6 +42,16 @@ void closeAndLift(FixedGrasp &g,FixedInput &v)
 int main()
 {
     unsigned cases=0;
+    { FixedGrasp g; auto v=healthy();
+      assert(!g.reportsStatus(false) && !g.reportsStatus(true));
+      v.motion.prepared=false;g.request(1,4,v.motion.binding,v);
+      assert(!g.owns() && g.request_result==3 && g.last_id==1);
+      assert(g.reportsStatus(true) && !g.reportsStatus(false));
+      v.motion.prepared=true;g.request(2,4,v.motion.binding,v);
+      assert(g.owns() && g.request_result==1);
+      assert(g.reportsStatus(false) && g.reportsStatus(true));++cases;
+    } // Rejected fixed-context requests are visible without granting ownership.
+
     { assert(precisionPositionReady(0.f) && precisionPositionReady(.010f));
       assert(!precisionPositionReady(-.001f) && !precisionPositionReady(.01001f));
       assert(!precisionPositionReady(std::numeric_limits<float>::quiet_NaN()));

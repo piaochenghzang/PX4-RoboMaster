@@ -76,7 +76,8 @@ void ArmControl::updateFixedGrasp(const arm_approach_request_s *request,const so
             _joint_target[GRIPPER_INDEX]=constrainJointPosition(GRIPPER_INDEX,_joint_target[GRIPPER_INDEX]+delta);
         }
     }
-    if (!_fixed_grasp.owns()) return;
+    // A rejected start still needs an observable request ID/result.
+    if (!_fixed_grasp.reportsStatus(_hover_context.fixed_grasp)) return;
     arm_approach_status_s out{};out.timestamp=now;
     out.mode=arm_approach_status_s::MODE_FIXED_GRASP;
     const auto &b=_fixed_grasp.binding;
@@ -90,10 +91,10 @@ void ArmControl::updateFixedGrasp(const arm_approach_request_s *request,const so
     out.close_entry_ready=_fixed_grasp.phase==FixedPhase::Approach && input.close_ready &&
         motion.hover_ready && !_fixed_grasp.paused && _fixed_grasp.safe(input);
     out.completed_success=_fixed_grasp.phase==FixedPhase::Done;
-    out.actual_lift=_fixed_grasp.actual_lift;out.feedback_age=input.feedback.grasp_age;
+    out.actual_lift=input.contact_only ? NAN : _fixed_grasp.actual_lift;out.feedback_age=input.feedback.grasp_age;
     out.bilateral_fraction=input.feedback.bilateral;
     out.fixed_normal_n=input.feedback.fixed_force;out.moving_normal_n=input.feedback.moving_force;
-    out.motion_authorized=motion.hover_ready && !_fixed_grasp.paused && _fixed_grasp.safe(input) &&
+    out.motion_authorized=_fixed_grasp.owns() && motion.hover_ready && !_fixed_grasp.paused && _fixed_grasp.safe(input) &&
         _fixed_grasp.phase!=FixedPhase::Fault && _fixed_grasp.phase!=FixedPhase::Canceled;
     out.lease_valid=motion.lease_fresh;
     out.goal_base[0]=motion.goal.x;out.goal_base[1]=motion.goal.y;out.goal_base[2]=motion.goal.z;

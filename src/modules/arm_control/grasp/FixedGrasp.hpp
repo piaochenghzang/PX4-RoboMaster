@@ -40,6 +40,7 @@ struct FixedAction {
 class FixedGrasp {
 public:
     bool owns() const { return phase!=FixedPhase::Idle; }
+    bool reportsStatus(bool fixed_context) const { return owns() || (fixed_context && last_id); }
     bool carrying() const { return phase>=FixedPhase::Lift && phase<=FixedPhase::Done; }
     bool safe(const FixedInput &v) const {
         const auto &i=v.motion; const auto &f=v.feedback;
