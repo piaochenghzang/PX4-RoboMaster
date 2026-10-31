@@ -201,7 +201,7 @@ def main():
         external_odometry_source='LIO_TWO_POSE_SOURCE_MIDPOINT' if args.fuse_lio_velocity else 'LIO_SCAN_END_POSE_ONLY',
         external_odometry_stddev=dict(position_m=.05,orientation_rad=.03,velocity_m_s=LIO_VELOCITY_STD,angular_velocity_rad_s=.05) if args.fuse_lio_velocity else None,
         ros_clock_hz=LIO_CLOCK_HZ,registered_cloud_source='UNDISTORTED_POINTS' if args.approach_lio else 'ESTIMATOR_VOXEL_POINTS',
-        demo_wall_step_pacing=args.approach_lio,
+        demo_wall_step_pacing=args.approach_lio,fine_velocity_residual_feedforward=True,fine_velocity_residual_slew_m_s2=.005,
         minimum_wall_step_s=float(scene.findtext('world/physics/max_step_size'))/speed if args.approach_lio else None,
         observation_local_goal_m=[.3,0,.9],sim_speed_factor=speed))
     os.environ.update(ROS_MASTER_URI=env['ROS_MASTER_URI'],ROS_HOSTNAME='localhost');os.environ.pop('ROS_IP',None)
