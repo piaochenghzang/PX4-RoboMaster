@@ -37,6 +37,13 @@ def filter_tracking_errors(position,velocity,goal,position_bias,velocity_bias):
         float(np.linalg.norm(finite(velocity,(3,))-finite(velocity_bias,(3,)))))
 
 
+def preview_pose_ready(preview,desired):
+    from grasp_audit.geometry import pose_transform
+    if not preview.get('ik_success'):return False
+    actual=pose_transform([*preview['fk'],*preview['quat']])
+    return angle_deg(actual[:3,:3],finite(desired,(4,4))[:3,:3])<=5.
+
+
 def transit_ready(index,phase,error,speed,hover_ready):
     # Keep the final native dwell. The far alignment is only an intermediate
     # waypoint: its instantaneous criteria need no second one-second dwell.
@@ -174,9 +181,10 @@ class LioApproachProbe:
         if not len(self.points):raise ValueError('APPROACH_MAP_COVERAGE')
         self.baseline=client.status('arm_control_status');self.jaw=self.baseline['joint_target'][5]
         self.static=[b for b in body_collision_boxes(scene,config,self.baseline['joint_target']) if '::' in b[0]]
-        # A higher-clearance transit on the same unfolded IK branch. The old
-        # 26.8mm transit margin was too small once LIO uncertainty was reserved.
-        self.first_arm=np.eye(4);self.first_arm[:3,3]=[.15,.015,.325]
+        # Keep the SAME first waypoint as the existing native unfold precheck.
+        # A substituted Cartesian point can select a joint-limit IK branch.
+        from fixed_demo_plan import ROUTE
+        self.first_arm=np.eye(4);self.first_arm[:3,3]=ROUTE[0]
         first=candidate['map_from_arm']@self.first_arm
         pre=np.array(candidate['pre_goal']['map_from_desired_tcp'])
         # 70mm put shoulder_lift on its lower limit even at nominal hover.
@@ -223,7 +231,6 @@ class LioApproachProbe:
     def run(self):
         import rospy
         from fixed_grasp_target import parse_native
-        from grasp_audit.geometry import pose_transform
         try:
             with (self.folder/'control.jsonl').open('w') as log, (self.folder/'timing.jsonl').open('w') as timing:
                 while not self.stop_event.wait(.002):
@@ -303,10 +310,7 @@ class LioApproachProbe:
                         output=self.client.client('arm_control','ik_check',*map(float,actual_pre[:3,3]),*map(float,self.seed))
                         native=parse_native(output)
                         with (self.folder/'actual_ik_precheck.log').open('a') as out:out.write(output+'\n')
-                        self.preview_valid=bool(native.get('ik_success'))
-                        if self.preview_valid:
-                            T=pose_transform([*native['fk'],*native['quat']])
-                            self.preview_valid=angle_deg(T[:3,:3],actual_pre[:3,:3])<=5.
+                        self.preview_valid=preview_pose_ready(native,actual_pre)
                         if not self.preview_valid:continue
                         self.expected=self.hover.get('last_request_id',0)
                         self.client.client('arm_control','hover_grasp_prepare',self.ids[0]);self.stage='prepare_ack'
@@ -356,9 +360,7 @@ class LioApproachProbe:
                                     *map(float,self.arm['joint_target'][:5]))
                                 with (self.folder/'transit_ik_precheck.log').open('a') as out:out.write(output+'\n')
                                 preview=parse_native(output)
-                                if not preview.get('ik_success'):continue
-                                checked=pose_transform([*preview['fk'],*preview['quat']])
-                                if self.index>=1 and angle_deg(checked[:3,:3],actual_pre[:3,:3])>5:continue
+                                if not preview_pose_ready(preview,actual_pre):continue
                                 event=('existing_transit_reached','far_alignment_reached','preapproach_reached')[self.index]
                                 self.index+=1;self.holding=None
                                 end=self.goals[self.index][:3,3]

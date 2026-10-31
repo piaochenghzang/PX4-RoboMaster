@@ -377,6 +377,16 @@ class LioApproachGeometryTests(unittest.TestCase):
         np.testing.assert_array_equal(self.static[0][2],saved[2][0][2])
 
 
+class PreviewPoseTests(unittest.TestCase):
+    def test_every_next_map_goal_requires_the_same_native_pose_check(self):
+        from lio_approach_probe import preview_pose_ready
+        preview=dict(ik_success=True,fk=[.15,.015,.325],quat=[1.,0.,0.,0.])
+        self.assertTrue(preview_pose_ready(preview,np.eye(4)))
+        self.assertTrue(preview_pose_ready(preview,rpy_transform([0.,0.,0.,0.,0.,math.radians(4.9)])))
+        self.assertFalse(preview_pose_ready(preview,rpy_transform([0.,0.,0.,0.,0.,math.radians(5.1)])))
+        self.assertFalse(preview_pose_ready(dict(preview,ik_success=False),np.eye(4)))
+
+
 class TransitReadyTests(unittest.TestCase):
     def test_only_far_waypoint_can_use_instantaneous_readiness(self):
         self.assertTrue(transit_ready(1,1,.00244,.00733,True))
@@ -430,6 +440,8 @@ class LioApproachCoverageRegressionTests(unittest.TestCase):
                 probe=self.create(points,Path(directory)/'probe',client)
                 self.assertEqual(len(probe.points),count)
                 self.assertEqual(len(probe.goals),3)
+                from fixed_demo_plan import ROUTE
+                np.testing.assert_allclose(probe.first_arm[:3,3],ROUTE[0],atol=1e-12)
                 np.testing.assert_allclose(probe.goals[1][:3,3]-probe.goals[2][:3,3],[0.,0.,.015])
                 client.status.assert_called_once_with('arm_control_status')
                 client.client.assert_not_called()
