@@ -341,11 +341,11 @@ def main():
                 estimator_voxel_parameters_unchanged=True))
             from check_fixed_target_native import evidence_json
             contact=native.status('arm_grasp_feedback')
-            unknown=[contact.get(k) for k in ('object_height_world','body_support_clearance','vertical_force_n')]
+            unknown=[contact.get(k) for k in ('object_height_world','body_support_clearance','vertical_force_n','support_fraction')]
             unknown+=contact.get('object_center_gripper',[])
             if (contact.get('source')!=2 or contact.get('profile_id')!=1 or contact.get('target_id')!=1
                     or not int(contact.get('capabilities',0))&1 or int(contact['capabilities'])&~3
-                    or len(unknown)!=6 or not all(isinstance(x,float) and math.isnan(x) for x in unknown)):
+                    or len(unknown)!=7 or not all(isinstance(x,float) and math.isnan(x) for x in unknown)):
                 raise RuntimeError('Contact-only feedback contract failed')
             age=(1e6*rospy.Time.now().to_sec()-contact['timestamp_sample'])*1e-6
             if not -.02<=age<=.3:raise RuntimeError('Contact-only feedback stale')

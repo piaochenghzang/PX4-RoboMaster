@@ -1,5 +1,6 @@
 #include "../arm_control.hpp"
 #include <algorithm>
+#include <cmath>
 
 void ArmControl::pollGraspFeedback()
 {
@@ -57,8 +58,10 @@ so101_grasp::Input ArmControl::graspInput() const
         (!contact_source || f.capabilities==arm_grasp_feedback_s::CAP_CONTACT ||
             f.capabilities==(arm_grasp_feedback_s::CAP_CONTACT|arm_grasp_feedback_s::CAP_FORCE));
     if (f.capabilities&arm_grasp_feedback_s::CAP_CONTACT) {
-        const float fractions[]{f.fixed_fraction,f.moving_fraction,in.bilateral,in.support,in.other,in.support_arm};
+        const float fractions[]{f.fixed_fraction,f.moving_fraction,in.bilateral,in.other,in.support_arm};
         for (const float fraction:fractions) in.finite=in.finite && PX4_ISFINITE(fraction);
+        // Keep unobserved target-support contact unknown, never replace it with zero.
+        in.finite=in.finite && (contact_source ? std::isnan(in.support) : PX4_ISFINITE(in.support));
     }
     if (force) in.finite=in.finite && PX4_ISFINITE(in.fixed_force) && PX4_ISFINITE(in.moving_force) &&
         (contact_source || PX4_ISFINITE(f.vertical_force_n));

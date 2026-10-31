@@ -175,8 +175,8 @@ class LioApproachProbe:
         if p.ndim!=2 or p.shape[1]!=3 or not len(p) or not np.isfinite(p).all():raise ValueError('APPROACH_MAP_RETURNS')
         center=candidate['map_from_body_hover'][:3,3]
         self.points=p[np.linalg.norm(p-center,axis=1)<.9]
-        # Registration is downsampled; point count alone is not a coverage
-        # certificate. Require observed returns, retain the independently
+        # Raw registration is reduced to fine cells; point count alone is not a
+        # coverage certificate. Require observed returns, retain the independently
         # validated target fit/shape, and never mark unknown space free.
         if not len(self.points):raise ValueError('APPROACH_MAP_COVERAGE')
         self.baseline=client.status('arm_control_status');self.jaw=self.baseline['joint_target'][5]
@@ -427,7 +427,8 @@ class LioApproachProbe:
             if canceled is None:raise RuntimeError('No-close cancellation not acknowledged')
         result=dict(completed=self.complete and self.error is None,error=self.error,events=self.events,binding=self.ids,
             motion_requested=self.motion_requested,closing_requested=getattr(self,'closing_requested',False),truth_control_inputs=False,
-            object_pose_after_grasp_observed=False,confirmation='CONTACT_SUPPORT_RELEASE_AND_LIO_FK_TOOL_EXTRACTION' if grasp else 'LIO_FK_PREAPPROACH',
+            object_pose_after_grasp_observed=False,object_support_contact_observed=False,
+            confirmation='CONTACT_RETENTION_AND_LIO_FK_TOOL_EXTRACTION' if grasp else 'LIO_FK_PREAPPROACH',
             final_record=self.last_record,cancellation=canceled)
         from check_fixed_target_native import evidence_json
         result=evidence_json(result)

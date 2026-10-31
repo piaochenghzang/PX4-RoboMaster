@@ -14,18 +14,20 @@ public:
             || !std::isfinite(v.sample_window_s) || v.sample_window_s < 0.05f
             || v.sample_window_s > 0.2f || v.contact_frames > 100000) { return false; }
         // Source 2 is a simulated pad sensor, not an object pose sensor.
-        // Unknown pose/clearance/world-force fields must stay explicit NaNs.
+        // Object-support contact is unobserved too; unknown fields stay explicit NaNs.
         if (v.source == 2) {
-            if ((v.capabilities & ~3u) != 0 || !std::isnan(v.vertical_force_n)
+            if ((v.capabilities & ~3u) != 0 || !std::isnan(v.support_fraction) || !std::isnan(v.vertical_force_n)
                 || !std::isnan(v.object_height_world) || !std::isnan(v.body_support_clearance)) { return false; }
             for (int j=0; j<3; ++j) if (!std::isnan(v.object_center_gripper[j])) { return false; }
         }
         if (seen && v.source != source) { return false; }
         const float fractions[]{v.fixed_fraction, v.moving_fraction, v.bilateral_fraction,
-            v.support_fraction, v.other_fraction, v.support_arm_fraction};
+            v.other_fraction, v.support_arm_fraction};
         if (v.capabilities & 1u) {
             if (!v.contact_frames) { return false; }
             for (float f : fractions) { if (!std::isfinite(f) || f < 0.f || f > 1.f) { return false; } }
+            if (v.source == 1 && (!std::isfinite(v.support_fraction) ||
+                v.support_fraction < 0.f || v.support_fraction > 1.f)) { return false; }
             if (v.bilateral_fraction > v.fixed_fraction || v.bilateral_fraction > v.moving_fraction) { return false; }
         }
         if ((v.capabilities & 2u) && (!std::isfinite(v.fixed_normal_n) || !std::isfinite(v.moving_normal_n)

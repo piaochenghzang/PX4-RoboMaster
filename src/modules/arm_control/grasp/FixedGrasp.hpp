@@ -44,8 +44,9 @@ public:
     bool carrying() const { return phase>=FixedPhase::Lift && phase<=FixedPhase::Done; }
     bool safe(const FixedInput &v) const {
         const auto &i=v.motion; const auto &f=v.feedback;
-        const float values[]{f.bilateral,f.support,f.other,f.support_arm,f.jaw_speed};
+        const float values[]{f.bilateral,f.other,f.support_arm,f.jaw_speed};
         for(float x:values)if(!std::isfinite(x))return false;
+        if (v.contact_only ? !std::isnan(f.support) : !std::isfinite(f.support)) return false;
         if (!feedbackCapabilities(v) || (owns() && v.contact_only!=contact_mode)) return false;
         if ((f.capabilities&2) && (!std::isfinite(f.fixed_force) || !std::isfinite(f.moving_force) ||
                 f.fixed_force<0 || f.moving_force<0)) return false;
@@ -110,7 +111,8 @@ public:
         const bool fresh=f.sequence!=last_sequence;
         if (fresh) last_sequence=f.sequence;
         const bool both=(f.capabilities&2) && f.frames && f.bilateral>=.9f && f.fixed_force>.01f && f.moving_force>.01f;
-        const bool unsupported=f.support<=.001f;
+        // Only source 1 observes payload-support contact. Source 2 cannot claim release.
+        const bool source1_unsupported=!contact_mode && f.support<=.001f;
         if (carrying()) {
             if (contact_mode) {
                 // This is tool extraction relative to the CURRENT world-fixed
@@ -127,10 +129,14 @@ public:
                 if (i.now-lost_since>500000) fail(FixedFault::Lost);
             } else lost_since=0;
             if (f.other>0 || f.support_arm>0) fail(FixedFault::Geometry);
-            if ((phase==FixedPhase::Hold || phase==FixedPhase::Done) && !unsupported) fail(FixedFault::Support);
+            if (!contact_mode && (phase==FixedPhase::Hold || phase==FixedPhase::Done) &&
+                !source1_unsupported) fail(FixedFault::Support);
             if (stop_pending) { stop_pending=false; out.stop=true; return out; }
         }
         if (paused) return out; // Payload monitoring continues while motion is paused.
+        // Source 2 confirms retained contact and measured tool extraction only.
+        // Actual payload lift/support release is checked by the offline observer.
+        const bool extraction_ready=contact_mode ? tool_progress>=.025f : actual_lift>=.025f && source1_unsupported;
         if (phase==FixedPhase::Align) {
             // This SITL fixed-point demo already checks live close geometry
             // every cycle, including during closure. A short alignment dwell
@@ -150,11 +156,11 @@ public:
                 enter(FixedPhase::Lift,i.now);
             }
         } else if (phase==FixedPhase::Lift) {
-            if (dwell((contact_mode ? tool_progress : actual_lift)>=.025f && unsupported && both &&
+            if (dwell(extraction_ready && both &&
                 (v.lift_goal-i.measured).norm()<=.005f,i.now,1000000)) enter(FixedPhase::Hold,i.now);
             if (i.now-entered>45000000) fail(FixedFault::Timeout);
         } else if (phase==FixedPhase::Hold) {
-            if ((contact_mode ? tool_progress : actual_lift)<.025f || !both || !unsupported) { stable_since=0; }
+            if (!extraction_ready || !both) { stable_since=0; }
             else if (dwell(true,i.now,5000000)) enter(FixedPhase::Done,i.now);
         }
         if (stop_pending) { stop_pending=false; out.stop=true; return out; }

@@ -18,7 +18,7 @@ FixedInput healthy()
 FixedInput contactInput(uint16_t capabilities=1)
 {
     auto v=healthy();v.contact_only=true;v.feedback.capabilities=capabilities;
-    v.feedback.object_height=v.feedback.clearance=NAN;
+    v.feedback.support=v.feedback.object_height=v.feedback.clearance=NAN;
     v.feedback.object_local=v.feedback.alignment_delta_base={NAN,NAN,NAN};
     if (!(capabilities&2)) v.feedback.fixed_force=v.feedback.moving_force=NAN;
     return v;
@@ -202,7 +202,8 @@ int main()
       for(int n=0;n<12;++n)tick(g,v);assert(g.phase==FixedPhase::Hold);
       for(int n=0;n<52;++n)tick(g,v);
       assert(g.phase==FixedPhase::Done && std::isnan(g.actual_lift));
-      assert(std::abs(g.tool_progress-.04f)<1e-6f && std::isnan(v.feedback.object_height));++cases;
+      assert(std::abs(g.tool_progress-.04f)<1e-6f && std::isnan(v.feedback.object_height) &&
+          std::isnan(v.feedback.support));++cases;
     } // Contact retention plus measured tool extraction is not object-height observation.
     { auto v=contactInput(3);FixedGrasp g;closeAndLift(g,v);
       // A changed body/arm frame moves all current coordinates together; it
@@ -271,15 +272,39 @@ int main()
       g.request(3,6,v.motion.binding,v);auto a=tick(g,v);
       assert(g.phase==FixedPhase::Canceled && a.stop && !a.jaw && std::isnan(g.actual_lift));++cases;
     }
-    { auto v=contactInput(3);FixedGrasp g;closeAndLift(g,v);
-      v.feedback.support=.1f;v.motion.measured=v.motion.accepted=v.lift_goal;
+    { auto v=healthy();FixedGrasp g;closeAndLift(g,v);
+      v.feedback.object_height+=.035f;v.feedback.support=.1f;v.motion.measured=v.motion.accepted=v.lift_goal;
       for(int n=0;n<15;++n)tick(g,v);assert(g.phase==FixedPhase::Lift);
       v.feedback.support=0;for(int n=0;n<12;++n)tick(g,v);assert(g.phase==FixedPhase::Hold);
       v.feedback.support=.1f;auto a=tick(g,v);
       assert(g.phase==FixedPhase::Fault && g.fault==FixedFault::Support && a.stop);++cases;
-    } // Tool motion alone is insufficient when the object still touches support.
+    } // Source 1 still requires observed support release and faults on recontact.
+    { auto v=healthy();FixedGrasp g;closeAndLift(g,v);
+      v.feedback.object_height+=.035f;v.motion.measured=v.motion.accepted=v.lift_goal;
+      for(int n=0;n<64;++n)tick(g,v);assert(g.phase==FixedPhase::Done);
+      v.feedback.support=.1f;auto a=tick(g,v);
+      assert(g.phase==FixedPhase::Fault && g.fault==FixedFault::Support && a.stop);++cases;
+    } // Source 1 still monitors support recontact after completing its hold.
     { auto v=healthy();FixedGrasp g;closeAndLift(g,v);v.feedback.object_local.x+=.046f;
       auto a=tick(g,v);assert(g.phase==FixedPhase::Fault && g.fault==FixedFault::Lost && a.stop);++cases;
     } // The old source retains its directly measured relative-object loss check.
+    { for(float support:{0.f,.1f,1.f,INFINITY,-INFINITY}) {
+          auto v=contactInput(3);v.feedback.support=support;FixedGrasp g;
+          g.request(1,4,v.motion.binding,v);assert(!g.owns());
+      } ++cases;
+    } // Source 2 rejects even zero support: unknown must never become measured release.
+    { auto v=contactInput(3);FixedGrasp g;closeAndLift(g,v);
+      v.feedback.support=0.f;auto a=tick(g,v);
+      assert(g.phase==FixedPhase::Fault && a.stop && std::isnan(g.actual_lift));++cases;
+    } // Unknown support may not silently change to a finite claim during ownership.
+    { auto v=healthy();v.feedback.support=NAN;FixedGrasp g;
+      g.request(1,4,v.motion.binding,v);assert(!g.owns());++cases;
+    } // Source 1 never inherits source 2's unknown-support permission.
+    { auto v=contactInput(3);FixedGrasp g;closeAndLift(g,v);
+      v.motion.measured=v.motion.accepted=v.motion.goal;
+      v.motion.measured.z-=.024f;v.motion.accepted=v.motion.measured;
+      for(int n=0;n<20;++n)tick(g,v);
+      assert(g.phase==FixedPhase::Lift && g.tool_progress<.025f && std::isnan(g.actual_lift));++cases;
+    } // Bilateral force with unknown support cannot replace the 25mm extraction evidence.
     std::printf("PASS: %u fixed-grasp logic cases (synthetic; not physical grasp proof)\n",cases);
 }

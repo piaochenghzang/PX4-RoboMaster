@@ -21,7 +21,7 @@ float32 sample_window_s
 float32 fixed_fraction
 float32 moving_fraction
 float32 bilateral_fraction
-float32 support_fraction
+float32 support_fraction # source 1 only; NaN for pad-only source 2
 float32 other_fraction
 float32 support_arm_fraction
 float32 fixed_normal_n
