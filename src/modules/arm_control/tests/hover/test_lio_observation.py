@@ -14,6 +14,33 @@ def sample(stamp):
     return (stamp,[stamp*.01,0.,.9,1.,0.,0.,0.])
 
 
+class DenseLaunchTests(unittest.TestCase):
+    def test_override_is_case_local_and_follows_the_original_config_load(self):
+        import tempfile
+        import xml.etree.ElementTree as ET
+        from sim_scene import write_lio_launch
+        text='<launch><arg name="alignment_source" default="lio_origin"/><rosparam file="source.yaml" command="load"/><node pkg="fast_lio" type="fastlio_mapping" name="laserMapping"><remap from="/cloud_registered" to="/fastlio/cloud_registered"/></node></launch>'
+        with tempfile.TemporaryDirectory() as folder:
+            source=Path(folder)/'source.launch';dest=Path(folder)/'case.launch';source.write_text(text)
+            write_lio_launch(source,dest)
+            self.assertEqual(source.read_text(),text)
+            actual=ET.parse(dest).getroot();original=ET.fromstring(text)
+            self.assertEqual([ET.tostring(e) for e in actual[:-1]],[ET.tostring(e) for e in original])
+            self.assertEqual(actual[-1].attrib,dict(name='/publish/dense_publish_en',value='true',type='bool'))
+            # Repeated generation cannot leave conflicting direct overrides.
+            write_lio_launch(dest,dest)
+            self.assertEqual(len(ET.parse(dest).findall("param[@name='/publish/dense_publish_en']")),1)
+
+    def test_unexpected_node_scope_is_rejected(self):
+        import tempfile
+        from sim_scene import write_lio_launch
+        with tempfile.TemporaryDirectory() as folder:
+            source=Path(folder)/'source.launch';dest=Path(folder)/'case.launch'
+            source.write_text('<launch><group ns="other"><node pkg="fast_lio" type="fastlio_mapping" name="laserMapping"/></group></launch>')
+            with self.assertRaisesRegex(ValueError,'global FAST-LIO'):write_lio_launch(source,dest)
+            self.assertFalse(dest.exists())
+
+
 class PoseWindowTests(unittest.TestCase):
     def poses(self):
         return [sample(round(t*.1,10)) for t in range(9,22)]

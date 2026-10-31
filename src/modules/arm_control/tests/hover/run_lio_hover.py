@@ -14,7 +14,7 @@ from known_target import rotation,quintic_segment,pose
 from lidar_grasp_demo import LidarDemoPlan,TargetObservation
 from lio_tool_observer import LioToolObserver
 from native_client import NativeClient
-from sim_scene import ROOT,BUILD,WS,MODELS,make_world,save,stop,SIM_VISION_PARAMS
+from sim_scene import ROOT,BUILD,WS,MODELS,make_world,save,stop,SIM_VISION_PARAMS,write_lio_launch
 
 PARAMS=dict(SIM_VISION_PARAMS,EKF2_EV_CTRL=11,EKF2_MAG_TYPE=5,EKF2_EVP_NOISE=.05,
     EKF2_EVA_NOISE=.03,EKF2_DELAY_MAX=150,EKF2_TAU_VEL=.05,
@@ -189,6 +189,9 @@ def main():
     mavros=Path(sp.check_output(['rospack','find','mavros'],env=env,text=True).strip())/'launch'
     cfg=yaml.safe_load((mavros/'px4_config.yaml').read_text());cfg['time']['timesync_mode']='PASSTHROUGH';cfg['conn']['timesync_rate']=0.
     if args.fuse_lio_velocity:cfg['odometry']['fcu']['odom_parent_id_des']='map'
+    lio_launch=WS/'src/super_px4_bridge/launch/fastlio_sim.launch'
+    if args.approach_lio:
+        write_lio_launch(lio_launch,folder/'fastlio.launch');lio_launch=folder/'fastlio.launch'
     save(folder/'mavros_config.json',cfg);launch=ET.parse(mavros/'px4.launch')
     launch.find("include/arg[@name='config_yaml']").set('value',str(folder/'mavros_config.json'));launch.write(folder/'mavros.launch')
     save(folder/'manifest.json',dict(stage='LIO_CONTACT_FIXED_GRASP' if args.grasp_lio else 'LIO_FK_NO_CLOSE_APPROACH' if args.approach_lio else 'LIO_CANDIDATE_NAVIGATION_NO_ARM_MOTION' if args.navigate_candidate else 'LIO_TARGET_OBSERVATION_NO_ARM_MOTION' if args.observe_target else 'LIO_LOCAL_FLIGHT_NO_ARM_MOTION',ground_truth_control_inputs=False,
@@ -196,6 +199,7 @@ def main():
         target_observation=args.observe_target,encoder_fk_observation=args.observe_target,read_only_ik_inspection=args.inspect_ik,candidate_navigation=args.navigate_candidate,lio_fk_approach=args.approach_lio,closing_allowed=args.grasp_lio,grasp_feedback_source='SIM_CONTACT_NO_OBJECT_POSE' if args.approach_lio else 'DISABLED',external_velocity_fused=args.fuse_lio_velocity,
         external_odometry_source='LIO_TWO_POSE_SOURCE_MIDPOINT' if args.fuse_lio_velocity else 'LIO_SCAN_END_POSE_ONLY',
         external_odometry_stddev=dict(position_m=.05,orientation_rad=.03,velocity_m_s=LIO_VELOCITY_STD,angular_velocity_rad_s=.05) if args.fuse_lio_velocity else None,
+        registered_cloud_source='UNDISTORTED_POINTS' if args.approach_lio else 'ESTIMATOR_VOXEL_POINTS',
         observation_local_goal_m=[.3,0,.9],sim_speed_factor=speed))
     os.environ.update(ROS_MASTER_URI=env['ROS_MASTER_URI'],ROS_HOSTNAME='localhost');os.environ.pop('ROS_IP',None)
     procs=[];logs=[];subs=[];pub=None;fcu_pub=None;latest={};result=dict(success=False);begin=end=None;observation=None
@@ -287,7 +291,7 @@ def main():
         px4=start('px4',[str(BUILD/'bin/px4'),'-d',str(BUILD/'etc')],folder/'rootfs')
         start('mavros',['roslaunch',str(folder/'mavros.launch'),'fcu_url:=udp://:14540@127.0.0.1:14580'])
         while rospy.Time.now().to_sec()<5:health();time.sleep(.05)
-        start('fastlio',['roslaunch','super_px4_bridge','fastlio_sim.launch','alignment_source:=lio_origin','publish_to_fcu:='+str(not args.fuse_lio_velocity).lower()])
+        start('fastlio',['roslaunch',str(lio_launch),'alignment_source:=lio_origin','publish_to_fcu:='+str(not args.fuse_lio_velocity).lower()])
         native=NativeClient(BUILD,env,transport='unix',expected_pid=px4.pid)
         if args.fuse_lio_velocity:
             # PX4 needs 500 valid responses before honoring remote source
@@ -322,6 +326,11 @@ def main():
             raise RuntimeError('Truth entered a control node')
         check_external_graph(graph)
         if args.approach_lio:
+            if rospy.get_param('/publish/dense_publish_en',False) is not True:
+                raise RuntimeError('Fine geometry requires undistorted raw registered points')
+            save(folder/'lio_cloud_source.json',dict(source='UNDISTORTED_POINTS',dense_publish_en=True,
+                filter_size_surf_m=rospy.get_param('/filter_size_surf'),filter_size_map_m=rospy.get_param('/filter_size_map'),
+                estimator_voxel_parameters_unchanged=True))
             from check_fixed_target_native import evidence_json
             contact=native.status('arm_grasp_feedback')
             unknown=[contact.get(k) for k in ('object_height_world','body_support_clearance','vertical_force_n')]

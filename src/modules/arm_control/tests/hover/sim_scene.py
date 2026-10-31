@@ -57,6 +57,20 @@ def save(path,value):
     path.write_text(json.dumps(value,indent=2,allow_nan=False)+'\n')
 
 
+def write_lio_launch(source,destination):
+    """Publish existing undistorted points; leave estimator filtering intact."""
+    launch=ET.parse(source)
+    if launch.find("node[@pkg='fast_lio'][@type='fastlio_mapping']") is None:
+        raise ValueError('Expected global FAST-LIO node')
+    # FAST-LIO uses a global NodeHandle. This follows the YAML load in the
+    # copied launch, so it overrides publication only before any node starts.
+    for param in list(launch.getroot()):
+        if param.tag=='param' and param.get('name','').lstrip('/')=='publish/dense_publish_en':
+            launch.getroot().remove(param)
+    ET.SubElement(launch.getroot(),'param',name='/publish/dense_publish_en',value='true',type='bool')
+    launch.write(destination,encoding='unicode',xml_declaration=True)
+
+
 def add_obstacle(world,description):
     model=ET.SubElement(world,'model',name=description['name'])
     ET.SubElement(model,'static').text='true'

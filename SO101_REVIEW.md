@@ -4858,7 +4858,7 @@ PX4_SIM_SPEED_FACTOR=.35 python3 src/modules/arm_control/tests/hover/run_lio_hov
 
 ### 53.3 验证与剩余工作
 
-SITL与Gazebo MAVLink插件编译通过。当前集中Python回归162项、原生固定抓取49项、许可36项、接近41项、反馈与旧抓取19组、夹指力13项通过；这些是逻辑检查，不能替代物理抓取验收。
+SITL与Gazebo MAVLink插件编译通过。当前集中Python回归164项、原生固定抓取49项、许可36项、接近41项、反馈与旧抓取19组、夹指力13项通过；这些是逻辑检查，不能替代物理抓取验收。
 
 case31已完成实际展开、臂坐标过渡和55 mm对齐（118.980 s，工具误差3.423 mm）。进入40 mm段后原生上下文净空14.93 mm触发保护，未闭爪；取消确认、自有进程清理完成。回放124.821～125.821 s的12帧，最小pair均为活动夹指/handle，盒体下界27.40～33.02 mm；非豁免最小pair为活动夹指/key，77.40～85.42 mm。125.821 s帧扣预测定位和计算运输后普通净空16.220 mm，同一帧精抓策略为57.196 mm；这不是先前触发14.93 mm的同一源帧，不能混为一个数字。
 
@@ -4873,3 +4873,16 @@ PX4_SIM_SPEED_FACTOR=.35 python3 src/modules/arm_control/tests/hover/run_lio_hov
 ```
 
 审阅同一案例目录中的 `contact_preflight.json`、`lio_approach/result.json`、`result.json`；只有全部自有进程已停止且完成物理评分时，才会生成 `grasp_offline_score.json`。不要把原生Done或命令发送成功当作物体实际抓起。
+
+
+### 53.4 速度补偿对照与精接近点云来源（2026-10-31）
+
+case34在case33上只把速度补偿slew由0.05提到0.20 m/s²，幅值仍50 mm/s；位置补偿slew20 mm/s、PID与全部保护不变。已完成55 mm对齐、40 mm预接近并进入精接近（142.903 s）；未闭爪。168.5 s原生Contract退出的具体原因是推力分配保护（hard_hover=0、denial16），context / lease / binding / geometry均有效，sample年龄17 ms、接收年龄8 ms。单侧夹指压缩反馈0.07871 N、另一侧0；取消与清理正常。不能把单侧接触或移动途经点的0.95 mm最小误差称为最终到位 / 抓起。
+
+前两轮停机数据重放表明，旧速度slew在far阶段99.47～100%更新被裁剪，50 mm/s幅值很少触顶；速度补偿剩余误差均值10.54 / 16.09 mm/s。离线重放用200 mm/s²可降至1.84 / 2.31 mm/s，但这不等于真实飞行改善。case34推进更远是单轮实测，仍未通过实际抓起，保留为有待复测的demo参数，不作为PID或实机标定结论。
+
+继续检查发现几何输入存在分辨率不一致：`fastlio_sim.yaml`的surf/map体素均0.15 m，dense_publish_en=false。实际FAST-LIO `publish_frame_world()`在false时发布feats_down_body（PCL 15 cm体素质心），true时发布feats_undistort。下游2 mm格子筛选不能恢复已经丢失的细节，因此旧输出不支持按4 mm点误差做夹爪附近净空判断，亦不能仅通过放大handle掩膜忽略这些点。
+
+本轮仅在LIO精接近入口生成案例自己的`fastlio.launch`，加载原配置后设置全局`/publish/dense_publish_en=true`。既有FAST-LIO节点、IMU/点源、时间戳、SLAM surf/map滤波参数均不改；发布改用现有去畸变原始点。`roslaunch --dump-params`逐键核对，原/新启动参数仅该一个布尔值不同。起飞前再次检查参数并保存`lio_cloud_source.json`；未启用dense就拒绝精接近。原共享launch、ROS工作区未修改。
+
+相关测试核对案例副本不修改源文件、参数覆盖在原配置之后、重复生成无重复覆盖、错误节点作用域拒绝；集中Python回归164项通过。case35正在用真实去畸变注册点重测，尚未验收闭爪、抓起与保持。现有16 mm / 3 mm净空、3 mm闭爪到位、5°、反馈时效、限位及推力分配保护不变。
