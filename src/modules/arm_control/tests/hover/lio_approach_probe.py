@@ -26,8 +26,8 @@ def alignment_bias(previous,ekf_position,lio_position,elapsed):
 
 
 def alignment_velocity(previous,ekf_velocity,lio_velocity,elapsed):
-    """Velocity feedforward bias, capped at 50mm/s and slewed <=50mm/s²."""
-    return _limited_difference(previous,finite(ekf_velocity,(3,))-finite(lio_velocity,(3,)),elapsed,.05,.05)[0]
+    """Velocity feedforward bias, capped at 50mm/s and slewed <=200mm/s²."""
+    return _limited_difference(previous,finite(ekf_velocity,(3,))-finite(lio_velocity,(3,)),elapsed,.05,.20)[0]
 
 
 def filter_tracking_errors(position,velocity,goal,position_bias,velocity_bias):
