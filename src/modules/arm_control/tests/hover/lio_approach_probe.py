@@ -267,7 +267,7 @@ class LioApproachProbe:
                     sent=rospy.Time.now().to_sec();ipc_started=time.perf_counter()
                     self.client.client('arm_control','fixed_grasp_context' if self.grasp else 'hover_task_context',*fields)
                     ack=rospy.Time.now().to_sec();publish_age=ack-row['stamp_s']
-                    timing.write(json.dumps(dict(kind='context',sample_sim_s=now,stamp_s=row['stamp_s'],
+                    timing.write(json.dumps(dict(kind='context',sample_sim_s=now,stamp_s=row['stamp_s'],sample_wall_monotonic_s=sample_started,ack_wall_monotonic_s=time.perf_counter(),
                         lio_stamp_s=row['last_lio_stamp_s'],sample_wall_s=sample_wall,geometry_wall_s=geometry_wall,
                         sent_sim_s=sent,ack_sim_s=ack,prepare_wall_s=ipc_started-sample_started,ipc_wall_s=time.perf_counter()-ipc_started))+'\n');timing.flush()
                     if now-self.last_status<.02:continue

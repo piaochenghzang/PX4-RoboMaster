@@ -180,10 +180,11 @@ def main():
     model.find('pose').text='0 0 .45 0 0 0'
     bridge=model.find("plugin[@name='mavlink_interface']")
     for el in list(bridge):
-        if el.tag in ('enableArmGraspFeedback','armGraspContactOnly','send_odometry','visionSubTopic'):bridge.remove(el)
+        if el.tag in ('enableArmGraspFeedback','armGraspContactOnly','demoWallStepPacing','send_odometry','visionSubTopic'):bridge.remove(el)
     if args.approach_lio:
         ET.SubElement(bridge,'enableArmGraspFeedback').text='true'
         ET.SubElement(bridge,'armGraspContactOnly').text='true'
+        ET.SubElement(bridge,'demoWallStepPacing').text='true'
     if any(e.get('filename')=='libgazebo_vision_plugin.so' for e in model.findall('plugin')):raise RuntimeError('Ground-truth localization source present')
     scene.write(folder/'scene.world',encoding='unicode',xml_declaration=True)
     mavros=Path(sp.check_output(['rospack','find','mavros'],env=env,text=True).strip())/'launch'
@@ -200,6 +201,8 @@ def main():
         external_odometry_source='LIO_TWO_POSE_SOURCE_MIDPOINT' if args.fuse_lio_velocity else 'LIO_SCAN_END_POSE_ONLY',
         external_odometry_stddev=dict(position_m=.05,orientation_rad=.03,velocity_m_s=LIO_VELOCITY_STD,angular_velocity_rad_s=.05) if args.fuse_lio_velocity else None,
         ros_clock_hz=LIO_CLOCK_HZ,registered_cloud_source='UNDISTORTED_POINTS' if args.approach_lio else 'ESTIMATOR_VOXEL_POINTS',
+        demo_wall_step_pacing=args.approach_lio,
+        minimum_wall_step_s=float(scene.findtext('world/physics/max_step_size'))/speed if args.approach_lio else None,
         observation_local_goal_m=[.3,0,.9],sim_speed_factor=speed))
     os.environ.update(ROS_MASTER_URI=env['ROS_MASTER_URI'],ROS_HOSTNAME='localhost');os.environ.pop('ROS_IP',None)
     procs=[];logs=[];subs=[];pub=None;fcu_pub=None;latest={};result=dict(success=False);begin=end=None;observation=None
@@ -329,6 +332,8 @@ def main():
             raise RuntimeError('Truth entered a control node')
         check_external_graph(graph)
         if args.approach_lio:
+            if 'Demo wall-step pacing enabled (no catch-up)' not in (folder/'gazebo.log').read_text(errors='replace'):
+                raise RuntimeError('Demo physics pacing was not enabled')
             if rospy.get_param('/publish/dense_publish_en',False) is not True:
                 raise RuntimeError('Fine geometry requires undistorted raw registered points')
             save(folder/'lio_cloud_source.json',dict(source='UNDISTORTED_POINTS',dense_publish_en=True,
