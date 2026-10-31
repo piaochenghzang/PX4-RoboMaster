@@ -14,7 +14,7 @@ from known_target import rotation,quintic_segment,pose
 from lidar_grasp_demo import LidarDemoPlan,TargetObservation
 from lio_tool_observer import LioToolObserver
 from native_client import NativeClient
-from sim_scene import ROOT,BUILD,WS,MODELS,make_world,save,stop,SIM_VISION_PARAMS,write_lio_launch
+from sim_scene import ROOT,BUILD,WS,MODELS,make_world,save,stop,SIM_VISION_PARAMS,write_lio_launch,LIO_CLOCK_HZ
 
 PARAMS=dict(SIM_VISION_PARAMS,EKF2_EV_CTRL=11,EKF2_MAG_TYPE=5,EKF2_EVP_NOISE=.05,
     EKF2_EVA_NOISE=.03,EKF2_DELAY_MAX=150,EKF2_TAU_VEL=.05,
@@ -199,7 +199,7 @@ def main():
         target_observation=args.observe_target,encoder_fk_observation=args.observe_target,read_only_ik_inspection=args.inspect_ik,candidate_navigation=args.navigate_candidate,lio_fk_approach=args.approach_lio,closing_allowed=args.grasp_lio,grasp_feedback_source='SIM_CONTACT_NO_OBJECT_POSE' if args.approach_lio else 'DISABLED',external_velocity_fused=args.fuse_lio_velocity,
         external_odometry_source='LIO_TWO_POSE_SOURCE_MIDPOINT' if args.fuse_lio_velocity else 'LIO_SCAN_END_POSE_ONLY',
         external_odometry_stddev=dict(position_m=.05,orientation_rad=.03,velocity_m_s=LIO_VELOCITY_STD,angular_velocity_rad_s=.05) if args.fuse_lio_velocity else None,
-        registered_cloud_source='UNDISTORTED_POINTS' if args.approach_lio else 'ESTIMATOR_VOXEL_POINTS',
+        ros_clock_hz=LIO_CLOCK_HZ,registered_cloud_source='UNDISTORTED_POINTS' if args.approach_lio else 'ESTIMATOR_VOXEL_POINTS',
         observation_local_goal_m=[.3,0,.9],sim_speed_factor=speed))
     os.environ.update(ROS_MASTER_URI=env['ROS_MASTER_URI'],ROS_HOSTNAME='localhost');os.environ.pop('ROS_IP',None)
     procs=[];logs=[];subs=[];pub=None;fcu_pub=None;latest={};result=dict(success=False);begin=end=None;observation=None
@@ -207,7 +207,7 @@ def main():
     tool_observer=None;tool_log=None;tool_start=None;tool_count=0
     inspection_thread=None;inspection={}
     clouds=deque(maxlen=10);candidate_route=None;candidate_held=None;candidate_baseline=None
-    candidate_samples=[];last_tool_row=None
+    candidate_samples=[];last_tool_row=None;filter_messages=deque(maxlen=50)
     approach_probe=None;fine_bias=np.zeros(3);fine_velocity=np.zeros(3);last_bias=None
     def odom_pose(message):
         p=message.pose.pose;q=p.orientation
@@ -227,6 +227,8 @@ def main():
         if [nodes for name,nodes in graph[0] if name==topic]!=[[node]]:raise RuntimeError('Unexpected FCU odometry publisher')
         other='/mavros/vision_pose/pose_cov' if args.fuse_lio_velocity else '/mavros/odometry/out'
         if any(nodes for name,nodes in graph[0] if name==other):raise RuntimeError('Duplicate FCU external input')
+    def receive_filter(message):
+        latest['odom']=message;filter_messages.append(message)
     def receive_lio(message):
         nonlocal external_count,external_max_age
         latest['lio']=message
@@ -264,6 +266,7 @@ def main():
             if time.monotonic()>deadline:raise RuntimeError('ROS unavailable')
             time.sleep(.1)
         sp.run(['rosparam','set','/use_sim_time','true'],env=env,check=True)
+        sp.run(['rosparam','set','/gazebo/pub_clock_frequency',str(LIO_CLOCK_HZ)],env=env,check=True)
         rospy.init_node('lio_hover_probe',disable_signals=True)
         if args.fuse_lio_velocity:fcu_pub=rospy.Publisher('/mavros/odometry/out',Odometry,queue_size=5)
         if args.observe_target:
@@ -280,7 +283,7 @@ def main():
         for topic,typ,key in [('/mavros/state',State,'state'),('/mavros/local_position/odom',Odometry,'odom'),
             ('/grasp_demo/flight_state',String,'manager'),
             ('/grasp_demo/known_status',KnownFlightStatus,'known')]:
-            subs.append(rospy.Subscriber(topic,typ,lambda m,k=key:latest.__setitem__(k,m),queue_size=50,tcp_nodelay=True))
+            subs.append(rospy.Subscriber(topic,typ,receive_filter if key=='odom' else lambda m,k=key:latest.__setitem__(k,m),queue_size=50,tcp_nodelay=True))
         subs.append(rospy.Subscriber('/lidar_slam/odom',Odometry,receive_lio,queue_size=50,tcp_nodelay=True))
         if args.navigate_candidate:
             subs.append(rospy.Subscriber('/cloud_registered',PointCloud2,clouds.append,queue_size=5,tcp_nodelay=True))
@@ -353,6 +356,12 @@ def main():
                 if now>(400 if args.grasp_lio else 320 if args.approach_lio else 170 if args.navigate_candidate else 110):raise RuntimeError('Simulation-time flight deadline')
                 if route is None and now-begin>30 and manager and manager.data!='HOVER_READY':
                     raise RuntimeError('Takeoff did not reach stable hover within 30 simulation seconds')
+                if odom is not None and args.approach_lio:
+                    # Retain latest-source validation, then pair an actual past
+                    # filter frame instead of clearing dwell on clock races.
+                    if not -.02<=now-odom.header.stamp.to_sec()<.2:raise RuntimeError('EKF output stale')
+                    from lio_control_sample import past_filter_message
+                    odom=past_filter_message(filter_messages,now)
                 if not (odom and lio and state and manager):time.sleep(.01);continue
                 if not -.02<=now-lio.header.stamp.to_sec()<.2:raise RuntimeError('LIO input stale')
                 if not -.02<=now-odom.header.stamp.to_sec()<.2:raise RuntimeError('EKF output stale')

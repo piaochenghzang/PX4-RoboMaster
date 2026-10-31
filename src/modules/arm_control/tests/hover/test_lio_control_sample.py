@@ -131,6 +131,24 @@ class PredictionTests(unittest.TestCase):
 
 
 
+class FilterHistoryTests(unittest.TestCase):
+    def test_filter_history_returns_the_actual_latest_past_message(self):
+        from types import SimpleNamespace
+        from lio_control_sample import past_filter_message
+        def frame(t):return SimpleNamespace(header=SimpleNamespace(stamp=SimpleNamespace(to_sec=lambda:t)))
+        a,b,c=frame(1.18),frame(1.20),frame(1.22)
+        history=deque([a,b,c]);saved=list(history)
+        self.assertIs(past_filter_message(history,1.201),b)
+        self.assertIs(past_filter_message(history,1.221),c)
+        self.assertEqual(list(history),saved)
+        self.assertIsNone(past_filter_message([c],1.201))
+        # Expired samples are not relabelled or dropped to hide the caller's
+        # existing 200ms selected-source freshness rejection.
+        self.assertIs(past_filter_message([a],1.5),a)
+        self.assertEqual(a.header.stamp.to_sec(),1.18)
+        with self.assertRaisesRegex(ValueError,'CURRENT_TIME'):past_filter_message(history,float('nan'))
+
+
 class FlightPairTests(unittest.TestCase):
     def test_moving_body_is_not_misclassified_as_a_coordinate_bias(self):
         source=observer()

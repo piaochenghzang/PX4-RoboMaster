@@ -165,6 +165,16 @@ class ReadOnlyObserverTests(unittest.TestCase):
         self.assertFalse(row['motion_permission']);self.assertFalse(row['close_permission'])
         self.assertIsNone(self.node.sample(1.16))  # A sample cannot be restamped/reused.
 
+    def test_clock_callback_race_uses_a_real_past_bracketed_joint_sample(self):
+        self.node.lock_target(target_input())
+        self.node.on_body(message_pose(1.));self.node.on_body(message_pose(1.1,.1))
+        self.node.on_joints(self.joints(1.04));self.node.on_joints(self.joints(1.06))
+        row=self.node.sample(1.05)
+        self.assertEqual(row['stamp_s'],1.04)
+        self.assertEqual(self.node.joints[-1][0],1.06)
+        self.assertIsNone(self.node.sample(1.055))
+        self.assertEqual(self.node.sample(1.065)['stamp_s'],1.06)
+
     def test_missing_body_endpoint_cannot_produce_an_extrapolated_sample(self):
         self.node.lock_target(target_input())
         self.node.on_body(message_pose(1.));self.node.on_body(message_pose(1.1))

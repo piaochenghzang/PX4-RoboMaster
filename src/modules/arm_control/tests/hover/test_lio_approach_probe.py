@@ -155,6 +155,37 @@ class LioCancellationTests(unittest.TestCase):
         self.assertFalse(cancellation_ack(state,dict(joint_target=[0.]*5+[float('nan')]),IDS,.3,100))
 
 
+class RejectedStartCleanupTests(unittest.TestCase):
+    def probe(self,folder,*,changed=False,request=101):
+        p=LioApproachProbe.__new__(LioApproachProbe)
+        p.stop_event=Mock();p.thread=Mock();p.thread.is_alive.return_value=False
+        p.folder=Path(folder);p.grasp=True;p.jaw=.3;p.ids=IDS;p.motion_requested=True;p.complete=False
+        p.error=None;p.events=[];p.last_record=None;p.closing_requested=False
+        p.native=dict(last_request_id=100)
+        p.baseline=dict(joint_target=[-.07,-1.175,1.45,1.3,-1.57,.3]);p.arm=copy.deepcopy(p.baseline)
+        arm=copy.deepcopy(p.baseline)
+        if changed:arm['joint_target'][1]+=.01
+        state=dict(mode=1,phase=0,ownership_locked=False,request_result=3,last_request_id=request,jaw_target=.3)
+        p.client=Mock();p.client.status.side_effect=lambda topic:state if topic=='arm_approach_status' else arm
+        return p
+
+    def test_rejected_unowned_start_has_a_confirmed_no_motion_cancel_result(self):
+        with TemporaryDirectory() as folder:
+            p=self.probe(folder);result=p.finish()
+            self.assertFalse(result['completed'])
+            self.assertTrue(result['cancellation']['acknowledged'])
+            self.assertTrue(result['cancellation']['motion_not_acquired'])
+            self.assertTrue(result['cancellation']['jaw_unchanged'])
+            p.client.client.assert_called_once_with('arm_control','fixed_grasp_cancel',*IDS)
+
+    def test_an_old_response_or_changed_joint_targets_cannot_claim_no_motion(self):
+        for changed,request in ((True,101),(False,100)):
+            with self.subTest(changed=changed,request=request),TemporaryDirectory() as folder:
+                p=self.probe(folder,changed=changed,request=request)
+                with patch('lio_approach_probe.time.monotonic',side_effect=[0.,.1,3.]),patch('lio_approach_probe.time.sleep'):
+                    with self.assertRaisesRegex(RuntimeError,'not acknowledged'):p.finish()
+
+
 class LioPrecisionTests(unittest.TestCase):
     def geometry(self,name,*,support_x=.4,points=None,extra=None):
         row=dict(map_from_body=np.eye(4),map_from_arm=np.eye(4),

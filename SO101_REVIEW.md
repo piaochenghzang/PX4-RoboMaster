@@ -4909,3 +4909,16 @@ case37进行不改保护的传递链修正：
 - 同一案例新增`lio_approach/timing.jsonl`，记录每次成功context的源时间、采样/几何wall耗时、发送/返回ROS时刻与IPC wall耗时，以及每次诊断RPC起止。暂缓/重复样本等早退不落该日志，故空窗仍须结合bag核对，不能把它当全部线程调度跟踪。
 
 新增配对边界/旧帧过期拒绝测试通过，相关67项测试和Python语法检查通过。case37在0.25倍率使用同一原始注册点源重测，实际闭爪 / 抓起尚未验收。
+
+
+### 53.7 拒绝回执和同一时刻的飞控配对（2026-10-31）
+
+case37没有取得固定抓取所有权，却一直等待start回执：旧adapter仅在owns时发布status，被拒绝的request_id/result未对外可见。已人工中止，所有自有进程停止；旧取消逻辑还报未确认，不能把这轮写成取消ACK通过或机械臂实际展开。
+
+修正复用既有status：`reportsStatus()`在当前fixed上下文收到请求后即报告拒绝，caller避免再以默认generic状态覆盖；已有generic owner优先。未持权时motion_authorized必须false，source2的actual_lift保持NaN。未取得所有权时，只有本次新cancel回执明确Idle/Rejected/noOwner且全部关节目标未变，外部才报告motion_not_acquired；旧回执或目标变化均拒绝，该正反用例已通过。
+
+直接gzserver曾绕过标准ROS launch的时钟设置；本demo改用`/gazebo/pub_clock_frequency=100`，与已安装empty_world.launch默认一致。[Gazebo ROS参数读取实现](https://github.com/ros-simulation/gazebo_ros_pkgs/blob/noetic-devel/gazebo_ros/src/gazebo_ros_api_plugin.cpp)。运输余量和计算年龄额外保守计入10 ms时钟周期，原生100 ms样本限制不变。case38出现正常回调比100 Hz本地clock略早，latest filter帧暂时不可配对并反复清零8 s观察位到位计时；尚未启动臂，已中止。
+
+case39使用真实飞控历史帧配对：保留最新源的原[-20 ms,200 ms]有效性检查，再从50帧缓冲选不晚于当前clock的最新原消息；选中帧仍须通过原200 ms检查，不重盖时间、不隐藏过期。只读FK同样只选择不晚于clock且有LIO前后括号的真实joint帧。没有缩短原到位连续等待，也未改变悬停/闭爪阈值。新增测试证明对象和源时间不变、未来帧未采用、过期仍由原检查拒绝。
+
+当前相关Python99项、原生Fixed50项、SITL编译通过。case39继续验证同一无物体位姿真值链；在线闭爪、实际抬起和保持仍待这轮结果，不以静态IK或命令回执代替物理验收。

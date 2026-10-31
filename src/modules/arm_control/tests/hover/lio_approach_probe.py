@@ -10,6 +10,7 @@ from lio_tool_observer import finite,inverse
 from lio_control_sample import sample_control
 from candidate_hover import angle_deg
 from lio_box_gaps import box_gaps
+from sim_scene import LIO_CLOCK_HZ
 
 
 def _limited_difference(previous,delta,elapsed,limit,rate):
@@ -229,7 +230,7 @@ class LioApproachProbe:
                     now=rospy.Time.now().to_sec();lease=self.latest.get('known')
                     if not self.bound_lease(lease):continue
                     if self.prepare_since is None:self.prepare_since=now
-                    if self.stage in ('prepare','prepare_ack') and now-self.prepare_since>30:
+                    if self.stage in ('prepare','prepare_ack','start_ack') and now-self.prepare_since>30:
                         raise RuntimeError('LIO grasp preparation did not pass within 30 simulation seconds')
                     sample_started=time.perf_counter()
                     row=sample_control(self.observer,now)
@@ -248,7 +249,7 @@ class LioApproachProbe:
                     sweep=jaw_sweep_geometry(row,self.config,self.geometry,self.static,self.points,precision=True) if fine else None
                     jaw_clearance=0. if self.grasp else None
                     geometry_wall=time.perf_counter()-geometry_started
-                    compute_age=max(0.,rospy.Time.now().to_sec()-row['stamp_s'])
+                    compute_age=max(0.,rospy.Time.now().to_sec()-row['stamp_s'])+1./LIO_CLOCK_HZ
                     if compute_age>.1:
                         self.holding=None
                         continue
@@ -268,7 +269,7 @@ class LioApproachProbe:
                     ack=rospy.Time.now().to_sec();publish_age=ack-row['stamp_s']
                     timing.write(json.dumps(dict(kind='context',sample_sim_s=now,stamp_s=row['stamp_s'],
                         lio_stamp_s=row['last_lio_stamp_s'],sample_wall_s=sample_wall,geometry_wall_s=geometry_wall,
-                        sent_sim_s=sent,ack_sim_s=ack,ipc_wall_s=time.perf_counter()-ipc_started))+'\n');timing.flush()
+                        sent_sim_s=sent,ack_sim_s=ack,prepare_wall_s=ipc_started-sample_started,ipc_wall_s=time.perf_counter()-ipc_started))+'\n');timing.flush()
                     if now-self.last_status<.02:continue
                     self.last_status=now
                     # Read one diagnostic topic between context publications;
@@ -402,6 +403,15 @@ class LioApproachProbe:
                 expected_jaw=state.get('jaw_target',float('nan')) if grasp else jaw
                 before=self.arm['joint_target'][5] if grasp else jaw
                 retained=(not grasp or (math.isfinite(expected_jaw) and .039999<=expected_jaw<=before+1e-6))
+                # If start was rejected, there is no owned motion to cancel.
+                # Still require the fresh response to THIS cancel and unchanged
+                # targets, so a missing acknowledgment cannot masquerade as idle.
+                if (grasp and state.get('mode')==1 and state.get('phase')==0 and
+                        state.get('ownership_locked') is False and state.get('request_result')==3 and
+                        state.get('last_request_id',0)>self.cancel_after and
+                        np.max(np.abs(np.array(arm['joint_target'])-self.baseline['joint_target']))<1e-6):
+                    canceled=dict(acknowledged=True,status=state,motion_not_acquired=True,
+                        jaw_held_rad=arm['joint_target'][5],jaw_unchanged=True,jaw_bias_retained=True);break
                 if retained and cancellation_ack(state,arm,self.ids,expected_jaw,self.cancel_after,grasp=grasp):
                     if grasp:
                         time.sleep(.02)

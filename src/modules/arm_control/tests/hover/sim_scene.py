@@ -30,6 +30,7 @@ LIO_ROOM=tuple(dict(name='demo_obstacle_room_'+str(i),center=c,size=z,color=(.6,
     for i,(c,z) in enumerate([((-3.,0.,2.),(.1,8.,4.)),((6.,0.,2.),(.1,8.,4.)),
         ((1.5,-4.,2.),(9.,.1,4.)),((1.5,4.,2.),(9.,.1,4.)),((1.5,0.,4.5),(9.,8.,.1))]))
 VEHICLE_OBSTACLE_RADIUS=.45
+LIO_CLOCK_HZ=100.  # Same as gazebo_ros empty_world.launch; avoid unbounded /clock traffic.
 # Isolated demo-only simulated localization and native gains, not real VIO.
 # No production airframe parameters are changed; fixed-demo native timing is
 # documented in SO101_REVIEW.md. Sensor freshness and collision guards remain.

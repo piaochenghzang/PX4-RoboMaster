@@ -84,7 +84,7 @@ class LioToolObserver:
             if not math.isfinite(now) or now<=0:raise ValueError('CURRENT_TIME')
             if self.target is None or len(self.body)<2 or not self.joints:return None
             # Use an actual encoder measurement with a before/after LIO pair.
-            candidates=[r for r in self.joints if max(self.body[0][0],self.target_stamp,self.last_stamp)<r[0]<=self.body[-1][0]]
+            candidates=[r for r in self.joints if max(self.body[0][0],self.target_stamp,self.last_stamp)<r[0]<=min(self.body[-1][0],now)]
             if not candidates:return None
             t,q,velocity=candidates[-1]
             if not 0<=now-t<=.2:raise ValueError('PAIRED_STATE_STALE_OR_FUTURE')

@@ -72,6 +72,20 @@ def predict_body(samples,joint_stamp,max_prediction=.12,max_linear_speed=.3,max_
 
 
 
+def past_filter_message(samples,now):
+    """Newest received filter frame no later than the sampled ROS clock.
+
+    Return the original measurement, never a retimed copy. The caller keeps
+    its existing latest-source and selected-frame freshness checks.
+    """
+    if not math.isfinite(now) or now<=0:raise ValueError('CURRENT_TIME')
+    for message in reversed(list(samples)):
+        stamp=float(message.header.stamp.to_sec())
+        if not math.isfinite(stamp) or stamp<=0:raise ValueError('FILTER_SOURCE_TIME')
+        if stamp<=now:return message
+    return None
+
+
 def flight_control_sample(observer,filter_stamp,now):
     """Compare EKF and LIO at the filter's actual sample time.
 
