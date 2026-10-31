@@ -3,7 +3,6 @@
 
 void ArmControl::updateHoverPermit()
 {
-    const uint64_t now=hrt_absolute_time();
     arm_hover_context_s c{};
     if (_hover_context_sub.update(&c)) {
         // Replays cannot renew local receipt time. Epoch changes are consumed
@@ -16,17 +15,26 @@ void ArmControl::updateHoverPermit()
     vehicle_land_detected_s land{}; control_allocator_status_s allocation{}; actuator_motors_s motors{};
     const bool present=_hover_vehicle_sub.copy(&vehicle) && _hover_position_sub.copy(&position) &&
         _hover_land_sub.copy(&land) && _hover_allocator_sub.copy(&allocation) && _hover_motors_sub.copy(&motors);
-    auto fresh=[now](uint64_t stamp,uint64_t limit) { return stamp && stamp<=now && now-stamp<=limit; };
     estimator_status_flags_s flags{}; vehicle_odometry_s external{};
     so101_hover::LocalHeading local{};
     estimator_selector_status_s selector{};
     // Local position is selector output; fusion flags must belong to that EKF.
-    const bool selected=!_hover_estimator_selector_sub.advertised() ?
-        _hover_estimator_flags_sub.ChangeInstance(0) :
-        (_hover_estimator_selector_sub.copy(&selector) && fresh(selector.timestamp,1200000) &&
+    const bool selector_advertised=_hover_estimator_selector_sub.advertised();
+    const bool selected=!selector_advertised ? _hover_estimator_flags_sub.ChangeInstance(0) :
+        (_hover_estimator_selector_sub.copy(&selector) &&
          position.timestamp>=selector.last_instance_change &&
          _hover_estimator_flags_sub.ChangeInstance(selector.primary_instance));
-    if (selected && _hover_estimator_flags_sub.copy(&flags) && _hover_external_odometry_sub.copy(&external)) {
+    const bool heading_present=selected && _hover_estimator_flags_sub.copy(&flags) &&
+        _hover_external_odometry_sub.copy(&external);
+    arm_hover_request_s request{};
+    const bool request_updated=_hover_request_sub.update(&request);
+    // A SITL clock tick can advance while these subscriptions are copied.
+    // Check every snapshot against the time AFTER copying it: a newly
+    // published allocator/heading sample is not a future sensor timestamp.
+    const uint64_t now=hrt_absolute_time();
+    auto fresh=[now](uint64_t stamp,uint64_t limit) { return stamp && stamp<=now && now-stamp<=limit; };
+    const bool selection_fresh=!selector_advertised || fresh(selector.timestamp,1200000);
+    if (heading_present && selection_fresh) {
         local.now=now; local.flags_stamp=flags.timestamp;
         local.received=external.timestamp; local.sample=external.timestamp_sample;
         local.fused=flags.cs_ev_pos && flags.cs_ev_hgt && flags.cs_ev_vel && flags.cs_ev_yaw;
@@ -64,13 +72,19 @@ void ArmControl::updateHoverPermit()
     in.tilt=_hover_context.tilt; in.position_error=_hover_context.hover_position_error;
     in.alignment_error=_hover_context.alignment_error; in.relative_speed=_hover_context.relative_speed;
     in.orientation_error=_hover_context.orientation_error;
+    const uint16_t previous_denial=_hover_gate.denial;
     _hover_gate.update(in);
+    if ((_hover_gate.denial & so101_hover::Allocation) && !(previous_denial & so101_hover::Allocation)) {
+        PX4_WARN("hover allocation present=%u age=%.4f motors_age=%.4f max=%.5f",unsigned(present),
+            (double(now)-double(allocation.timestamp))*1e-6,(double(now)-double(motors.timestamp))*1e-6,(double)in.motor_max);
+        PX4_WARN("hover allocator thrust=%u torque=%u failure=%u stop=%u",unsigned(allocation.thrust_setpoint_achieved),
+            unsigned(allocation.torque_setpoint_achieved),unsigned(allocation.handled_motor_failure_mask),unsigned(allocation.motor_stop_mask));
+    }
     const bool arm_ready=_command_initialized && _joint_feedback_valid && _last_feedback_time &&
         now>=_last_feedback_time && now-_last_feedback_time<=200000;
     const bool eligible=_hover_gate.start_ready && !_grasp.owns() && !_hover_approach.owns() && !_fixed_grasp.owns() && arm_ready;
     _hover_preparation.update(_hover_gate.task,eligible);
-    arm_hover_request_s request{};
-    if (_hover_request_sub.update(&request)) {
+    if (request_updated) {
         bool request_valid=false;
 #if defined(CONFIG_ARCH_BOARD_PX4_SITL)
         request_valid=request.action==arm_hover_request_s::PREPARE && fresh(request.timestamp,300000);
