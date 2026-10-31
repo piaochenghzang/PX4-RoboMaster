@@ -147,8 +147,12 @@ def sample_control(observer,now):
         # actual buffered measurements no later than this clock read, rather
         # than treating the newest callback as a future-time sensor failure.
         body_samples=[(float(t),list(p)) for t,p in observer.body if t<=now][-3:]
-        joints=next((r for r in reversed(observer.joints) if 0<=now-r[0]<=.05+1e-9),None)
-        if len(body_samples)<2 or joints is None:return None
+        if len(body_samples)<2:return None
+        # Pick the newest ACTUAL encoder sample within the available LIO
+        # horizon, not an unpairable newer sample that discards valid history.
+        joints=next((r for r in reversed(observer.joints) if 0<=now-r[0]<=.05+1e-9
+            and body_samples[0][0]<=r[0]<=body_samples[-1][0]+.12+1e-9),None)
+        if joints is None:return None
         stamp,q,dq=joints
         stamp=float(stamp);q=finite(q,(6,)).copy();dq=finite(dq,(6,)).copy()
         target=finite(observer.target,(4,4)).copy();reference=finite(observer.reference,(3,)).copy()

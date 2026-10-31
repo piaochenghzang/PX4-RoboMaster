@@ -294,6 +294,19 @@ class ControlSampleTests(unittest.TestCase):
         self.assertAlmostEqual(row['prediction_s'],.021)
         self.assertIsNotNone(flight_control_sample(source,1.221,1.23))
 
+    def test_newest_pairable_encoder_is_selected_with_all_original_bounds(self):
+        source=observer()
+        source.joints.extend([(1.22,np.zeros(6),np.zeros(6)),(1.24,np.ones(6),np.ones(6))])
+        row=sample_control(source,1.24)
+        self.assertEqual(row['stamp_s'],1.22)
+        self.assertAlmostEqual(row['prediction_s'],.12)
+        self.assertAlmostEqual(row['source_age_s'],.02)
+        np.testing.assert_array_equal(row['joint_position_rad'],np.zeros(6))
+        self.assertEqual(source.joints[-1][0],1.24)
+        self.assertEqual(source.last_stamp,1.05)
+        source.joints=deque([(1.18,np.zeros(6),np.zeros(6)),(1.24,np.ones(6),np.ones(6))])
+        self.assertIsNone(sample_control(source,1.24))
+
     def test_prediction_abstention_does_not_hide_invalid_motion(self):
         source=observer();source.body[-1]=(1.1,pose_values(.1))
         with self.assertRaisesRegex(ValueError,'LIO_DERIVATIVE_LIMIT'):
