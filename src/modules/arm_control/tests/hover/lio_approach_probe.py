@@ -224,14 +224,16 @@ class LioApproachProbe:
         from fixed_grasp_target import parse_native
         from grasp_audit.geometry import pose_transform
         try:
-            with (self.folder/'control.jsonl').open('w') as log:
+            with (self.folder/'control.jsonl').open('w') as log, (self.folder/'timing.jsonl').open('w') as timing:
                 while not self.stop_event.wait(.002):
                     now=rospy.Time.now().to_sec();lease=self.latest.get('known')
                     if not self.bound_lease(lease):continue
                     if self.prepare_since is None:self.prepare_since=now
                     if self.stage in ('prepare','prepare_ack') and now-self.prepare_since>30:
                         raise RuntimeError('LIO grasp preparation did not pass within 30 simulation seconds')
+                    sample_started=time.perf_counter()
                     row=sample_control(self.observer,now)
+                    sample_wall=time.perf_counter()-sample_started
                     if row is None:
                         self.holding=None
                         continue
@@ -261,14 +263,21 @@ class LioApproachProbe:
                     if self.grasp:
                         lift=(inverse(np.array(row['map_from_arm']))@np.r_[goal[:3,3]+[0.,0.,.04],1])[:3]
                         fields.extend([*map(float,lift),jaw_clearance])
+                    sent=rospy.Time.now().to_sec();ipc_started=time.perf_counter()
                     self.client.client('arm_control','fixed_grasp_context' if self.grasp else 'hover_task_context',*fields)
-                    publish_age=rospy.Time.now().to_sec()-row['stamp_s']
+                    ack=rospy.Time.now().to_sec();publish_age=ack-row['stamp_s']
+                    timing.write(json.dumps(dict(kind='context',sample_sim_s=now,stamp_s=row['stamp_s'],
+                        lio_stamp_s=row['last_lio_stamp_s'],sample_wall_s=sample_wall,geometry_wall_s=geometry_wall,
+                        sent_sim_s=sent,ack_sim_s=ack,ipc_wall_s=time.perf_counter()-ipc_started))+'\n');timing.flush()
                     if now-self.last_status<.02:continue
                     self.last_status=now
                     # Read one diagnostic topic between context publications;
                     # three blocking CLI reads must never form a heartbeat gap.
                     attr,topic=(('hover','arm_hover_status'),('native','arm_approach_status'),('arm','arm_control_status'))[self.poll_index]
+                    began=rospy.Time.now().to_sec();ipc_started=time.perf_counter()
                     setattr(self,attr,self.client.status(topic));self.poll_index=(self.poll_index+1)%3
+                    timing.write(json.dumps(dict(kind='diagnostic',topic=topic,start_sim_s=began,
+                        end_sim_s=rospy.Time.now().to_sec(),ipc_wall_s=time.perf_counter()-ipc_started))+'\n');timing.flush()
                     if self.poll_index or not self.hover or not self.native or not self.arm:continue
                     tcp=np.array(row['map_from_tcp']);error=float(np.linalg.norm(tcp[:3,3]-goal[:3,3]))
                     angle=angle_deg(tcp[:3,:3],goal[:3,:3]) if self.index else None

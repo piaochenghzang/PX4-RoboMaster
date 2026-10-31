@@ -441,7 +441,7 @@ def main():
                         save(folder/'perceived_target_map.json',detected)
                         tool_observer.lock_target(detected);result['target_observation_completed']=True
                         print('Target locked in LIO map; reading encoder FK for 3 seconds',flush=True)
-                if result.get('target_observation_completed'):
+                if result.get('target_observation_completed') and approach_probe is None:
                     row=tool_observer.sample(now)
                     if row is not None:
                         last_tool_row=row
@@ -540,10 +540,12 @@ def main():
                     lio_pose=odom_pose(lio);error_lio=float(np.linalg.norm(lio_pose[:3,3]-goal))
                     commanded,_,command_yaw=candidate_route.sample(now)
                     tracking_error=float(np.linalg.norm(lio_pose[:3,3]-commanded))
-                    if last_tool_row is None or not 0<=now-last_tool_row['stamp_s']<=.2:raise RuntimeError('Folded arm feedback stale')
-                    joint_delta=np.abs(np.array(last_tool_row['joint_position_rad'])-
-                        candidate_baseline['arm_control_status']['joint_target'])
-                    arm_deviation=float(np.array([.51,.45,.33,.20,.13])@joint_delta[:5]+.13*joint_delta[5])
+                    arm_deviation=None
+                    if approach_probe is None:
+                        if last_tool_row is None or not 0<=now-last_tool_row['stamp_s']<=.2:raise RuntimeError('Folded arm feedback stale')
+                        joint_delta=np.abs(np.array(last_tool_row['joint_position_rad'])-
+                            candidate_baseline['arm_control_status']['joint_target'])
+                        arm_deviation=float(np.array([.51,.45,.33,.20,.13])@joint_delta[:5]+.13*joint_delta[5])
                     c,s=math.cos(command_yaw),math.sin(command_yaw)
                     desired_rotation=np.array([[c,-s,0],[s,c,0],[0,0,1]])
                     rotation_error=math.degrees(math.acos(float(np.clip((np.trace(desired_rotation.T@lio_pose[:3,:3])-1)/2,-1,1))))
