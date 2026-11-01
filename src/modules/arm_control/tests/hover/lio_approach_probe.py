@@ -293,7 +293,10 @@ class LioApproachProbe:
                         approach=self.native,arm=self.arm,control_sample=row,goal_map=goal.tolist(),tool_error_m=error,orientation_error_deg=angle,
                         goal_policy='ARM_RELATIVE_TRANSIT' if self.index==0 else ('LIO_TARGET_QUINTIC_2MM_S' if self.grasp and self.index==3 else 'LIO_TARGET_QUINTIC_10MM_S'),segment_finished=segment_finished,
                         geometry_compute_wall_s=geometry_wall,context_publish_age_s=publish_age,
-                        precision_contact_profile=fine,jaw_sweep_clearance_m=jaw_clearance,closing_requested=self.closing_requested)
+                        precision_contact_profile=fine,jaw_sweep_clearance_m=jaw_clearance,closing_requested=self.closing_requested,
+                        sent_context=dict(body_speed_m_s=fields[5],body_angular_speed_rad_s=fields[6],tilt_rad=fields[7],
+                            body_position_error_m=fields[8],alignment_error_m=fields[9],relative_speed_m_s=fields[10],
+                            orientation_error_rad=fields[11]))
                     from check_fixed_target_native import evidence_json
                     log.write(json.dumps(evidence_json(record),allow_nan=False)+'\n');log.flush();self.last_record=record
                     if (self.motion_requested and self.native.get('ownership_locked') and self.native.get('mode')!=(1 if self.grasp else 0)):

@@ -306,5 +306,33 @@ int main()
       for(int n=0;n<20;++n)tick(g,v);
       assert(g.phase==FixedPhase::Lift && g.tool_progress<.025f && std::isnan(g.actual_lift));++cases;
     } // Bilateral force with unknown support cannot replace the 25mm extraction evidence.
+    { auto v=contactInput();FixedGrasp g;v.motion.joint_speed=.3f;
+      g.request(1,4,v.motion.binding,v);v.motion.accepted.x-=.04f;v.motion.measured=v.motion.accepted;
+      assert(!tick(g,v).send);v.unfold_complete=true;
+      auto a=tick(g,v);assert(a.send && (a.goal-v.motion.accepted).norm()<=.001001f &&
+          a.max_joint_step<=.008001f);++cases;
+    } // Source 2 continues after unfolding without raising any command slew.
+    { auto v=healthy();FixedGrasp g;v.unfold_complete=true;v.motion.joint_speed=.3f;
+      g.request(1,4,v.motion.binding,v);v.motion.accepted.x-=.04f;v.motion.measured=v.motion.accepted;
+      assert(!tick(g,v).send);++cases;
+    } // Source 1 keeps its original slower-motion admission.
+    { auto v=contactInput();FixedGrasp g;v.unfold_complete=true;v.motion.joint_speed=.4001f;
+      g.request(1,4,v.motion.binding,v);v.motion.accepted.x-=.04f;v.motion.measured=v.motion.accepted;
+      assert(!tick(g,v).send);v.motion.joint_speed=fixedArmJointSlew;assert(tick(g,v).send);++cases;
+    } // No admission beyond the existing arm command-rate bound.
+    { auto v=contactInput();FixedGrasp g;v.unfold_complete=true;v.motion.joint_speed=.3f;
+      g.request(1,4,v.motion.binding,v);v.motion.accepted.x-=.04f;v.motion.measured=v.motion.accepted;
+      v.close_ready=false;g.phase=FixedPhase::Align;assert(tick(g,v).send);
+      g.phase=FixedPhase::Close;assert(!tick(g,v).send);++cases;
+    } // Close and all later payload phases retain the original admission.
+    { auto v=contactInput();FixedGrasp g;v.unfold_complete=true;v.motion.joint_speed=.3f;
+      g.request(1,4,v.motion.binding,v);v.motion.accepted.x-=.04f;v.motion.measured=v.motion.accepted;
+      v.motion.geometry_valid=false;auto a=tick(g,v);
+      assert(!a.send && a.stop && g.fault==FixedFault::Geometry);++cases;
+    } // Continuous compensation cannot bypass the geometry contract.
+    { auto v=contactInput();FixedGrasp g;v.unfold_complete=true;v.motion.joint_speed=.3f;
+      g.request(1,4,v.motion.binding,v);v.motion.accepted.x-=.04f;v.motion.measured=v.motion.accepted;
+      v.motion.measured.x-=.016f;assert(!tick(g,v).send);++cases;
+    } // The 15mm pending tracking gate is unchanged.
     std::printf("PASS: %u fixed-grasp logic cases (synthetic; not physical grasp proof)\n",cases);
 }
