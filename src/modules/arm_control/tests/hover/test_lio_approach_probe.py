@@ -74,6 +74,37 @@ class PrecisionStageTests(unittest.TestCase):
         for index in (1,2,3):self.assertTrue(precision_contact_profile(True,index,{},IDS))
 
 
+class CompensationResumeTests(unittest.TestCase):
+    def state(self):
+        return dict(zip(('task_id','plan_id','target_id','scene_id'),IDS),
+            mode=1,phase=1,ownership_locked=True,unfold_complete=True)
+
+    def test_same_unfolded_grasp_may_request_resume_during_repeat_dwell(self):
+        from lio_approach_probe import compensation_resume_ready
+        for phase in (1,2):self.assertTrue(compensation_resume_ready(True,dict(self.state(),phase=phase),
+            dict(start_ready=False,task_id=IDS[0],denial_mask=1024),IDS))
+
+    def test_wrong_owner_phase_binding_or_unfold_cannot_skip_wait(self):
+        from lio_approach_probe import compensation_resume_ready
+        hover=dict(start_ready=False,task_id=IDS[0],denial_mask=1024)
+        for key,value in [('mode',0),('phase',0),('phase',3),('phase',8),('ownership_locked',False),
+                          ('unfold_complete',False),('task_id',99),('plan_id',99),('target_id',99),('scene_id',99)]:
+            self.assertFalse(compensation_resume_ready(True,dict(self.state(),**{key:value}),hover,IDS))
+        self.assertFalse(compensation_resume_ready(False,self.state(),hover,IDS))
+        self.assertFalse(compensation_resume_ready(True,self.state(),dict(hover,task_id=99),IDS))
+
+    def test_any_other_denial_still_blocks_repeat_dwell_shortcut(self):
+        from lio_approach_probe import compensation_resume_ready
+        for mask in (0,1,2,4,8,16,32,64,128,256,512,1024|64,1024|2):
+            self.assertFalse(compensation_resume_ready(True,self.state(),
+                dict(start_ready=False,task_id=IDS[0],denial_mask=mask),IDS))
+
+    def test_full_ready_keeps_the_previous_resume_path(self):
+        from lio_approach_probe import compensation_resume_ready
+        self.assertTrue(compensation_resume_ready(False,{},dict(start_ready=True),IDS))
+        self.assertTrue(compensation_resume_ready(True,dict(self.state(),phase=3),dict(start_ready=True),IDS))
+
+
 class LioContextTests(unittest.TestCase):
     def test_cli_layout_and_hand_calculated_arm_coordinates(self):
         fields=context()

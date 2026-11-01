@@ -1,9 +1,12 @@
 #include "../arm_control.hpp"
 #include <algorithm>
 
-void ArmControl::updateFixedGrasp(const arm_approach_request_s *request,const so101_hover::ApproachInput &motion)
+void ArmControl::updateFixedGrasp(const arm_approach_request_s *request,const so101_hover::ApproachInput &raw_motion)
 {
     using namespace so101_hover;
+    auto motion=raw_motion;
+    motion.hover_ready=motion.hover_ready ||
+        _fixed_grasp.compensationReady(motion.binding,_fixed_unfold_complete,_hover_gate.denial);
     FixedInput input{}; input.motion=motion; input.feedback=graspInput();
 #if defined(CONFIG_ARCH_BOARD_PX4_SITL)
     input.contact_only=_grasp_feedback.source==arm_grasp_feedback_s::SOURCE_SIM_CONTACT;

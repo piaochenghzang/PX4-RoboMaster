@@ -1,5 +1,6 @@
 #pragma once
 #include "HoverApproach.hpp"
+#include "HoverPermit.hpp"
 #include <algorithm>
 
 namespace so101_hover {
@@ -41,6 +42,13 @@ class FixedGrasp {
 public:
     bool owns() const { return phase!=FixedPhase::Idle; }
     bool reportsStatus(bool fixed_context) const { return owns() || (fixed_context && last_id); }
+    bool compensationReady(const Binding &current,bool unfolded,uint16_t denial) const {
+        // The task was admitted with the full gate. Only repeat dwell may be
+        // skipped for its already-authorized approach tracking; start, unfold,
+        // waypoint changes and closing still use the original full permit.
+        return contact_mode && owns() && unfolded && current==binding && denial==Dwelling &&
+            (phase==FixedPhase::Approach || phase==FixedPhase::Align);
+    }
     bool carrying() const { return phase>=FixedPhase::Lift && phase<=FixedPhase::Done; }
     bool safe(const FixedInput &v) const {
         const auto &i=v.motion; const auto &f=v.feedback;

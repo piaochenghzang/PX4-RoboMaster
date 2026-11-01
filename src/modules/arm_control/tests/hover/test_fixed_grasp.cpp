@@ -306,5 +306,47 @@ int main()
       for(int n=0;n<20;++n)tick(g,v);
       assert(g.phase==FixedPhase::Lift && g.tool_progress<.025f && std::isnan(g.actual_lift));++cases;
     } // Bilateral force with unknown support cannot replace the 25mm extraction evidence.
+    { auto v=contactInput();FixedGrasp g;v.unfold_complete=true;v.motion.hover_ready=false;
+      assert(!g.compensationReady(v.motion.binding,true,Dwelling));
+      g.request(1,4,v.motion.binding,v);assert(!g.owns());
+      v.motion.hover_ready=true;g.request(2,4,v.motion.binding,v);assert(g.owns());
+      assert(g.compensationReady(v.motion.binding,true,Dwelling));++cases;
+    } // No shortcut for initial admission.
+    { auto v=contactInput();FixedGrasp g;g.request(1,4,v.motion.binding,v);
+      assert(!g.compensationReady(v.motion.binding,false,Dwelling));
+      auto other=v.motion.binding;++other.plan;assert(!g.compensationReady(other,true,Dwelling));
+      auto legacy=healthy();FixedGrasp old;old.request(1,4,legacy.motion.binding,legacy);
+      assert(!old.compensationReady(legacy.motion.binding,true,Dwelling));++cases;
+    } // Only the same source-2 owner after unfolding.
+    { auto v=contactInput();FixedGrasp g;g.request(1,4,v.motion.binding,v);
+      const uint16_t denied[]{0,Missing,Stale,Invalid,Flight,Allocation,Position,Speed,Angular,Tilt,Reset,
+          uint16_t(Dwelling|Speed),uint16_t(Dwelling|Stale)};
+      for(auto d:denied)assert(!g.compensationReady(v.motion.binding,true,d));
+      g.phase=FixedPhase::Align;assert(g.compensationReady(v.motion.binding,true,Dwelling));
+      for(auto phase:{FixedPhase::Close,FixedPhase::Verify,FixedPhase::Lift,FixedPhase::Hold,
+          FixedPhase::Done,FixedPhase::Fault,FixedPhase::Canceled}) {
+          g.phase=phase;assert(!g.compensationReady(v.motion.binding,true,Dwelling));
+      } ++cases;
+    } // Any numeric/hard denial, and every payload phase, keep the full permit.
+    { auto v=contactInput();FixedGrasp g;v.unfold_complete=true;g.request(1,4,v.motion.binding,v);
+      v.motion.accepted.x-=.04f;v.motion.measured=v.motion.accepted;v.motion.hover_ready=false;
+      assert(tick(g,v).stop && g.paused);
+      v.motion.hover_ready=g.compensationReady(v.motion.binding,true,Dwelling);
+      g.request(2,7,v.motion.binding,v);assert(!g.paused && g.request_result==1);
+      assert(tick(g,v).send);v.close_ready=false;
+      g.request(3,5,v.motion.binding,v);assert(g.phase==FixedPhase::Approach && g.request_result==3);
+      g.phase=FixedPhase::Align;for(int n=0;n<10;++n)tick(g,v);
+      assert(g.phase==FixedPhase::Align);++cases;
+    } // Tracking resumes without re-pausing; repeat dwell cannot grant closure.
+    { auto v=contactInput();FixedGrasp g;v.unfold_complete=true;g.request(1,4,v.motion.binding,v);
+      v.motion.hover_ready=false;tick(g,v);v.motion.hover_ready=g.compensationReady(v.motion.binding,true,Dwelling);
+      v.feedback.grasp_age=.31f;g.request(2,7,v.motion.binding,v);assert(g.paused && g.request_result==3);
+      auto a=tick(g,v);assert(!a.send && a.stop && g.fault==FixedFault::Feedback);++cases;
+    } // A diagnostic dwell flag cannot override stale feedback.
+    { auto v=contactInput();FixedGrasp g;v.unfold_complete=true;g.request(1,4,v.motion.binding,v);
+      v.motion.hover_ready=false;tick(g,v);v.motion.hover_ready=g.compensationReady(v.motion.binding,true,Dwelling);
+      v.motion.geometry_valid=false;g.request(2,7,v.motion.binding,v);assert(g.paused && g.request_result==3);
+      auto a=tick(g,v);assert(!a.send && a.stop && g.fault==FixedFault::Geometry);++cases;
+    } // The live geometry contract remains authoritative.
     std::printf("PASS: %u fixed-grasp logic cases (synthetic; not physical grasp proof)\n",cases);
 }

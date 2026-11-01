@@ -5005,3 +5005,14 @@ case47未到地图far/final段：137.30～142.08 s的新策略有效区间仅52�
 只读重放case47最后15个已落盘帧，见`build/case47_firstpoint_geometry_20261101.json`。普通策略重算与记录逐帧差0；最紧pair均为指定pad/handle（moving8、fixed7），观测点最小也在原4 mm关联内。保留原定位/预测4.752～8.667 mm及transport0.130～0.637 mm后，已有precision策略的净空67.59～74.16 mm、全jaw扫掠65.16～69.67 mm；非豁免最小对为moving_jaw/key，pad/support至少150.60 mm。故障15.50 mm那帧未落盘，不能把邻帧重算冒充精确故障复现。
 
 首点ROUTE[0]已经比下一个55 mm对齐更近。现在仅在grasp、当前绑定的原生fixed owner已接受且确认unfold_complete后，对index0后半启用原有precision策略。未展开、缺失/错误绑定或错误模式/阶段仍all16；NoClose始终all16。后续规则、2.3 mm seating、4 mm关联掩膜不变；仅指定pad/handle可接触，pad/support仍至少3 mm，其他部位仍16 mm；速度/IK/闭爪保护不改。没有新增消息、状态机或路径点。新增来源/阶段/绑定及NoClose隔离测试，物理验收待完成。
+
+
+case48已验证启用边界：展开前232条记录全部fine=false；105.48 s首次启用时mode/phase/持权/展开完成/四ID均匹配，净空76.65 mm、全jaw扫掠76.10 mm。已通过首点、55 mm对齐并进入40 mm预接近，未再发生该首点净空退出；322.985 s在预接近最终因Timeout退出，未请求闭爪，取消ACK和自有进程清理通过。源2替换与首点修复通过上述阶段，仍未完成实际闭爪/抓起/保持。
+
+### 53.15 已持权接近任务的重复等待恢复（2026-11-01）
+
+case48的index2且segment_finished共1765帧，paused1099，其中859帧hover诊断仅Dwelling（暂停的78.2%）；其中808帧同帧数值也合格，余51不能拿旧诊断替代新输入。288.70～302.10 s关节目标固定，实际关节最大速度均值0.00561 rad/s，LIO/FK世界TCP速度均61.53 mm/s、P95 100.22 mm/s；体坐标停臂并没有保持世界末端。重复2 s等待是一个已证实的直接补偿中断点，不认定为唯一根因。
+
+本次明确调整的是恢复等待时序：仅latched source2、已持权同binding、展开完成、Approach/Align且原生当前denial精确Dwelling时，可恢复既有段内跟踪，不重复等待2 s。Gate本身的start_ready/denial不改，初次启动、腕展开、旧source1、NoClose、Close及以后均保留原许可；换新途经点与闭爪仍要求完整start_ready。段内原quintic可继续推进，不能称纯驻留补偿。所有数值/分配/反馈/源时效/重置、15 mm跟踪差、pending/swept净空及命令速率不变。
+
+Fixed adapter给step和motion_authorized使用同一有效补偿许可，input.close_ready仍直接依赖原_gate.start_ready，不能借恢复许可提前闭爪。Python只发已有resume请求；旧诊断不能授权动作，Native以最新gate与safe重新拒绝失联/超限/错误绑定。无新消息、参数、计时器或状态机。61项原生、65项Python正反检查通过，物理对照待验收；部分所需补偿超过既有50 mm/s，尚不保证该改动足够。

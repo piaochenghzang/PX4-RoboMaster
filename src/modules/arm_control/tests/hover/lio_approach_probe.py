@@ -55,6 +55,16 @@ def precision_contact_profile(grasp,index,native,ids):
         [native.get(k) for k in ('task_id','plan_id','target_id','scene_id')]==ids)
 
 
+def compensation_resume_ready(grasp,native,hover,ids):
+    if hover.get('start_ready') is True:return True
+    # A request is not permission: native checks its CURRENT gate and safety
+    # inputs again. Stale diagnostics cannot authorize compensation.
+    return (grasp and hover.get('denial_mask')==1024 and hover.get('task_id')==ids[0] and
+        native.get('mode')==1 and native.get('phase') in (1,2) and
+        native.get('ownership_locked') is True and native.get('unfold_complete') is True and
+        [native.get(k) for k in ('task_id','plan_id','target_id','scene_id')]==ids)
+
+
 def transit_ready(index,phase,error,speed,hover_ready):
     # Keep the final native dwell. The far alignment is only an intermediate
     # waypoint: its instantaneous criteria need no second one-second dwell.
@@ -342,7 +352,7 @@ class LioApproachProbe:
                             self.closing_requested=False;self.stage='approach'
                         else:self.stage='grasp'
                     elif self.stage=='grasp':
-                        if self.native.get('paused') and self.hover.get('start_ready'):
+                        if self.native.get('paused') and compensation_resume_ready(self.grasp,self.native,self.hover,self.ids):
                             self.client.client('arm_control','fixed_grasp_resume',*self.ids)
                         if self.native.get('phase')==7 and self.native.get('completed_success'):
                             self.complete=True;self.event('contact_hold_and_lio_fk_extraction_completed',now)
@@ -351,7 +361,7 @@ class LioApproachProbe:
                     elif self.stage=='approach':
                         if (self.native.get('paused') if self.grasp else self.native.get('phase')==3):
                             self.holding=None
-                            if (self.grasp or self.native.get('resume_ready')) and self.hover.get('start_ready'):
+                            if (self.grasp or self.native.get('resume_ready')) and compensation_resume_ready(self.grasp,self.native,self.hover,self.ids):
                                 request_id=self.native.get('last_request_id',0)
                                 if request_id!=self.resume_id:
                                     self.resume_id=request_id;self.client.client('arm_control','fixed_grasp_resume' if self.grasp else 'hover_resume',*self.ids)
