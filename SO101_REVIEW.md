@@ -5016,3 +5016,12 @@ case48的index2且segment_finished共1765帧，paused1099，其中859帧hover诊
 本次明确调整的是恢复等待时序：仅latched source2、已持权同binding、展开完成、Approach/Align且原生当前denial精确Dwelling时，可恢复既有段内跟踪，不重复等待2 s。Gate本身的start_ready/denial不改，初次启动、腕展开、旧source1、NoClose、Close及以后均保留原许可；换新途经点与闭爪仍要求完整start_ready。段内原quintic可继续推进，不能称纯驻留补偿。所有数值/分配/反馈/源时效/重置、15 mm跟踪差、pending/swept净空及命令速率不变。
 
 Fixed adapter给step和motion_authorized使用同一有效补偿许可，input.close_ready仍直接依赖原_gate.start_ready，不能借恢复许可提前闭爪。Python只发已有resume请求；旧诊断不能授权动作，Native以最新gate与safe重新拒绝失联/超限/错误绑定。无新消息、参数、计时器或状态机。61项原生、65项Python正反检查通过，物理对照待验收；部分所需补偿超过既有50 mm/s，尚不保证该改动足够。
+
+
+case49已验证恢复路径执行：一次Speed拒绝到原生接受resume仅0.236 s；另有90条旧hover仅Dwelling而后续native已授权记录。独立23组Speed/Angular拒绝仍暂停不授权；所有jaw目标0.3、未提前闭爪。两类诊断时刻单独核对，不冒充同tick完备证明。
+
+本轮人工取消以继续单因素对照，KeyboardInterrupt、success=false，取消ACK、夹爪0.3保持与自有进程清理通过。获授权far且segment_finished的586个诊断样本：所需体运动补偿均48.25 / P95 80.87 mm/s；关节最大速度均.183 / P95 .297 rad/s，目标到已接纳目标均差10.81 mm、已接纳到实际伺服均差3.39 mm。有127个诊断样本同时满足所需补偿<50 mm/s、实测关节速度>.20和伺服差<15 mm。这是诊断采样重叠，不是逐native tick精确的停发次数；提示另一个旧续发等待仍可能限制连续补偿，不能据此认定唯一根因。
+
+### 53.16 两层旧等待条件的同范围连续接近对照（2026-11-01）
+
+保留53.15的同任务重复dwell恢复，再恢复53.13已审过的接纳对照：仅source2、展开完成的Approach/Align允许实测joint speed不高于既有命令slew .4继续续发，其余仍.20。它不提高50 mm/s、.4 rad/s、jaw .2 rad/s命令预算，不改15 mm跟踪差、底层速度加速度/位置、pending/swept净空、首次/换点/闭爪完整许可。source1、腕展开和Close及以后保持原策略。两个条件作用于同一已持权接近阶段，无新消息/参数/状态机。67项原生正反检查覆盖该组合，物理结果待验收。

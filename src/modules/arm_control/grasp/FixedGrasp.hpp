@@ -181,8 +181,14 @@ public:
         // Budget ACTUAL elapsed time, capped at one period: no catch-up jump
         // and no increase above the bounded Cartesian / arm-joint rates.
         const uint64_t minimum_interval=v.unfold_complete ? 16000 : period;
+        // The owned contact approach tracks a moving arm-frame goal. Admit
+        // continuous tracking within the EXISTING slew; keep legacy, unfold
+        // and payload phases on the original slower-motion admission.
+        const bool continuous=contact_mode && v.unfold_complete &&
+            (phase==FixedPhase::Approach || phase==FixedPhase::Align);
+        const float admission_speed=continuous ? fixedArmJointSlew : .20f;
         if (distance>.0002f && (!last_send || i.now-last_send>=minimum_interval) &&
-            (i.accepted-i.measured).norm()<=.015f && i.joint_speed<=.20f) {
+            (i.accepted-i.measured).norm()<=.015f && i.joint_speed<=admission_speed) {
             const float seconds=float(last_send ? std::min(period,i.now-last_send) : period)*1e-6f;
             const float max_step=fixedCartesianSpeed*seconds;
             out.max_joint_step=fixedArmJointSlew*seconds;
