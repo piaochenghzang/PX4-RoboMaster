@@ -201,7 +201,7 @@ def main():
         external_odometry_source='LIO_TWO_POSE_SOURCE_MIDPOINT' if args.fuse_lio_velocity else 'LIO_SCAN_END_POSE_ONLY',
         external_odometry_stddev=dict(position_m=.05,orientation_rad=.03,velocity_m_s=LIO_VELOCITY_STD,angular_velocity_rad_s=.05) if args.fuse_lio_velocity else None,
         ros_clock_hz=LIO_CLOCK_HZ,registered_cloud_source='UNDISTORTED_POINTS' if args.approach_lio else 'ESTIMATOR_VOXEL_POINTS',
-        demo_wall_step_pacing=args.approach_lio,fine_velocity_residual_feedforward=True,fine_velocity_residual_slew_m_s2=.005,
+        demo_wall_step_pacing=args.approach_lio,fine_velocity_residual_feedforward=True,fine_velocity_residual_slew_m_s2=.20,flight_registration_policy='FIXED_POSITION_AND_VELOCITY_TRIM_TO_ZERO',
         minimum_wall_step_s=float(scene.findtext('world/physics/max_step_size'))/speed if args.approach_lio else None,
         observation_local_goal_m=[.3,0,.9],sim_speed_factor=speed))
     os.environ.update(ROS_MASTER_URI=env['ROS_MASTER_URI'],ROS_HOSTNAME='localhost');os.environ.pop('ROS_IP',None)
@@ -397,19 +397,19 @@ def main():
                     cmd=KnownFlightSetpoint();cmd.header.stamp=rospy.Time.now();cmd.header.frame_id='map';cmd.task_id=1
                     if args.approach_lio:
                         from lio_approach_probe import alignment_bias,alignment_velocity
-                        local_lio=flight_sample['body'][:3,3]
                         elapsed=.02 if last_bias is None else now-last_bias
-                        fine_bias,_=alignment_bias(fine_bias,xyz,local_lio,elapsed);last_bias=now
-                        ev=odom.twist.twist.linear
-                        ekf_v=R@np.array([ev.x,ev.y,ev.z]);lio_v=flight_sample['linear_v_map']
-                        # EV fusion improves the filter, but does not make its
-                        # output identical to the measured LIO velocity. Apply
-                        # only that residual so position and damping share the
-                        # same reference; do not add position-bias derivative.
-                        fine_velocity=alignment_velocity(fine_velocity,ekf_v,lio_v,elapsed)
-                        # EKF-LIO velocity difference already supplies the
-                        # changing position offset's feedforward. Adding its
-                        # finite-difference derivative again doubles it.
+                        last_bias=now
+                        # A task-fixed position registration preserves fast EKF
+                        # feedback. A velocity residual is not a frame offset:
+                        # slew it to zero instead of freezing a transient sample.
+                        if approach_probe is None:
+                            local_lio=flight_sample['body'][:3,3]
+                            fine_bias,_=alignment_bias(fine_bias,xyz,local_lio,elapsed)
+                            ev=odom.twist.twist.linear
+                            ekf_v=R@np.array([ev.x,ev.y,ev.z]);lio_v=flight_sample['linear_v_map']
+                            fine_velocity=alignment_velocity(fine_velocity,ekf_v,lio_v,elapsed)
+                        else:
+                            fine_velocity=alignment_velocity(fine_velocity,np.zeros(3),np.zeros(3),elapsed)
                         wp=wp+fine_bias;wv=wv+fine_velocity
                     if approach_probe is not None:
                         cmd.task_id,cmd.plan_id,cmd.target_id,cmd.scene_id=approach_probe.ids;cmd.terminal_hold=True
@@ -600,6 +600,7 @@ def main():
                         approach_probe=LioApproachProbe(native,tool_observer,config,plan.geometry_profile,
                             inspection['candidate'],inspection['result']['unfold_precheck']['final_q'],
                             folder/'lio_approach',latest,folder/'scene.world',np.load(folder/'approach_map_returns.npy'),grasp=args.grasp_lio)
+                        result['flight_registration']=dict(stamp_s=now,policy='FIXED_POSITION_AND_VELOCITY_TRIM_TO_ZERO',position_bias_m=fine_bias.tolist(),velocity_bias_at_handover_m_s=fine_velocity.tolist())
                         approach_probe.start();print('LIO/FK native '+('contact grasp' if args.grasp_lio else 'no-close approach')+' adapter started; matching terminal flight binding follows',flush=True)
                     if approach_probe is not None:
                         if approach_probe.error:raise RuntimeError('LIO approach: '+approach_probe.error)

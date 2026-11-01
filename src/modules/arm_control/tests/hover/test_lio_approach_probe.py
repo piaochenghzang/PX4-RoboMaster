@@ -284,14 +284,24 @@ class LioAlignmentBiasTests(unittest.TestCase):
         from lio_approach_probe import alignment_velocity
         previous=np.zeros(3)
         out=alignment_velocity(previous,[.03,-.04,0.],[0.,0.,0.],.1)
-        np.testing.assert_allclose(out,[.0003,-.0004,0.],atol=1e-12)
-        for _ in range(200):out=alignment_velocity(out,[.3,-.4,0.],np.zeros(3),.1)
+        np.testing.assert_allclose(out,[.012,-.016,0.],atol=1e-12)
+        for _ in range(20):out=alignment_velocity(out,[.3,-.4,0.],np.zeros(3),.1)
         np.testing.assert_allclose(out,[.03,-.04,0.],atol=1e-12)
         late=alignment_velocity(previous,[.3,-.4,0.],np.zeros(3),1.)
-        self.assertAlmostEqual(np.linalg.norm(late),.0005)
+        self.assertAlmostEqual(np.linalg.norm(late),.020)
         np.testing.assert_array_equal(previous,np.zeros(3))
         for elapsed in (0.,-.1,float('nan')):
             with self.assertRaises(ValueError):alignment_velocity(previous,[0.,0.,0.],[0.,0.,0.],elapsed)
+
+    def test_velocity_trim_fades_to_zero_without_a_reference_step(self):
+        from lio_approach_probe import alignment_velocity
+        value=np.array([.03,-.04,0.])
+        for _ in range(14):
+            before=value.copy()
+            value=alignment_velocity(value,np.zeros(3),np.zeros(3),.02)
+            self.assertLessEqual(np.linalg.norm(value-before),.004000000001)
+            self.assertLessEqual(np.linalg.norm(value),np.linalg.norm(before)+1e-12)
+        np.testing.assert_allclose(value,np.zeros(3),atol=1e-12)
 
     def test_filter_minus_lio_sign_and_twenty_mm_per_second_rate(self):
         bias,velocity=alignment_bias(np.zeros(3),[1.,2.,3.],[1.03,1.96,3.],.1)
