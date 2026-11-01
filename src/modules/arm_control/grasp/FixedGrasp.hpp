@@ -173,14 +173,8 @@ public:
         // Budget ACTUAL elapsed time, capped at one period: no catch-up jump
         // and no increase above the bounded Cartesian / arm-joint rates.
         const uint64_t minimum_interval=v.unfold_complete ? 16000 : period;
-        // In contact-only flight approach, permit continuous compensation
-        // within the EXISTING command slew. Keep legacy, unfold and payload
-        // phases on the original wait-for-slower-motion admission policy.
-        const bool continuous=contact_mode && v.unfold_complete &&
-            (phase==FixedPhase::Approach || phase==FixedPhase::Align);
-        const float admission_speed=continuous ? fixedArmJointSlew : .20f;
         if (distance>.0002f && (!last_send || i.now-last_send>=minimum_interval) &&
-            (i.accepted-i.measured).norm()<=.015f && i.joint_speed<=admission_speed) {
+            (i.accepted-i.measured).norm()<=.015f && i.joint_speed<=.20f) {
             const float seconds=float(last_send ? std::min(period,i.now-last_send) : period)*1e-6f;
             const float max_step=fixedCartesianSpeed*seconds;
             out.max_joint_step=fixedArmJointSlew*seconds;

@@ -4993,3 +4993,15 @@ case46未通过物理验收，未闭爪。93.93～118.79 s已有telemetry的固�
 
 
 同一control.jsonl补记本次实际发送context的7个已有测量值（机体速度/角速/倾角/位置误差、对齐误差/相对速度/朝向），不增消息或日志文件。它们与本次source stamp配对，避免用较旧hover诊断快照代替闭爪同帧条件。原生61项、Python57项及SITL编译通过，物理对照待验收。
+
+
+case47未到地图far/final段：137.30～142.08 s的新策略有效区间仅52帧、全部首点，其中只有1帧实测joint speed位于新接纳范围(.20,.40]，不能判断策略收益。142.161 s因净空保护退出，故障clearance15.50 mm（随后18.69 mm不同帧），时效/租约/悬停硬条件正常，未闭爪，取消ACK与清理通过。此续发策略试验已撤回到基线，保留同帧日志，不将未证实收益的速度策略留作默认。
+
+首点ROUTE[0]相对目标已约44 mm，而后一个对齐点为55 mm；当前index0始终使用all16策略。下一步仅同帧核对首点最小pair及已批准precision例外，确认是否仍由指定夹指/handle先限制，不根据名称或猜测提前放行。
+
+
+### 53.14 首过渡点与已有精抓策略一致（2026-11-01）
+
+只读重放case47最后15个已落盘帧，见`build/case47_firstpoint_geometry_20261101.json`。普通策略重算与记录逐帧差0；最紧pair均为指定pad/handle（moving8、fixed7），观测点最小也在原4 mm关联内。保留原定位/预测4.752～8.667 mm及transport0.130～0.637 mm后，已有precision策略的净空67.59～74.16 mm、全jaw扫掠65.16～69.67 mm；非豁免最小对为moving_jaw/key，pad/support至少150.60 mm。故障15.50 mm那帧未落盘，不能把邻帧重算冒充精确故障复现。
+
+首点ROUTE[0]已经比下一个55 mm对齐更近。现在仅在grasp、当前绑定的原生fixed owner已接受且确认unfold_complete后，对index0后半启用原有precision策略。未展开、缺失/错误绑定或错误模式/阶段仍all16；NoClose始终all16。后续规则、2.3 mm seating、4 mm关联掩膜不变；仅指定pad/handle可接触，pad/support仍至少3 mm，其他部位仍16 mm；速度/IK/闭爪保护不改。没有新增消息、状态机或路径点。新增来源/阶段/绑定及NoClose隔离测试，物理验收待完成。

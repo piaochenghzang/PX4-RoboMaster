@@ -44,6 +44,17 @@ def preview_pose_ready(preview,desired):
     return angle_deg(actual[:3,:3],finite(desired,(4,4))[:3,:3])<=5.
 
 
+def precision_contact_profile(grasp,index,native,ids):
+    if not grasp:return False
+    if index>=1:return True
+    # ROUTE[0] can already be closer than the following 55mm alignment.
+    # Require THIS accepted owner to have finished unfolding before applying
+    # the existing approved pad/handle policy at the first transit point.
+    return (native.get('mode')==1 and native.get('phase')==1 and
+        native.get('ownership_locked') is True and native.get('unfold_complete') is True and
+        [native.get(k) for k in ('task_id','plan_id','target_id','scene_id')]==ids)
+
+
 def transit_ready(index,phase,error,speed,hover_ready):
     # Keep the final native dwell. The far alignment is only an intermediate
     # waypoint: its instantaneous criteria need no second one-second dwell.
@@ -248,10 +259,10 @@ class LioApproachProbe:
                     if row['stamp_s']==self.last_stamp:continue
                     self.last_stamp=row['stamp_s']
                     geometry_started=time.perf_counter()
-                    # Precision starts at the 55mm alignment in grasp mode.
-                    # Only the already approved pad/handle contact pair changes;
-                    # NoClose and every other 16mm pair remain independent.
-                    fine=self.grasp and self.index>=1
+                    # The first post-unfold transit can be closer to the
+                    # target than the following 55mm alignment. Apply the SAME
+                    # approved contact policy only after accepted unfolding.
+                    fine=precision_contact_profile(self.grasp,self.index,self.native,self.ids)
                     geo=approach_geometry(row,self.config,self.geometry,self.static,self.points,precision=fine)
                     sweep=jaw_sweep_geometry(row,self.config,self.geometry,self.static,self.points,precision=True) if fine else None
                     jaw_clearance=0. if self.grasp else None

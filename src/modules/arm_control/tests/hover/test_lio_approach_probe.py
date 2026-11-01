@@ -46,6 +46,34 @@ def context(row=None,gate=None):
         dict(valid=True,clearance_m=.05),12.36)
 
 
+class PrecisionStageTests(unittest.TestCase):
+    def accepted(self):
+        return dict(zip(('task_id','plan_id','target_id','scene_id'),IDS),
+            mode=1,phase=1,ownership_locked=True,unfold_complete=True)
+
+    def test_first_point_requires_this_accepted_unfolded_owner(self):
+        from lio_approach_probe import precision_contact_profile
+        self.assertTrue(precision_contact_profile(True,0,self.accepted(),IDS))
+        for key,value in [('mode',0),('phase',0),('phase',8),('ownership_locked',False),
+                          ('unfold_complete',False),('task_id',99),('plan_id',99),('target_id',99),('scene_id',99)]:
+            with self.subTest(key=key,value=value):
+                self.assertFalse(precision_contact_profile(True,0,dict(self.accepted(),**{key:value}),IDS))
+
+    def test_no_close_stays_all16_at_every_waypoint(self):
+        from lio_approach_probe import precision_contact_profile
+        for index in range(4):self.assertFalse(precision_contact_profile(False,index,self.accepted(),IDS))
+
+    def test_missing_or_unowned_status_cannot_enable_first_point_contact(self):
+        from lio_approach_probe import precision_contact_profile
+        self.assertFalse(precision_contact_profile(True,0,{},IDS))
+        state=self.accepted();del state['unfold_complete']
+        self.assertFalse(precision_contact_profile(True,0,state,IDS))
+
+    def test_existing_later_precision_waypoints_are_unchanged(self):
+        from lio_approach_probe import precision_contact_profile
+        for index in (1,2,3):self.assertTrue(precision_contact_profile(True,index,{},IDS))
+
+
 class LioContextTests(unittest.TestCase):
     def test_cli_layout_and_hand_calculated_arm_coordinates(self):
         fields=context()
