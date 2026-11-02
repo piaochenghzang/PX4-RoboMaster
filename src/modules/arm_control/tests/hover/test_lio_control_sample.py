@@ -30,6 +30,24 @@ def observer():
         target=target,target_stamp=.9,last_stamp=1.05)
 
 
+class ExternalSourceFreshnessTests(unittest.TestCase):
+    def test_old_frame_is_not_permission_to_retime_or_invalidate_newer_output(self):
+        from lio_control_sample import external_source_current
+        published_stamp=10.10
+        self.assertFalse(external_source_current(9.90,10.20))
+        self.assertTrue(external_source_current(published_stamp,10.20))
+        self.assertEqual(published_stamp,10.10)
+        self.assertTrue(external_source_current(10.15,10.20))
+
+    def test_last_valid_output_expires_even_if_callbacks_keep_arriving(self):
+        from lio_control_sample import external_source_current
+        self.assertTrue(external_source_current(10.,10.25))
+        self.assertFalse(external_source_current(10.,10.25001))
+        self.assertTrue(external_source_current(10.02,10.))
+        for source,now in ((10.021,10.),(float('nan'),10.),(10.,float('inf')),(0.,10.)):
+            with self.assertRaises(ValueError):external_source_current(source,now)
+
+
 class MidpointOdometryTests(unittest.TestCase):
     def test_pose_velocity_and_timestamp_refer_to_the_same_true_source_midpoint(self):
         samples=[(1.,pose_values()),(1.1,pose_values(.01,.02))];saved=copy.deepcopy(samples)

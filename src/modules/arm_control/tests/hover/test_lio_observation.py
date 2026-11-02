@@ -33,9 +33,9 @@ class DemoPropulsionTests(unittest.TestCase):
         m=self.model();r=size_lio_demo_propulsion(m,.01)
         motors=m.findall("plugin[@filename='libgazebo_motor_model.so']")
         thrust=sum(float(p.findtext('motorConstant'))*float(p.findtext('maxRotVelocity'))**2 for p in motors)
-        self.assertAlmostEqual(thrust,2.*3.11*9.81)
+        self.assertAlmostEqual(thrust,2.*3.11*9.8)
         omega=r['expected_empty_hover_command']*1000.+100.
-        self.assertAlmostEqual(sum(float(p.findtext('motorConstant'))*omega**2 for p in motors),3.1*9.81)
+        self.assertAlmostEqual(sum(float(p.findtext('motorConstant'))*omega**2 for p in motors),3.1*9.8)
         self.assertTrue(all(p.findtext('maxRotVelocity')=='1000' for p in motors))
         self.assertEqual([l.findtext('inertial/mass') for l in m.findall('link')],['2.0','0.7','0.4'])
 

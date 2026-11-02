@@ -110,6 +110,19 @@ def flight_control_sample(observer,filter_stamp,now):
     return result
 
 
+def external_source_current(stamp,now):
+    """Reject future/invalid clocks; drop old fusion input without retiming it.
+
+    Also used as the watchdog on the last ACTUALLY published source stamp.
+    A delayed queued frame cannot poison a newer healthy publication.
+    """
+    if not math.isfinite(stamp) or stamp<=0 or not math.isfinite(now) or now<=0:
+        raise ValueError('EXTERNAL_SOURCE_TIME')
+    age=now-stamp
+    if age<-.02-1e-9:raise ValueError('EXTERNAL_SOURCE_FUTURE')
+    return age<=.25+1e-9
+
+
 def midpoint_body_odometry(samples):
     """Pair interval velocity with its midpoint pose/time for external fusion.
 

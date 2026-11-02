@@ -212,7 +212,7 @@ def main():
         observation_local_goal_m=[.3,0,.9],sim_speed_factor=speed))
     os.environ.update(ROS_MASTER_URI=env['ROS_MASTER_URI'],ROS_HOSTNAME='localhost');os.environ.pop('ROS_IP',None)
     procs=[];logs=[];subs=[];pub=None;fcu_pub=None;latest={};result=dict(success=False);begin=end=None;observation=None
-    external_pairs=deque(maxlen=2);external_stamps=deque(maxlen=20);external_count=0;external_max_age=0.
+    external_pairs=deque(maxlen=2);external_stamps=deque(maxlen=20);external_count=0;external_max_age=0.;external_stale_dropped=0
     tool_observer=None;tool_log=None;tool_start=None;tool_count=0
     inspection_thread=None;inspection={}
     clouds=deque(maxlen=10);candidate_route=None;candidate_held=None;candidate_baseline=None
@@ -239,18 +239,20 @@ def main():
     def receive_filter(message):
         latest['odom']=message;filter_messages.append(message)
     def receive_lio(message):
-        nonlocal external_count,external_max_age
+        nonlocal external_count,external_max_age,external_stale_dropped
         latest['lio']=message
         if fcu_pub is None:return
         try:
-            from lio_control_sample import midpoint_body_odometry
+            from lio_control_sample import midpoint_body_odometry,external_source_current
             from tf.transformations import quaternion_from_matrix
             if message.header.frame_id!='map' or message.child_frame_id!='base_link':raise ValueError('EXTERNAL_FRAME')
             p=message.pose.pose;q=p.orientation;t=message.header.stamp.to_sec()
             external_pairs.append((t,[p.position.x,p.position.y,p.position.z,q.w,q.x,q.y,q.z]))
             if len(external_pairs)<2:return
             row=midpoint_body_odometry(external_pairs);age=rospy.Time.now().to_sec()-row['stamp_s']
-            if not -.02<=age<=.25:raise ValueError('EXTERNAL_MIDPOINT_STALE')
+            if not external_source_current(row['stamp_s'],rospy.Time.now().to_sec()):
+                external_stale_dropped+=1
+                return  # Never fuse or re-stamp an obsolete queued frame.
             out=Odometry();out.header.frame_id='map';out.child_frame_id='base_link';out.header.stamp=rospy.Time.from_sec(row['stamp_s'])
             out.pose.pose.position.x,out.pose.pose.position.y,out.pose.pose.position.z=map(float,row['body'][:3,3])
             out.pose.pose.orientation.x,out.pose.pose.orientation.y,out.pose.pose.orientation.z,out.pose.pose.orientation.w=map(float,quaternion_from_matrix(row['body']))
@@ -267,6 +269,10 @@ def main():
     started=time.monotonic()
     def health():
         if latest.get('external_error'):raise RuntimeError('LIO external odometry: '+latest['external_error'])
+        if args.fuse_lio_velocity and external_stamps:
+            from lio_control_sample import external_source_current
+            if not external_source_current(external_stamps[-1],rospy.Time.now().to_sec()):
+                raise RuntimeError('LIO external publication stale')
         if any(p.poll() is not None for p in procs):raise RuntimeError('Own process exited')
         if time.monotonic()-started>(500 if args.grasp_lio else 400 if args.approach_lio else 200)/speed:raise RuntimeError('Wall watchdog')
     try:
@@ -644,7 +650,7 @@ def main():
             result['success']=result['offline_score']['passed'] and (not args.observe_target or result['offline_score'].get('target',{}).get('passed',False) and result['offline_score'].get('tool',{}).get('passed',False))
         except Exception as e:result['offline_score_error']=str(e)
     result.update(ground_truth_control_inputs=False,arm_motion_requested=bool(approach_probe and approach_probe.motion_requested),
-        external_velocity_fused=args.fuse_lio_velocity,external_odometry_samples=external_count,external_odometry_max_age_s=external_max_age,
+        external_velocity_fused=args.fuse_lio_velocity,external_odometry_samples=external_count,external_odometry_max_age_s=external_max_age,external_odometry_stale_dropped=external_stale_dropped,
         own_processes_stopped=all_stopped,wall_elapsed_s=time.monotonic()-started)
     if not result['own_processes_stopped'] or result.get('observation_cleanup_error') or result.get('inspection_cleanup_error'):result['success']=False
     if args.inspect_ik and not result.get('ik_inspection',{}).get('inspection_verified'):result['success']=False
