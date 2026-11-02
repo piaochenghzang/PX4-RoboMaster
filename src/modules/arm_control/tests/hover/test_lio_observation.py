@@ -14,6 +14,36 @@ def sample(stamp):
     return (stamp,[stamp*.01,0.,.9,1.,0.,0.,0.])
 
 
+class BenchFixtureAdmissionTests(unittest.TestCase):
+    def measure(self,*,offset=0.,velocity=(0.,0.,0.),angular=(0.,0.,0.),source=10.,stamp=10.05,locked=False):
+        from run_lio_hover import bench_fixture_metrics
+        body=np.eye(4);body[0,3]=offset
+        sample=dict(body=body,linear_v_map=np.array(velocity),angular_v_map=np.array(angular),
+            stamp_s=stamp,last_lio_stamp_s=source)
+        saved={key:value.copy() if isinstance(value,np.ndarray) else value for key,value in sample.items()}
+        result=bench_fixture_metrics(sample,np.zeros(3),10.05,locked=locked)
+        for key in sample:np.testing.assert_array_equal(sample[key],saved[key])
+        return result
+
+    def test_capture_uses_norms_and_does_not_move_the_measured_body(self):
+        self.assertTrue(self.measure(offset=.003,velocity=(.01,0.,0.),angular=(.02,0.,0.))['ready'])
+        self.assertFalse(self.measure(offset=.0036)['ready'])
+        self.assertFalse(self.measure(velocity=(.011,.011,0.))['ready'])
+        self.assertFalse(self.measure(angular=(.022,.022,0.))['ready'])
+
+    def test_lock_ack_does_not_bypass_live_position_and_stationary_checks(self):
+        self.assertTrue(self.measure(offset=.0045,velocity=(.004,0.,0.),angular=(.009,0.,0.),locked=True)['ready'])
+        self.assertFalse(self.measure(offset=.0051,locked=True)['ready'])
+        self.assertFalse(self.measure(velocity=(.006,0.,0.),locked=True)['ready'])
+        self.assertFalse(self.measure(angular=(.011,0.,0.),locked=True)['ready'])
+
+    def test_stale_future_and_nonfinite_sources_cannot_capture(self):
+        self.assertFalse(self.measure(source=9.92)['ready'])
+        self.assertFalse(self.measure(source=10.08)['ready'])
+        self.assertFalse(self.measure(stamp=10.06)['ready'])
+        with self.assertRaisesRegex(ValueError,'BENCH_LIO_SAMPLE'):self.measure(offset=float('nan'))
+
+
 class DemoPropulsionTests(unittest.TestCase):
     def model(self):
         import xml.etree.ElementTree as ET

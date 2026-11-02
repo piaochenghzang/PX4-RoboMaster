@@ -17,11 +17,31 @@ from native_client import NativeClient
 from sim_scene import ROOT,BUILD,WS,MODELS,make_world,save,stop,SIM_VISION_PARAMS,write_lio_launch,LIO_CLOCK_HZ,size_lio_demo_propulsion
 
 PARAMS=dict(SIM_VISION_PARAMS,EKF2_EV_CTRL=11,EKF2_MAG_TYPE=5,EKF2_EVP_NOISE=.05,
-    EKF2_EVA_NOISE=.03,EKF2_DELAY_MAX=150,EKF2_TAU_VEL=.05,
+    EKF2_EVA_NOISE=.03,EKF2_DELAY_MAX=150,EKF2_TAU_VEL=.05,EKF2_TAU_POS=.10,
     # Measured collective in the previous loaded-vehicle hover; experiment only.
     MPC_THR_HOVER=.84)
 LIO_VELOCITY_STD=.010  # PX4 EV minimum; ideal simulation, not hardware calibration.
 NAV_TRACKING_BUDGET=.09  # Body tracking + measured folded-arm corner deviation.
+
+
+
+def bench_fixture_metrics(sample,goal,now,*,locked=False):
+    """Real LIO admission for a body-only mechanical fixture, never a pose set."""
+    body=np.asarray(sample['body'],dtype=float);goal=np.asarray(goal,dtype=float)
+    velocity=np.asarray(sample['linear_v_map'],dtype=float)
+    angular=np.asarray(sample['angular_v_map'],dtype=float)
+    stamp=float(sample['stamp_s']);source=float(sample['last_lio_stamp_s'])
+    if (body.shape!=(4,4) or goal.shape!=(3,) or velocity.shape!=(3,) or angular.shape!=(3,) or
+            not np.isfinite([*body.ravel(),*goal,*velocity,*angular,stamp,source,now]).all() or
+            stamp<=0 or source<=0 or now<=0):raise ValueError('BENCH_LIO_SAMPLE')
+    error=float(np.linalg.norm(body[:3,3]-goal));speed=float(np.linalg.norm(velocity));rate=float(np.linalg.norm(angular))
+    position_limit,speed_limit,rate_limit=(.005,.005,.01) if locked else (.0035,.015,.03)
+    fresh=-.02<=now-source<=.12 and 0<=now-stamp<=.2
+    return dict(ready=bool(fresh and error<=position_limit and speed<=speed_limit and rate<=rate_limit),
+        source='LIVE_LIO_BODY_PREDICTION',sample_stamp_s=stamp,last_lio_stamp_s=source,
+        source_age_s=now-source,body_position_map_m=body[:3,3].tolist(),position_error_m=error,
+        speed_m_s=speed,angular_speed_rad_s=rate,source_fresh=bool(fresh),
+        position_limit_m=position_limit,speed_limit_m_s=speed_limit,angular_limit_rad_s=rate_limit)
 
 
 def score_recording(folder,begin,end,goal):
@@ -147,10 +167,12 @@ def score_payload_recording(folder,approach):
 def main():
     ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('name');ap.add_argument('--gui',action='store_true');ap.add_argument('--observe-target',action='store_true',help='LIO-paired target and FK observation');ap.add_argument('--inspect-ik',action='store_true',help='Read-only native IK and local clearance checks after FK observation');ap.add_argument('--navigate-candidate',action='store_true',help='Fly folded to the LIO-derived candidate');ap.add_argument('--approach-lio',action='store_true',help='Includes observation, IK, navigation and velocity fusion; LIO/FK unfold and 40mm preapproach, never close')
     ap.add_argument('--grasp-lio',action='store_true',help='Same LIO route, then native contact-only close, 40mm tool extraction and hold')
+    ap.add_argument('--bench-grasp',action='store_true',help='Identify and fly to candidate, support body position with free attitude, then contact grasp; NOT an airborne grasp')
     ap.add_argument('--fuse-lio-velocity',action='store_true',help='Test source-midpoint LIO pose+velocity through standard MAVROS odometry')
     args=ap.parse_args()
     # A later stage includes its prerequisites. One LIO approach command
     # selects the validated pose+velocity transport and all read-only checks.
+    if args.bench_grasp:args.grasp_lio=True
     if args.grasp_lio:args.approach_lio=True
     if args.fuse_lio_velocity and not args.approach_lio:ap.error('--fuse-lio-velocity requires --approach-lio')
     if args.approach_lio:args.navigate_candidate=args.fuse_lio_velocity=True
@@ -186,11 +208,12 @@ def main():
         save(folder/'propulsion.json',propulsion)
     bridge=model.find("plugin[@name='mavlink_interface']")
     for el in list(bridge):
-        if el.tag in ('enableArmGraspFeedback','armGraspContactOnly','demoWallStepPacing','send_odometry','visionSubTopic'):bridge.remove(el)
+        if el.tag in ('enableArmGraspFeedback','armGraspContactOnly','demoWallStepPacing','demoBenchLock','send_odometry','visionSubTopic'):bridge.remove(el)
     if args.approach_lio:
         ET.SubElement(bridge,'enableArmGraspFeedback').text='true'
         ET.SubElement(bridge,'armGraspContactOnly').text='true'
         ET.SubElement(bridge,'demoWallStepPacing').text='true'
+    if args.bench_grasp:ET.SubElement(bridge,'demoBenchLock').text='true'
     if any(e.get('filename')=='libgazebo_vision_plugin.so' for e in model.findall('plugin')):raise RuntimeError('Ground-truth localization source present')
     scene.write(folder/'scene.world',encoding='unicode',xml_declaration=True)
     mavros=Path(sp.check_output(['rospack','find','mavros'],env=env,text=True).strip())/'launch'
@@ -201,13 +224,14 @@ def main():
         write_lio_launch(lio_launch,folder/'fastlio.launch');lio_launch=folder/'fastlio.launch'
     save(folder/'mavros_config.json',cfg);launch=ET.parse(mavros/'px4.launch')
     launch.find("include/arg[@name='config_yaml']").set('value',str(folder/'mavros_config.json'));launch.write(folder/'mavros.launch')
-    save(folder/'manifest.json',dict(stage='LIO_CONTACT_FIXED_GRASP' if args.grasp_lio else 'LIO_FK_NO_CLOSE_APPROACH' if args.approach_lio else 'LIO_CANDIDATE_NAVIGATION_NO_ARM_MOTION' if args.navigate_candidate else 'LIO_TARGET_OBSERVATION_NO_ARM_MOTION' if args.observe_target else 'LIO_LOCAL_FLIGHT_NO_ARM_MOTION',ground_truth_control_inputs=False,
+    save(folder/'manifest.json',dict(stage='LIO_IDENTIFICATION_MECHANICALLY_SUPPORTED_GRASP' if args.bench_grasp else 'LIO_CONTACT_FIXED_GRASP' if args.grasp_lio else 'LIO_FK_NO_CLOSE_APPROACH' if args.approach_lio else 'LIO_CANDIDATE_NAVIGATION_NO_ARM_MOTION' if args.navigate_candidate else 'LIO_TARGET_OBSERVATION_NO_ARM_MOTION' if args.observe_target else 'LIO_LOCAL_FLIGHT_NO_ARM_MOTION',ground_truth_control_inputs=False,
+        mechanically_supported_grasp=args.bench_grasp,airborne_grasp_validated=False,
         gazebo_vision_plugin=False,lio_alignment_source='FIRST_LIO_BODY_POSE',ekf_parameters=parameters,propulsion=propulsion,
         target_observation=args.observe_target,encoder_fk_observation=args.observe_target,read_only_ik_inspection=args.inspect_ik,candidate_navigation=args.navigate_candidate,lio_fk_approach=args.approach_lio,closing_allowed=args.grasp_lio,grasp_feedback_source='SIM_CONTACT_NO_OBJECT_POSE' if args.approach_lio else 'DISABLED',external_velocity_fused=args.fuse_lio_velocity,
         external_odometry_source='LIO_TWO_POSE_SOURCE_MIDPOINT' if args.fuse_lio_velocity else 'LIO_SCAN_END_POSE_ONLY',
         external_odometry_stddev=dict(position_m=.05,orientation_rad=.03,velocity_m_s=LIO_VELOCITY_STD,angular_velocity_rad_s=.05) if args.fuse_lio_velocity else None,
         ros_clock_hz=LIO_CLOCK_HZ,registered_cloud_source='UNDISTORTED_POINTS' if args.approach_lio else 'ESTIMATOR_VOXEL_POINTS',
-        demo_wall_step_pacing=args.approach_lio,fine_velocity_residual_feedforward=False,fine_velocity_residual_slew_m_s2=None,flight_registration_policy='DYNAMIC_POSITION_ONLY',
+        demo_wall_step_pacing=args.approach_lio,fine_velocity_residual_feedforward=False,fine_velocity_residual_slew_m_s2=None,flight_registration_policy='POSITION_REGISTRATION_FIXED_DURING_ARM_STAGE',
         minimum_wall_step_s=float(scene.findtext('world/physics/max_step_size'))/speed if args.approach_lio else None,
         observation_local_goal_m=[.3,0,.9],sim_speed_factor=speed))
     os.environ.update(ROS_MASTER_URI=env['ROS_MASTER_URI'],ROS_HOSTNAME='localhost');os.environ.pop('ROS_IP',None)
@@ -215,6 +239,36 @@ def main():
     external_pairs=deque(maxlen=2);external_stamps=deque(maxlen=20);external_count=0;external_max_age=0.;external_stale_dropped=0
     tool_observer=None;tool_log=None;tool_start=None;tool_count=0
     inspection_thread=None;inspection={}
+    bench_thread=None;bench_stop=threading.Event()
+    bench_fixture=dict(enabled=args.bench_grasp,requested=False,locked=False,
+        joint_name='yhang550::demo_bench_anchor',joint_type='ball',position_supported=True,attitude_free=True,
+        parent='world',child='yhang550_base::base_link',
+        payload_attachment=False,pose_teleport=False,ground_truth_control_inputs=False)
+    def request_bench_fixture():
+        # This worker only requests a physical world->body spherical support. Flight
+        # setpoints continue on the main thread; arm gates remain untouched.
+        try:
+            from gazebo_msgs.srv import GetModelProperties
+            deadline=time.monotonic()+5.
+            sp.run(['gz','topic','-p','/gazebo/default/yhang550/demo_bench_lock',
+                '-m','data: 1'],env=env,check=True,
+                stdout=sp.PIPE,stderr=sp.STDOUT,text=True,timeout=3.)
+            if bench_stop.is_set():return
+            rospy.wait_for_service('/gazebo/get_model_properties',timeout=max(.01,deadline-time.monotonic()))
+            properties=rospy.ServiceProxy('/gazebo/get_model_properties',GetModelProperties)
+            while not bench_stop.is_set() and time.monotonic()<deadline:
+                response=properties(model_name='yhang550')
+                names=[name for name in response.joint_names if name.split('::')[-1]=='demo_bench_anchor']
+                if response.success and names:
+                    if response.is_static:raise RuntimeError('Bench must constrain only the body; whole model is static')
+                    bench_fixture.update(locked=True,locked_sim_s=rospy.Time.now().to_sec(),
+                        acknowledgement='GAZEBO_GET_MODEL_PROPERTIES',ack_joint_name=names[0],model_static=False)
+                    return
+                bench_stop.wait(.05)
+            if not bench_stop.is_set():raise RuntimeError('Body fixture joint was not acknowledged')
+        except Exception as exc:
+            if not bench_stop.is_set():bench_fixture['error']=str(exc) or type(exc).__name__
+
     clouds=deque(maxlen=10);candidate_route=None;candidate_held=None;candidate_baseline=None
     candidate_samples=[];last_tool_row=None;filter_messages=deque(maxlen=50)
     approach_probe=None;fine_bias=np.zeros(3);fine_velocity=np.zeros(3);last_bias=None
@@ -269,6 +323,10 @@ def main():
     started=time.monotonic()
     def health():
         if latest.get('external_error'):raise RuntimeError('LIO external odometry: '+latest['external_error'])
+        if bench_fixture.get('error'):raise RuntimeError('Bench fixture: '+bench_fixture['error'])
+        if (bench_fixture['requested'] and not bench_fixture['locked'] and
+                time.monotonic()-bench_fixture['request_wall_monotonic_s']>6.):
+            raise RuntimeError('Bench fixture acknowledgment watchdog')
         if args.fuse_lio_velocity and external_stamps:
             from lio_control_sample import external_source_current
             if not external_source_current(external_stamps[-1],rospy.Time.now().to_sec()):
@@ -411,7 +469,13 @@ def main():
                         from lio_approach_probe import alignment_bias
                         local_lio=flight_sample['body'][:3,3]
                         elapsed=.02 if last_bias is None else now-last_bias
-                        fine_bias,_=alignment_bias(fine_bias,xyz,local_lio,elapsed);last_bias=now
+                        # Latch the map registration when the arm stage
+                        # begins. Recomputing EKF-minus-LIO position inside
+                        # flight control replaces its current position error
+                        # with a delayed scan error. LIO fusion/guards stay live.
+                        if approach_probe is None:
+                            fine_bias,_=alignment_bias(fine_bias,xyz,local_lio,elapsed)
+                        last_bias=now
                         # Keep map registration in position only. Adding
                         # EKF-minus-scan velocity can cancel PX4's faster inertial
                         # velocity feedback. Retain the trajectory feedforward;
@@ -602,6 +666,24 @@ def main():
                         save(folder/'candidate_navigation_samples.json',candidate_samples)
                         save(folder/'graph_candidate_completed.json',check_online_graph())
                         if not args.approach_lio:end=now;break
+                    if args.approach_lio and result.get('candidate_navigation') and approach_probe is None:
+                        if args.bench_grasp:
+                            metrics=bench_fixture_metrics(flight_sample,goal,now,locked=bench_fixture['locked'])
+                            if not bench_fixture['requested']:
+                                if not metrics['ready']:time.sleep(.005);continue
+                                bench_fixture.update(requested=True,request_sim_s=now,request_frame=metrics,
+                                    request_wall_monotonic_s=time.monotonic())
+                                save(folder/'bench_fixture.json',dict(bench_fixture))
+                                bench_thread=threading.Thread(target=request_bench_fixture,daemon=True);bench_thread.start()
+                                print('Bench fixture requested: world -> vehicle body ONLY; not airborne grasp',flush=True)
+                            if bench_fixture['locked'] and 'ack_frame' not in bench_fixture:
+                                bench_fixture.update(ack_observed_sim_s=now,ack_frame=metrics)
+                                save(folder/'bench_fixture.json',dict(bench_fixture))
+                            if not bench_fixture['locked'] or now-bench_fixture['locked_sim_s']<2. or not metrics['ready']:
+                                time.sleep(.005);continue
+                            bench_fixture.update(settled_sim_s=now,settled_frame=metrics)
+                            save(folder/'bench_fixture.json',dict(bench_fixture))
+                            print('Body mechanically supported; live LIO/FK and native grasp guards remain active',flush=True)
                         from lio_approach_probe import LioApproachProbe
                         approach_probe=LioApproachProbe(native,tool_observer,config,plan.geometry_profile,
                             inspection['candidate'],inspection['result']['unfold_precheck']['final_q'],
@@ -619,6 +701,8 @@ def main():
         # Complete bounded owned-process cleanup and save the result even if
         # another interrupt arrives while a child is already shutting down.
         old_interrupt=signal.signal(signal.SIGINT,signal.SIG_IGN)
+        bench_stop.set()
+        if bench_thread is not None:bench_thread.join(timeout=6.)
         if approach_probe is not None and 'lio_approach' not in result:
             try:result['lio_approach']=approach_probe.finish()
             except Exception as e:result['approach_cleanup_error']=str(e)
@@ -634,6 +718,11 @@ def main():
         if fcu_pub:fcu_pub.unregister()
         for sub in subs:sub.unregister()
         for p in reversed(procs):stop(p)
+        if bench_thread is not None:
+            bench_thread.join(timeout=2.)
+            if bench_thread.is_alive():result['bench_cleanup_error']='Bench worker did not stop'
+        if args.bench_grasp:
+            save(folder/'bench_fixture.json',dict(bench_fixture));result['bench_fixture']=dict(bench_fixture)
         for log in logs:log.close()
         if candidate_samples:save(folder/'candidate_navigation_samples.json',candidate_samples)
         signal.signal(signal.SIGINT,old_interrupt)
@@ -646,7 +735,7 @@ def main():
     result.update(ground_truth_control_inputs=False,arm_motion_requested=bool(approach_probe and approach_probe.motion_requested),
         external_velocity_fused=args.fuse_lio_velocity,external_odometry_samples=external_count,external_odometry_max_age_s=external_max_age,external_odometry_stale_dropped=external_stale_dropped,
         own_processes_stopped=all_stopped,wall_elapsed_s=time.monotonic()-started)
-    if not result['own_processes_stopped'] or result.get('observation_cleanup_error') or result.get('inspection_cleanup_error'):result['success']=False
+    if not result['own_processes_stopped'] or result.get('observation_cleanup_error') or result.get('inspection_cleanup_error') or result.get('bench_cleanup_error'):result['success']=False
     if args.inspect_ik and not result.get('ik_inspection',{}).get('inspection_verified'):result['success']=False
     if args.navigate_candidate and not result.get('candidate_navigation',{}).get('completed'):result['success']=False
     if args.approach_lio and not result.get('lio_approach',{}).get('completed'):result['success']=False
@@ -655,6 +744,9 @@ def main():
             result['payload_offline_score']=score_payload_recording(folder,result['lio_approach'])
             result['success']=result['success'] and result['payload_offline_score']['passed']
         except Exception as e:result['success']=False;result['payload_offline_score_error']=str(e)
+    result['mechanically_supported_grasp']=bool(args.bench_grasp)
+    result['airborne_grasp_validated']=bool(args.grasp_lio and not args.bench_grasp and result['success'])
+    if args.bench_grasp and not bench_fixture.get('settled_sim_s'):result['success']=False
     save(folder/'result.json',result);print(json.dumps(result,indent=2),flush=True)
     return 0 if result['success'] else 2
 
