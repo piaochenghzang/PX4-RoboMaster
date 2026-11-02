@@ -47,7 +47,7 @@ def preview_pose_ready(preview,desired):
 def precision_contact_profile(grasp,index,native,ids):
     if not grasp:return False
     if index>=1:return True
-    # ROUTE[0] can already be closer than the following 55mm alignment.
+    # ROUTE[0] is already near the designated contact approach region.
     # Require THIS accepted owner to have finished unfolding before applying
     # the existing approved pad/handle policy at the first transit point.
     return (native.get('mode')==1 and native.get('phase')==1 and
@@ -208,10 +208,13 @@ class LioApproachProbe:
         self.first_arm=np.eye(4);self.first_arm[:3,3]=ROUTE[0]
         first=candidate['map_from_arm']@self.first_arm
         pre=np.array(candidate['pre_goal']['map_from_desired_tcp'])
-        # 70mm put shoulder_lift on its lower limit even at nominal hover.
-        # Align at 55mm instead, then retain the unchanged 40mm endpoint.
-        far=pre.copy();far[:3,3]+=np.array(candidate['map_from_target'])[:3,2]*.015
-        self.goals=[first,far,pre]
+        # Grasp uses the SAME ROUTE[0] -> 40mm path already checked by
+        # inspect_unfold. The extra 55mm retreat pushed the shoulder towards
+        # its limit. Keep the legacy all16/no-close observation route intact.
+        if self.grasp:self.goals=[first,pre]
+        else:
+            far=pre.copy();far[:3,3]+=np.array(candidate['map_from_target'])[:3,2]*.015
+            self.goals=[first,far,pre]
         self.alignment_target=None
         if self.grasp:
             final=np.array(candidate['final_goal']['map_from_desired_tcp']).copy()
@@ -312,7 +315,7 @@ class LioApproachProbe:
                     angle=angle_deg(tcp[:3,:3],goal[:3,:3]) if self.index else None
                     record=dict(sim_s=now,stage=self.stage,index=self.index,geometry=geo,hover=self.hover,
                         approach=self.native,arm=self.arm,control_sample=row,goal_map=goal.tolist(),tool_error_m=error,orientation_error_deg=angle,
-                        goal_policy='ARM_RELATIVE_TRANSIT' if self.index==0 else ('LIO_TARGET_QUINTIC_2MM_S' if self.grasp and self.index==3 else 'LIO_TARGET_QUINTIC_10MM_S'),segment_finished=segment_finished,
+                        goal_policy='ARM_RELATIVE_TRANSIT' if self.index==0 else ('LIO_TARGET_QUINTIC_2MM_S' if self.grasp and self.index==len(self.goals)-1 else 'LIO_TARGET_QUINTIC_10MM_S'),segment_finished=segment_finished,
                         geometry_compute_wall_s=geometry_wall,context_publish_age_s=publish_age,
                         precision_contact_profile=fine,jaw_sweep_clearance_m=jaw_clearance,closing_requested=self.closing_requested,
                         sent_context=dict(body_speed_m_s=fields[5],body_angular_speed_rad_s=fields[6],tilt_rad=fields[7],
@@ -371,7 +374,7 @@ class LioApproachProbe:
                                 or (not self.grasp and transit_ready(self.index,self.native.get('phase'),error,fields[10],self.hover.get('start_ready')))) and error<=.015:
                             if self.index<len(self.goals)-1:
                                 if self.index>=1:
-                                    if self.index==2 and (error>.005 or angle>5):continue
+                                    if (self.grasp or self.index==2) and (error>.005 or angle>5):continue
                                     lateral=np.array(row['map_from_target'])[:3,:3].T@(tcp[:3,3]-goal[:3,3])
                                     if error>.005 or np.linalg.norm(lateral[:2])>.003:continue
                                 # Recheck from the actual unfolded/transit seed;
@@ -385,12 +388,13 @@ class LioApproachProbe:
                                 with (self.folder/'transit_ik_precheck.log').open('a') as out:out.write(output+'\n')
                                 preview=parse_native(output)
                                 if not preview_pose_ready(preview,actual_pre):continue
-                                event=('existing_transit_reached','far_alignment_reached','preapproach_reached')[self.index]
+                                names=('existing_transit_reached','preapproach_reached') if self.grasp else ('existing_transit_reached','far_alignment_reached','preapproach_reached')
+                                event=names[self.index]
                                 self.index+=1;self.holding=None
                                 end=self.goals[self.index][:3,3]
                                 # Smooth only forward approach; native retains
-                                # its 30mm/s budget for body-motion compensation.
-                                duration=max(4.,1.875*float(np.linalg.norm(end-tcp[:3,3]))/(.002 if self.grasp and self.index==3 else .010))
+                                # its 50mm/s budget for body-motion compensation.
+                                duration=max(4.,1.875*float(np.linalg.norm(end-tcp[:3,3]))/(.002 if self.grasp and self.index==len(self.goals)-1 else .010))
                                 self.segment=(now,tcp[:3,3].copy(),duration)
                                 self.event(event,now,error_m=error,transition_duration_s=duration)
                             elif self.grasp:

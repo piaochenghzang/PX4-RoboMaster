@@ -491,13 +491,13 @@ class SmoothGoalTests(unittest.TestCase):
 
 
 class LioApproachCoverageRegressionTests(unittest.TestCase):
-    def create(self,points,folder,client):
+    def create(self,points,folder,client,*,grasp=False):
         candidate=dict(map_from_target=np.eye(4),map_from_body_hover=np.eye(4),map_from_arm=np.eye(4),
-            pre_goal=dict(map_from_desired_tcp=np.eye(4)))
+            pre_goal=dict(map_from_desired_tcp=np.eye(4)),final_goal=dict(map_from_desired_tcp=np.eye(4)))
         static=[('vehicle::base',np.eye(4),np.ones(3)*.01)]
         with patch('lio_route_clearance.body_collision_boxes',return_value=static):
             return LioApproachProbe(client,SimpleNamespace(),{}, {},candidate,np.zeros(5),folder,
-                {},Path('/unused/scene.world'),points)
+                {},Path('/unused/scene.world'),points,grasp=grasp)
 
     def test_sparse_nonempty_local_returns_do_not_invent_a_fifty_point_threshold(self):
         # Global map and target-fit acceptance belong to the caller. The local
@@ -516,6 +516,17 @@ class LioApproachCoverageRegressionTests(unittest.TestCase):
                 client.client.assert_not_called()
                 self.assertFalse(probe.thread.is_alive())
                 self.assertFalse(probe.motion_requested)
+
+    def test_grasp_reuses_checked_preapproach_without_extra_retreat(self):
+        with TemporaryDirectory() as directory:
+            client=Mock();client.status.return_value=dict(joint_target=[-.07,-1.175,1.45,1.3,-1.57,.3])
+            probe=self.create(np.array([[.1,0.,0.]]),Path(directory)/'probe',client,grasp=True)
+            self.assertEqual(len(probe.goals),3)
+            np.testing.assert_allclose(probe.goals[1],np.eye(4))
+            np.testing.assert_allclose(probe.goals[2][:3,3],[.0023,0.,0.])
+            np.testing.assert_allclose(probe.alignment_target,[.0023,0.,0.])
+            client.client.assert_not_called()
+            self.assertFalse(probe.motion_requested)
 
     def test_missing_global_or_local_returns_still_refuse_before_native_io(self):
         for points in (np.empty((0,3)),np.array([[2.,0.,0.],[0.,3.,0.]])):
