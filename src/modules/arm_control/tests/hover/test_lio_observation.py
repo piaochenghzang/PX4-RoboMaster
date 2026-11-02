@@ -34,10 +34,28 @@ class DemoPropulsionTests(unittest.TestCase):
         motors=m.findall("plugin[@filename='libgazebo_motor_model.so']")
         thrust=sum(float(p.findtext('motorConstant'))*float(p.findtext('maxRotVelocity'))**2 for p in motors)
         self.assertAlmostEqual(thrust,2.*3.11*9.8)
-        omega=r['expected_empty_hover_command']*1000.+100.
+        omega=r['expected_empty_hover_actuator_command']*r['input_scaling']+r['armed_idle_rad_s']
         self.assertAlmostEqual(sum(float(p.findtext('motorConstant'))*omega**2 for p in motors),3.1*9.8)
         self.assertTrue(all(p.findtext('maxRotVelocity')=='1000' for p in motors))
         self.assertEqual([l.findtext('inertial/mass') for l in m.findall('link')],['2.0','0.7','0.4'])
+
+    def test_px4_inverse_curve_matches_simulator_thrust_over_full_command_range(self):
+        from sim_scene import size_lio_demo_propulsion
+        m=self.model();r=size_lio_demo_propulsion(m,.01)
+        factor=r['thr_mdl_fac'];idle=r['armed_idle_rad_s'];scale=r['input_scaling']
+        k=r['motor_constant'];minimum=4*k*idle**2
+        maximum=4*k*r['max_rot_velocity_rad_s']**2
+        for alpha in [*np.linspace(0.,1.,21),r['expected_empty_hover_thrust']]:
+            # The installed PX4 FunctionMotors inverse of a*u²+(1-a)*u.
+            u=(-(1-factor)+np.sqrt((1-factor)**2+4*factor*alpha))/(2*factor)
+            omega=idle+scale*u
+            self.assertLessEqual(omega,r['max_rot_velocity_rad_s']+1e-9)
+            self.assertAlmostEqual(4*k*omega**2,minimum+(maximum-minimum)*alpha,places=10)
+        alpha=r['expected_empty_hover_thrust']
+        u=(-(1-factor)+np.sqrt((1-factor)**2+4*factor*alpha))/(2*factor)
+        self.assertAlmostEqual(u,r['expected_empty_hover_actuator_command'],places=12)
+        self.assertAlmostEqual(4*k*(idle+scale*u)**2,r['vehicle_mass_kg']*r['gravity_m_s2'],places=10)
+        self.assertTrue(all(c.findtext('input_scaling')=='900.0' for c in m.findall('.//channel')))
 
     def test_unknown_mapping_and_invalid_mass_reject_before_mutating_model(self):
         import xml.etree.ElementTree as ET

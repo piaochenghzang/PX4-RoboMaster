@@ -82,15 +82,25 @@ def size_lio_demo_propulsion(model,payload_mass,gravity=9.8):
     loaded_mass=mass+payload_mass;weight=loaded_mass*gravity
     old_thrust=sum(k*w*w for k,w in zip(original,speeds))
     constant=2.*weight/sum(w*w for w in speeds)
-    hover=(math.sqrt(mass*gravity/(4.*constant))-100.)/1000.
-    if not .1<hover<.9:raise ValueError('Unsupported demo hover command')
+    idle=100.;scale=speeds[0]-idle
+    if scale<=0:raise ValueError('Unsupported demo rotor speed')
+    # Match FunctionMotors' rel_thrust=a*u*u+(1-a)*u to Gazebo's
+    # F=k*(idle+scale*u)^2, excluding the constant armed-idle thrust.
+    # The full [0,1] actuator range must reach, not exceed, maxRotVelocity.
+    factor=scale/(scale+2.*idle)
+    omega=math.sqrt(mass*gravity/(4.*constant))
+    hover=(omega*omega-idle*idle)/(speeds[0]**2-idle*idle)
+    if not .1<hover<.9:raise ValueError('Unsupported demo hover thrust')
     for motor in motors:motor.find('motorConstant').text=str(constant)
-    return dict(policy='DEMO_ONLY_2_TO_1_LOADED_THRUST_WEIGHT_NOT_HARDWARE_CALIBRATION',
+    for channel in channels:channel.find('input_scaling').text=str(scale)
+    return dict(policy='DEMO_ONLY_LINEARIZED_2_TO_1_LOADED_THRUST_WEIGHT_NOT_HARDWARE_CALIBRATION',
         vehicle_mass_kg=mass,payload_mass_kg=payload_mass,gravity_m_s2=gravity,loaded_mass_kg=loaded_mass,
         original_motor_constants=original,motor_constant=constant,max_rot_velocity_rad_s=speeds[0],
         original_max_static_thrust_n=old_thrust,max_static_thrust_n=2.*weight,
-        loaded_thrust_weight_ratio=2.,expected_empty_hover_command=hover,
-        thr_mdl_fac=0.,production_model_modified=False)
+        loaded_thrust_weight_ratio=2.,expected_empty_hover_thrust=hover,
+        expected_empty_hover_actuator_command=(omega-idle)/scale,
+        original_input_scaling=1000.,input_scaling=scale,armed_idle_rad_s=idle,
+        thr_mdl_fac=factor,production_model_modified=False)
 
 
 def write_lio_launch(source,destination):

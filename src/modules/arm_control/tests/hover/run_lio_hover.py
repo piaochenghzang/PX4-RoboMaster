@@ -181,7 +181,7 @@ def main():
     propulsion=None
     if args.approach_lio:
         propulsion=size_lio_demo_propulsion(model,plan.geometry_profile['target']['candidate_total_mass_kg'])
-        parameters.update(MPC_THR_HOVER=propulsion['expected_empty_hover_command'],THR_MDL_FAC=0.)
+        parameters.update(MPC_THR_HOVER=propulsion['expected_empty_hover_thrust'],THR_MDL_FAC=propulsion['thr_mdl_fac'])
         env.update({'PX4_PARAM_'+k:str(v) for k,v in parameters.items()})
         save(folder/'propulsion.json',propulsion)
     bridge=model.find("plugin[@name='mavlink_interface']")
@@ -207,7 +207,7 @@ def main():
         external_odometry_source='LIO_TWO_POSE_SOURCE_MIDPOINT' if args.fuse_lio_velocity else 'LIO_SCAN_END_POSE_ONLY',
         external_odometry_stddev=dict(position_m=.05,orientation_rad=.03,velocity_m_s=LIO_VELOCITY_STD,angular_velocity_rad_s=.05) if args.fuse_lio_velocity else None,
         ros_clock_hz=LIO_CLOCK_HZ,registered_cloud_source='UNDISTORTED_POINTS' if args.approach_lio else 'ESTIMATOR_VOXEL_POINTS',
-        demo_wall_step_pacing=args.approach_lio,fine_velocity_residual_feedforward=True,fine_velocity_residual_slew_m_s2=.20,flight_registration_policy='DYNAMIC_BASELINE',
+        demo_wall_step_pacing=args.approach_lio,fine_velocity_residual_feedforward=False,fine_velocity_residual_slew_m_s2=None,flight_registration_policy='DYNAMIC_POSITION_ONLY',
         minimum_wall_step_s=float(scene.findtext('world/physics/max_step_size'))/speed if args.approach_lio else None,
         observation_local_goal_m=[.3,0,.9],sim_speed_factor=speed))
     os.environ.update(ROS_MASTER_URI=env['ROS_MASTER_URI'],ROS_HOSTNAME='localhost');os.environ.pop('ROS_IP',None)
@@ -408,21 +408,15 @@ def main():
                     else:wp,wv,yaw=candidate_route.sample(now)
                     cmd=KnownFlightSetpoint();cmd.header.stamp=rospy.Time.now();cmd.header.frame_id='map';cmd.task_id=1
                     if args.approach_lio:
-                        from lio_approach_probe import alignment_bias,alignment_velocity
+                        from lio_approach_probe import alignment_bias
                         local_lio=flight_sample['body'][:3,3]
                         elapsed=.02 if last_bias is None else now-last_bias
                         fine_bias,_=alignment_bias(fine_bias,xyz,local_lio,elapsed);last_bias=now
-                        ev=odom.twist.twist.linear
-                        ekf_v=R@np.array([ev.x,ev.y,ev.z]);lio_v=flight_sample['linear_v_map']
-                        # EV fusion improves the filter, but does not make its
-                        # output identical to the measured LIO velocity. Apply
-                        # only that residual so position and damping share the
-                        # same reference; do not add position-bias derivative.
-                        fine_velocity=alignment_velocity(fine_velocity,ekf_v,lio_v,elapsed)
-                        # EKF-LIO velocity difference already supplies the
-                        # changing position offset's feedforward. Adding its
-                        # finite-difference derivative again doubles it.
-                        wp=wp+fine_bias;wv=wv+fine_velocity
+                        # Keep map registration in position only. Adding
+                        # EKF-minus-scan velocity can cancel PX4's faster inertial
+                        # velocity feedback. Retain the trajectory feedforward;
+                        # fine_velocity stays zero in existing diagnostics.
+                        wp=wp+fine_bias
                     if approach_probe is not None:
                         cmd.task_id,cmd.plan_id,cmd.target_id,cmd.scene_id=approach_probe.ids;cmd.terminal_hold=True
                     cmd.setpoint.header=cmd.header;cmd.setpoint.coordinate_frame=PositionTarget.FRAME_LOCAL_NED
