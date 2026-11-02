@@ -14,6 +14,43 @@ def sample(stamp):
     return (stamp,[stamp*.01,0.,.9,1.,0.,0.,0.])
 
 
+class DemoPropulsionTests(unittest.TestCase):
+    def model(self):
+        import xml.etree.ElementTree as ET
+        m=ET.Element('model')
+        for mass in (2.,.7,.4):
+            ET.SubElement(ET.SubElement(ET.SubElement(m,'link'),'inertial'),'mass').text=str(mass)
+        channels=ET.SubElement(ET.SubElement(m,'plugin',name='mavlink_interface'),'control_channels')
+        for i in range(4):
+            p=ET.SubElement(m,'plugin',filename='libgazebo_motor_model.so')
+            for k,v in dict(motorNumber=i,motorConstant=8.54858e-6,maxRotVelocity=1000).items():ET.SubElement(p,k).text=str(v)
+            c=ET.SubElement(channels,'channel')
+            for k,v in dict(input_scaling=1000,input_offset=0,zero_position_armed=100).items():ET.SubElement(c,k).text=str(v)
+        return m
+
+    def test_full_payload_has_twice_weight_and_empty_hover_balances_mass(self):
+        from sim_scene import size_lio_demo_propulsion
+        m=self.model();r=size_lio_demo_propulsion(m,.01)
+        motors=m.findall("plugin[@filename='libgazebo_motor_model.so']")
+        thrust=sum(float(p.findtext('motorConstant'))*float(p.findtext('maxRotVelocity'))**2 for p in motors)
+        self.assertAlmostEqual(thrust,2.*3.11*9.81)
+        omega=r['expected_empty_hover_command']*1000.+100.
+        self.assertAlmostEqual(sum(float(p.findtext('motorConstant'))*omega**2 for p in motors),3.1*9.81)
+        self.assertTrue(all(p.findtext('maxRotVelocity')=='1000' for p in motors))
+        self.assertEqual([l.findtext('inertial/mass') for l in m.findall('link')],['2.0','0.7','0.4'])
+
+    def test_unknown_mapping_and_invalid_mass_reject_before_mutating_model(self):
+        import xml.etree.ElementTree as ET
+        from sim_scene import size_lio_demo_propulsion
+        for payload in (-.01,float('nan'),float('inf')):
+            m=self.model();before=ET.tostring(m)
+            with self.assertRaises(ValueError):size_lio_demo_propulsion(m,payload)
+            self.assertEqual(ET.tostring(m),before)
+        m=self.model();m.find('.//input_scaling').text='900';before=ET.tostring(m)
+        with self.assertRaisesRegex(ValueError,'mapping'):size_lio_demo_propulsion(m,.01)
+        self.assertEqual(ET.tostring(m),before)
+
+
 class DenseLaunchTests(unittest.TestCase):
     def test_override_is_case_local_and_follows_the_original_config_load(self):
         import tempfile

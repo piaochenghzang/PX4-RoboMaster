@@ -58,6 +58,41 @@ def save(path,value):
     path.write_text(json.dumps(value,indent=2,allow_nan=False)+'\n')
 
 
+
+def size_lio_demo_propulsion(model,payload_mass):
+    """Size only the generated LIO demo for 2:1 loaded static thrust/weight.
+
+    This is an explicit simulated powertrain candidate, not motor calibration.
+    Retain all mass/inertia, rotor speed limits and safety thresholds.
+    """
+    mass=sum(float(link.findtext('inertial/mass')) for link in model.findall('link'))
+    payload_mass=float(payload_mass)
+    motors=[p for p in model.findall('plugin') if p.get('filename')=='libgazebo_motor_model.so']
+    if not math.isfinite(mass) or mass<=0 or not math.isfinite(payload_mass) or payload_mass<0:
+        raise ValueError('Invalid demo propulsion mass')
+    channels=model.findall("plugin[@name='mavlink_interface']/control_channels/channel")
+    if len(motors)!=4 or sorted(int(p.findtext('motorNumber')) for p in motors)!=list(range(4)) or len(channels)!=4:
+        raise ValueError('Expected four demo motors and channels')
+    original=[float(p.findtext('motorConstant')) for p in motors]
+    speeds=[float(p.findtext('maxRotVelocity')) for p in motors]
+    mapping=[tuple(float(c.findtext(k)) for k in ('input_scaling','input_offset','zero_position_armed')) for c in channels]
+    if (any(not math.isfinite(v) or v<=0 for v in original+speeds) or
+            len(set(speeds))!=1 or any(v!=(1000.,0.,100.) for v in mapping)):
+        raise ValueError('Unsupported demo propulsion mapping')
+    loaded_mass=mass+payload_mass;weight=loaded_mass*9.81
+    old_thrust=sum(k*w*w for k,w in zip(original,speeds))
+    constant=2.*weight/sum(w*w for w in speeds)
+    hover=(math.sqrt(mass*9.81/(4.*constant))-100.)/1000.
+    if not .1<hover<.9:raise ValueError('Unsupported demo hover command')
+    for motor in motors:motor.find('motorConstant').text=str(constant)
+    return dict(policy='DEMO_ONLY_2_TO_1_LOADED_THRUST_WEIGHT_NOT_HARDWARE_CALIBRATION',
+        vehicle_mass_kg=mass,payload_mass_kg=payload_mass,loaded_mass_kg=loaded_mass,
+        original_motor_constants=original,motor_constant=constant,max_rot_velocity_rad_s=speeds[0],
+        original_max_static_thrust_n=old_thrust,max_static_thrust_n=2.*weight,
+        loaded_thrust_weight_ratio=2.,expected_empty_hover_command=hover,
+        thr_mdl_fac=0.,production_model_modified=False)
+
+
 def write_lio_launch(source,destination):
     """Publish existing undistorted points; leave estimator filtering intact."""
     launch=ET.parse(source)

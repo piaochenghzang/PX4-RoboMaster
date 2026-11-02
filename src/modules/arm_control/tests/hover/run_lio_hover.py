@@ -14,7 +14,7 @@ from known_target import rotation,quintic_segment,pose
 from lidar_grasp_demo import LidarDemoPlan,TargetObservation
 from lio_tool_observer import LioToolObserver
 from native_client import NativeClient
-from sim_scene import ROOT,BUILD,WS,MODELS,make_world,save,stop,SIM_VISION_PARAMS,write_lio_launch,LIO_CLOCK_HZ
+from sim_scene import ROOT,BUILD,WS,MODELS,make_world,save,stop,SIM_VISION_PARAMS,write_lio_launch,LIO_CLOCK_HZ,size_lio_demo_propulsion
 
 PARAMS=dict(SIM_VISION_PARAMS,EKF2_EV_CTRL=11,EKF2_MAG_TYPE=5,EKF2_EVP_NOISE=.05,
     EKF2_EVA_NOISE=.03,EKF2_DELAY_MAX=150,EKF2_TAU_VEL=.05,
@@ -178,6 +178,12 @@ def main():
     make_world(folder,plan.target,env,fixed_grasp=True,lidar_geometry=plan.geometry_profile,fastlio=True)
     scene=ET.parse(folder/'scene.world');model=scene.find("world/model[@name='yhang550']")
     model.find('pose').text='0 0 .45 0 0 0'
+    propulsion=None
+    if args.approach_lio:
+        propulsion=size_lio_demo_propulsion(model,plan.geometry_profile['target']['candidate_total_mass_kg'])
+        parameters.update(MPC_THR_HOVER=propulsion['expected_empty_hover_command'],THR_MDL_FAC=0.)
+        env.update({'PX4_PARAM_'+k:str(v) for k,v in parameters.items()})
+        save(folder/'propulsion.json',propulsion)
     bridge=model.find("plugin[@name='mavlink_interface']")
     for el in list(bridge):
         if el.tag in ('enableArmGraspFeedback','armGraspContactOnly','demoWallStepPacing','send_odometry','visionSubTopic'):bridge.remove(el)
@@ -196,7 +202,7 @@ def main():
     save(folder/'mavros_config.json',cfg);launch=ET.parse(mavros/'px4.launch')
     launch.find("include/arg[@name='config_yaml']").set('value',str(folder/'mavros_config.json'));launch.write(folder/'mavros.launch')
     save(folder/'manifest.json',dict(stage='LIO_CONTACT_FIXED_GRASP' if args.grasp_lio else 'LIO_FK_NO_CLOSE_APPROACH' if args.approach_lio else 'LIO_CANDIDATE_NAVIGATION_NO_ARM_MOTION' if args.navigate_candidate else 'LIO_TARGET_OBSERVATION_NO_ARM_MOTION' if args.observe_target else 'LIO_LOCAL_FLIGHT_NO_ARM_MOTION',ground_truth_control_inputs=False,
-        gazebo_vision_plugin=False,lio_alignment_source='FIRST_LIO_BODY_POSE',ekf_parameters=parameters,
+        gazebo_vision_plugin=False,lio_alignment_source='FIRST_LIO_BODY_POSE',ekf_parameters=parameters,propulsion=propulsion,
         target_observation=args.observe_target,encoder_fk_observation=args.observe_target,read_only_ik_inspection=args.inspect_ik,candidate_navigation=args.navigate_candidate,lio_fk_approach=args.approach_lio,closing_allowed=args.grasp_lio,grasp_feedback_source='SIM_CONTACT_NO_OBJECT_POSE' if args.approach_lio else 'DISABLED',external_velocity_fused=args.fuse_lio_velocity,
         external_odometry_source='LIO_TWO_POSE_SOURCE_MIDPOINT' if args.fuse_lio_velocity else 'LIO_SCAN_END_POSE_ONLY',
         external_odometry_stddev=dict(position_m=.05,orientation_rad=.03,velocity_m_s=LIO_VELOCITY_STD,angular_velocity_rad_s=.05) if args.fuse_lio_velocity else None,
