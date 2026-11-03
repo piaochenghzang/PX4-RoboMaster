@@ -44,6 +44,38 @@ class BenchFixtureAdmissionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'BENCH_LIO_SAMPLE'):self.measure(offset=float('nan'))
 
 
+class OfflinePayloadEvidenceTests(unittest.TestCase):
+    def score(self,*,guard=False,forbidden=False,lift=.04):
+        import tempfile,rosbag
+        from run_lio_hover import score_payload_recording
+        def message(t,z):
+            return types.SimpleNamespace(header=types.SimpleNamespace(stamp=types.SimpleNamespace(to_sec=lambda:t)),
+                target_present=True,target_pose=types.SimpleNamespace(position=types.SimpleNamespace(z=z)),
+                fixed_grasp_geometry_valid=guard,fixed_grasp_forbidden_contact=forbidden)
+        rows=[('/grasp_audit/truth',message(9.5+i*.04,1.),None) for i in range(13)]
+        rows += [('/grasp_audit/truth',message(15.5+i*.0204,1.+lift),None) for i in range(220)]
+        bag=mock.MagicMock();bag.__enter__.return_value.read_messages.return_value=iter(rows)
+        events=[dict(event='lio_controlled_close_requested',sim_s=10.),
+                dict(event='contact_hold_and_lio_fk_extraction_completed',sim_s=20.)]
+        with tempfile.TemporaryDirectory() as folder,mock.patch.object(rosbag,'Bag',return_value=bag):
+            return score_payload_recording(Path(folder),dict(events=events))
+
+    def test_disabled_truth_contact_fields_remain_unknown(self):
+        for default in (False,True):
+            result=self.score(guard=False,forbidden=default)
+            self.assertIsNone(result['forbidden_contact'])
+            self.assertFalse(result['forbidden_contact_observed'])
+            self.assertTrue(result['passed'])  # Height/retention only; native guards are separate.
+        self.assertFalse(self.score(lift=.02)['passed'])
+
+    def test_valid_contact_guard_can_independently_reject_lifted_payload(self):
+        result=self.score(guard=True,forbidden=True)
+        self.assertTrue(result['forbidden_contact_observed'])
+        self.assertTrue(result['forbidden_contact'])
+        self.assertFalse(result['passed'])
+        self.assertIs(self.score(guard=True)['forbidden_contact'],False)
+
+
 class DemoPropulsionTests(unittest.TestCase):
     def model(self):
         import xml.etree.ElementTree as ET

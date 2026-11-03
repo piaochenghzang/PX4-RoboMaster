@@ -174,13 +174,19 @@ def score_payload_recording(folder,approach):
             if not m.target_present:continue
             z=m.target_pose.position.z
             if close-.5<=t<=close:baseline.append(z)
-            if done-4.5<=t<=done:held.append((t,z,bool(m.fixed_grasp_forbidden_contact)))
+            if done-4.5<=t<=done:held.append((t,z,bool(m.fixed_grasp_forbidden_contact),bool(m.fixed_grasp_geometry_valid)))
     if len(baseline)<10 or len(held)<100:raise RuntimeError('Offline payload scoring coverage insufficient')
-    initial=float(np.median(baseline));minimum=min(z-initial for _,z,_ in held)
+    initial=float(np.median(baseline));minimum=min(row[1]-initial for row in held)
+    # This legacy truth guard can be disabled. Default false is then UNKNOWN,
+    # not an independent contact certificate. Native source-2 contact guards
+    # are required separately by the completed grasp result.
+    contact_observed=all(row[3] for row in held)
+    forbidden=True if any(row[2] and row[3] for row in held) else False if contact_observed else None
     result=dict(scoring_only_after_shutdown=True,ground_truth_control_inputs=False,
         actual_payload_lift_min_m=minimum,held_duration_s=held[-1][0]-held[0][0],
-        forbidden_contact=any(x[2] for x in held),samples=len(held),
-        passed=minimum>=.025 and held[-1][0]-held[0][0]>=4.3 and not any(x[2] for x in held))
+        forbidden_contact=forbidden,forbidden_contact_observed=contact_observed,samples=len(held),
+        acceptance_scope='ACTUAL_PAYLOAD_LIFT_AND_HOLD; NATIVE_CONTACT_GUARDS_REQUIRED_SEPARATELY',
+        passed=minimum>=.025 and held[-1][0]-held[0][0]>=4.3 and forbidden is not True)
     save(folder/'grasp_offline_score.json',result)
     return result
 
