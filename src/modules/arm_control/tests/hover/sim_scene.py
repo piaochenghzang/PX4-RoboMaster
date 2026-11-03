@@ -103,6 +103,39 @@ def size_lio_demo_propulsion(model,payload_mass,gravity=9.8):
         thr_mdl_fac=factor,production_model_modified=False)
 
 
+
+def write_lio_super_config(source,destination,vehicle_mass):
+    """Copy the existing SUPER configuration for the bounded LIO demo only."""
+    import yaml
+    source=Path(source);destination=Path(destination)
+    try:mass=float(vehicle_mass)
+    except (TypeError,ValueError):raise ValueError('Invalid SUPER vehicle mass')
+    if not math.isfinite(mass) or mass<=0:raise ValueError('Invalid SUPER vehicle mass')
+    if source.resolve()==destination.resolve():raise ValueError('SUPER configuration must be a case-local copy')
+    config=yaml.safe_load(source.read_text())
+    try:
+        mapping=config['rog_map'];callbacks=mapping['ros_callback']
+        boundary=config['traj_opt']['boundary'];switch=config['traj_opt']['switch']
+        trajectory=config['traj_opt']['exp_traj'];flatness=config['traj_opt']['flatness']
+        if (callbacks['enable'] is not True or callbacks['cloud_topic']!='/cloud_registered'
+                or callbacks['odom_topic']!='/lidar_slam/odom'):
+            raise ValueError('SUPER requires the existing live LIO topics')
+        mapping.update(resolution=.15,inflation_resolution=.15,inflation_step=4,
+            map_size=[18,12,6],fix_map_origin=[2.,0.,1.5],virtual_ceil_height=4.2,load_pcd_en=False)
+        mapping['visualization']['frame_id']='map'
+        boundary.update(max_vel=.5,max_acc=.6)
+        trajectory['penna_t']=1.e5;switch['print_optimizer_log']=True
+        flatness['mass']=mass
+    except (KeyError,TypeError,AttributeError):raise ValueError('Unexpected SUPER configuration structure')
+    destination.write_text(yaml.safe_dump(config,sort_keys=False))
+    return dict(source=str(source),case_config=str(destination),
+        localization='LIVE_FAST_LIO_MAP',cloud_topic=callbacks['cloud_topic'],odom_topic=callbacks['odom_topic'],
+        preloaded_map=False,map_resolution_m=mapping['resolution'],
+        map_inflation_m=mapping['inflation_resolution']*mapping['inflation_step'],
+        max_velocity_m_s=boundary['max_vel'],max_acceleration_m_s2=boundary['max_acc'],
+        vehicle_mass_kg=mass,production_config_modified=False)
+
+
 def write_lio_launch(source,destination):
     """Publish existing undistorted points; leave estimator filtering intact."""
     launch=ET.parse(source)

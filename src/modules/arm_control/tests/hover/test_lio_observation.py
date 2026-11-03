@@ -99,6 +99,56 @@ class DemoPropulsionTests(unittest.TestCase):
         self.assertEqual(ET.tostring(m),before)
 
 
+
+class LioSuperConfigurationTests(unittest.TestCase):
+    def config(self):
+        return dict(rog_map=dict(ros_callback=dict(enable=True,cloud_topic='/cloud_registered',
+                    odom_topic='/lidar_slam/odom',odom_timeout=2.),load_pcd_en=True,
+                visualization=dict(frame_id='world',enable=True)),
+            traj_opt=dict(boundary=dict(max_vel=1.5,max_acc=2.,max_jerk=6.),
+                switch=dict(print_optimizer_log=False),exp_traj=dict(penna_t=1.e8),
+                flatness=dict(mass=1.64,grav=9.81)),unchanged=dict(value=17))
+
+    def test_case_copy_retains_sensor_contract_without_preloading_or_changing_original(self):
+        import tempfile,yaml
+        from sim_scene import write_lio_super_config
+        with tempfile.TemporaryDirectory() as folder:
+            source=Path(folder)/'source.yaml';dest=Path(folder)/'case.yaml'
+            original=self.config();text=yaml.safe_dump(original);source.write_text(text)
+            report=write_lio_super_config(source,dest,3.1079536)
+            actual=yaml.safe_load(dest.read_text());mapping=actual['rog_map']
+            self.assertEqual(source.read_text(),text)
+            self.assertEqual(mapping['ros_callback'],original['rog_map']['ros_callback'])
+            self.assertFalse(mapping['load_pcd_en']);self.assertFalse(report['preloaded_map'])
+            self.assertEqual(mapping['visualization']['frame_id'],'map')
+            self.assertEqual(mapping['map_size'],[18,12,6])
+            self.assertEqual(mapping['fix_map_origin'],[2.,0.,1.5])
+            self.assertAlmostEqual(report['map_inflation_m'],.6)
+            self.assertEqual(actual['traj_opt']['boundary'],dict(max_vel=.5,max_acc=.6,max_jerk=6.))
+            self.assertEqual(actual['traj_opt']['flatness'],dict(mass=3.1079536,grav=9.81))
+            self.assertEqual(actual['unchanged'],original['unchanged'])
+            self.assertFalse(report['production_config_modified'])
+
+    def test_invalid_mass_source_topics_and_overwriting_original_are_rejected(self):
+        import tempfile,yaml
+        from sim_scene import write_lio_super_config
+        with tempfile.TemporaryDirectory() as folder:
+            source=Path(folder)/'source.yaml';dest=Path(folder)/'case.yaml'
+            text=yaml.safe_dump(self.config());source.write_text(text)
+            for mass in (0.,-.1,float('nan'),float('inf'),None):
+                with self.subTest(mass=mass),self.assertRaises(ValueError):
+                    write_lio_super_config(source,dest,mass)
+                self.assertFalse(dest.exists())
+            with self.assertRaisesRegex(ValueError,'case-local copy'):
+                write_lio_super_config(source,source,3.1)
+            self.assertEqual(source.read_text(),text)
+            config=self.config();config['rog_map']['ros_callback']['odom_topic']='/truth'
+            source.write_text(yaml.safe_dump(config))
+            with self.assertRaisesRegex(ValueError,'live LIO topics'):
+                write_lio_super_config(source,dest,3.1)
+            self.assertFalse(dest.exists())
+
+
 class DenseLaunchTests(unittest.TestCase):
     def test_override_is_case_local_and_follows_the_original_config_load(self):
         import tempfile

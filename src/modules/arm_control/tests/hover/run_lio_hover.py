@@ -5,6 +5,7 @@ from collections import deque
 from pathlib import Path
 import numpy as np
 import rospy,rosgraph,yaml
+from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry
 from mavros_msgs.msg import State,PositionTarget
 from std_msgs.msg import String
@@ -14,7 +15,7 @@ from known_target import rotation,quintic_segment,pose
 from lidar_grasp_demo import LidarDemoPlan,TargetObservation
 from lio_tool_observer import LioToolObserver
 from native_client import NativeClient
-from sim_scene import ROOT,BUILD,WS,MODELS,make_world,save,stop,SIM_VISION_PARAMS,write_lio_launch,LIO_CLOCK_HZ,size_lio_demo_propulsion
+from sim_scene import ROOT,BUILD,WS,MODELS,make_world,save,stop,SIM_VISION_PARAMS,write_lio_launch,LIO_CLOCK_HZ,size_lio_demo_propulsion,write_lio_super_config,DEMO_OBSTACLES
 
 PARAMS=dict(SIM_VISION_PARAMS,EKF2_EV_CTRL=11,EKF2_MAG_TYPE=5,EKF2_EVP_NOISE=.05,
     EKF2_EVA_NOISE=.03,EKF2_DELAY_MAX=150,EKF2_TAU_VEL=.05,EKF2_TAU_POS=.10,
@@ -86,6 +87,26 @@ def score_recording(folder,begin,end,goal):
         position_error_max_m=max(errors),physical_final_goal_mean_error_m=float(np.mean(hold)),
         physical_final_goal_max_error_m=max(hold),samples=len(errors),alignment_source=alignment['source'],
         passed=max(hold)<.12)
+    navigation_path=folder/'super_navigation.json'
+    if navigation_path.exists():
+        navigation=json.loads(navigation_path.read_text())
+        if not navigation.get('completed') or not navigation.get('track_seen'):
+            raise RuntimeError('SUPER terminal handover missing')
+        positions=np.array([T[:3] for t,T in truth if navigation['sent_sim_s']<=t<=navigation['terminal_sim_s']])
+        if len(positions)<100:raise RuntimeError('SUPER offline path coverage insufficient')
+        start=(W_M@np.r_[navigation['start_map_m'],1])[:3]
+        goal_point=(W_M@np.r_[navigation['goal_map_m'],1])[:3]
+        delta=goal_point-start
+        u=np.clip((positions-start)@delta/(delta@delta),0,1)
+        deviation=np.linalg.norm(positions-start-u[:,None]*delta,axis=1)
+        clearance=min(float(np.min(np.linalg.norm(np.maximum(np.abs(positions-np.array(o['center']))-
+            np.array(o['size'])*.5,0),axis=1)-.45)) for o in DEMO_OBSTACLES)
+        nav_score=dict(scoring_only_after_shutdown=True,samples=len(positions),
+            vehicle_envelope_radius_m=.45,minimum_obstacle_clearance_m=clearance,
+            maximum_direct_line_deviation_m=float(np.max(deviation)),
+            passed=clearance>=0 and float(np.max(deviation))>=.5)
+        save(folder/'super_offline_score.json',nav_score)
+        result['super_navigation']=nav_score;result['passed']=result['passed'] and nav_score['passed']
     observation=folder/'perceived_target_map.json'
     if observation.exists():
         detected=json.loads(observation.read_text())
@@ -168,10 +189,12 @@ def main():
     ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('name');ap.add_argument('--gui',action='store_true');ap.add_argument('--observe-target',action='store_true',help='LIO-paired target and FK observation');ap.add_argument('--inspect-ik',action='store_true',help='Read-only native IK and local clearance checks after FK observation');ap.add_argument('--navigate-candidate',action='store_true',help='Fly folded to the LIO-derived candidate');ap.add_argument('--approach-lio',action='store_true',help='Includes observation, IK, navigation and velocity fusion; LIO/FK unfold and 40mm preapproach, never close')
     ap.add_argument('--grasp-lio',action='store_true',help='Same LIO route, then native contact-only close, 40mm tool extraction and hold')
     ap.add_argument('--bench-grasp',action='store_true',help='Identify and fly to candidate, support body position with free attitude, then contact grasp; NOT an airborne grasp')
+    ap.add_argument('--super-obstacle',action='store_true',help='Reuse SUPER obstacle navigation to the observation area, then the same LIO bench grasp')
     ap.add_argument('--fuse-lio-velocity',action='store_true',help='Test source-midpoint LIO pose+velocity through standard MAVROS odometry')
     args=ap.parse_args()
     # A later stage includes its prerequisites. One LIO approach command
     # selects the validated pose+velocity transport and all read-only checks.
+    if args.super_obstacle and not args.bench_grasp:ap.error('--super-obstacle requires --bench-grasp; keep the verified supported grasp entry')
     if args.bench_grasp:args.grasp_lio=True
     if args.grasp_lio:args.approach_lio=True
     if args.fuse_lio_velocity and not args.approach_lio:ap.error('--fuse-lio-velocity requires --approach-lio')
@@ -196,8 +219,22 @@ def main():
     parameters=dict(PARAMS)
     if args.fuse_lio_velocity:parameters.update(EKF2_EV_CTRL=15,EKF2_EVV_NOISE=LIO_VELOCITY_STD,EKF2_DELAY_MAX=250)
     env.update({'PX4_PARAM_'+k:str(v) for k,v in parameters.items()});env.pop('ROS_IP',None)
-    plan=LidarDemoPlan(Path(__file__).with_name('known_target_lidar.json'))
+    target_file=Path(__file__).with_name('known_target_lidar.json')
+    observation_goal=np.array([.3,0.,.9])
+    if args.super_obstacle:
+        # Translate only the pre-spawn experiment fixture. The online arm target
+        # still comes exclusively from a later LIO-paired cloud observation.
+        fixture=json.loads(target_file.read_text());fixture['object_position_world_m'][0]+=3.
+        target_file=folder/'scene_target.json';save(target_file,fixture)
+        observation_goal[0]+=3.
+    plan=LidarDemoPlan(target_file)
     make_world(folder,plan.target,env,fixed_grasp=True,lidar_geometry=plan.geometry_profile,fastlio=True)
+    # Reuse the already tested wall and side posts; do not preload the ROG map.
+    if args.super_obstacle:
+        from sim_scene import add_obstacle
+        scene=ET.parse(folder/'scene.world')
+        for description in DEMO_OBSTACLES:add_obstacle(scene.find('world'),description)
+        scene.write(folder/'scene.world',encoding='unicode',xml_declaration=True)
     scene=ET.parse(folder/'scene.world');model=scene.find("world/model[@name='yhang550']")
     model.find('pose').text='0 0 .45 0 0 0'
     propulsion=None
@@ -216,6 +253,11 @@ def main():
     if args.bench_grasp:ET.SubElement(bridge,'demoBenchLock').text='true'
     if any(e.get('filename')=='libgazebo_vision_plugin.so' for e in model.findall('plugin')):raise RuntimeError('Ground-truth localization source present')
     scene.write(folder/'scene.world',encoding='unicode',xml_declaration=True)
+    planner_config=None;planner_manifest=None
+    if args.super_obstacle:
+        planner_config=folder/'super_demo.yaml'
+        planner_manifest=write_lio_super_config(WS/'src/super_px4_bridge/config/px4_sim.yaml',
+            planner_config,propulsion['vehicle_mass_kg'])
     mavros=Path(sp.check_output(['rospack','find','mavros'],env=env,text=True).strip())/'launch'
     cfg=yaml.safe_load((mavros/'px4_config.yaml').read_text());cfg['time']['timesync_mode']='PASSTHROUGH';cfg['conn']['timesync_rate']=0.
     if args.fuse_lio_velocity:cfg['odometry']['fcu']['odom_parent_id_des']='map'
@@ -224,7 +266,7 @@ def main():
         write_lio_launch(lio_launch,folder/'fastlio.launch');lio_launch=folder/'fastlio.launch'
     save(folder/'mavros_config.json',cfg);launch=ET.parse(mavros/'px4.launch')
     launch.find("include/arg[@name='config_yaml']").set('value',str(folder/'mavros_config.json'));launch.write(folder/'mavros.launch')
-    save(folder/'manifest.json',dict(stage='LIO_IDENTIFICATION_MECHANICALLY_SUPPORTED_GRASP' if args.bench_grasp else 'LIO_CONTACT_FIXED_GRASP' if args.grasp_lio else 'LIO_FK_NO_CLOSE_APPROACH' if args.approach_lio else 'LIO_CANDIDATE_NAVIGATION_NO_ARM_MOTION' if args.navigate_candidate else 'LIO_TARGET_OBSERVATION_NO_ARM_MOTION' if args.observe_target else 'LIO_LOCAL_FLIGHT_NO_ARM_MOTION',ground_truth_control_inputs=False,
+    save(folder/'manifest.json',dict(stage='SUPER_LIO_IDENTIFICATION_MECHANICALLY_SUPPORTED_GRASP' if args.super_obstacle else 'LIO_IDENTIFICATION_MECHANICALLY_SUPPORTED_GRASP' if args.bench_grasp else 'LIO_CONTACT_FIXED_GRASP' if args.grasp_lio else 'LIO_FK_NO_CLOSE_APPROACH' if args.approach_lio else 'LIO_CANDIDATE_NAVIGATION_NO_ARM_MOTION' if args.navigate_candidate else 'LIO_TARGET_OBSERVATION_NO_ARM_MOTION' if args.observe_target else 'LIO_LOCAL_FLIGHT_NO_ARM_MOTION',ground_truth_control_inputs=False,
         mechanically_supported_grasp=args.bench_grasp,airborne_grasp_validated=False,
         gazebo_vision_plugin=False,lio_alignment_source='FIRST_LIO_BODY_POSE',ekf_parameters=parameters,propulsion=propulsion,
         target_observation=args.observe_target,encoder_fk_observation=args.observe_target,read_only_ik_inspection=args.inspect_ik,candidate_navigation=args.navigate_candidate,lio_fk_approach=args.approach_lio,closing_allowed=args.grasp_lio,grasp_feedback_source='SIM_CONTACT_NO_OBJECT_POSE' if args.approach_lio else 'DISABLED',external_velocity_fused=args.fuse_lio_velocity,
@@ -233,9 +275,11 @@ def main():
         ros_clock_hz=LIO_CLOCK_HZ,registered_cloud_source='UNDISTORTED_POINTS' if args.approach_lio else 'ESTIMATOR_VOXEL_POINTS',
         demo_wall_step_pacing=args.approach_lio,fine_velocity_residual_feedforward=False,fine_velocity_residual_slew_m_s2=None,flight_registration_policy='POSITION_REGISTRATION_FIXED_DURING_ARM_STAGE',
         minimum_wall_step_s=float(scene.findtext('world/physics/max_step_size'))/speed if args.approach_lio else None,
-        observation_local_goal_m=[.3,0,.9],sim_speed_factor=speed))
+        observation_local_goal_m=observation_goal.tolist(),super_obstacle=args.super_obstacle,super_configuration=planner_manifest,sim_speed_factor=speed))
     os.environ.update(ROS_MASTER_URI=env['ROS_MASTER_URI'],ROS_HOSTNAME='localhost');os.environ.pop('ROS_IP',None)
-    procs=[];logs=[];subs=[];pub=None;fcu_pub=None;latest={};result=dict(success=False);begin=end=None;observation=None
+    procs=[];logs=[];subs=[];pub=None;planner_pub=None;fcu_pub=None;latest={};result=dict(success=False);begin=end=None;observation=None
+    navigation=dict(enabled=args.super_obstacle,completed=False,track_seen=False,ground_truth_control_inputs=False)
+    navigation_rows=[];armed_seen=False
     external_pairs=deque(maxlen=2);external_stamps=deque(maxlen=20);external_count=0;external_max_age=0.;external_stale_dropped=0
     tool_observer=None;tool_log=None;tool_start=None;tool_count=0
     inspection_thread=None;inspection={}
@@ -332,7 +376,7 @@ def main():
             if not external_source_current(external_stamps[-1],rospy.Time.now().to_sec()):
                 raise RuntimeError('LIO external publication stale')
         if any(p.poll() is not None for p in procs):raise RuntimeError('Own process exited')
-        if time.monotonic()-started>(500 if args.grasp_lio else 400 if args.approach_lio else 200)/speed:raise RuntimeError('Wall watchdog')
+        if time.monotonic()-started>((140 if args.super_obstacle else 0)+(500 if args.grasp_lio else 400 if args.approach_lio else 200))/speed:raise RuntimeError('Wall watchdog')
     try:
         core=start('roscore',['roscore']);deadline=time.monotonic()+20
         while not rosgraph.is_master_online():
@@ -361,7 +405,7 @@ def main():
         if args.navigate_candidate:
             subs.append(rospy.Subscriber('/cloud_registered',PointCloud2,clouds.append,queue_size=5,tcp_nodelay=True))
         start('audit',['rosbag','record','--lz4','-O',str(folder/'audit.bag'),'/grasp_audit/truth','/lidar_slam/odom',
-            '/clock','/mavros/local_position/odom','/mavros/odometry/out','/mavros/state','/so101/joint_states','/fastlio_sim/alignment','/grasp_demo/known_setpoint','__name:=lio_hover_audit_recorder'])
+            '/clock','/mavros/local_position/odom','/mavros/odometry/out','/mavros/state','/so101/joint_states','/fastlio_sim/alignment','/grasp_demo/known_setpoint','/grasp_demo/flight_state','/planning/user_goal','/planning/pos_cmd','/planning_cmd/poly_traj','__name:=lio_hover_audit_recorder'])
         start('gazebo',['gzserver','--verbose','--seed','123','-s','libgazebo_ros_api_plugin.so',str(folder/'scene.world')])
         if args.gui:start('gui',['gzclient'])
         px4=start('px4',[str(BUILD/'bin/px4'),'-d',str(BUILD/'etc')],folder/'rootfs')
@@ -421,15 +465,21 @@ def main():
             if not -.02<=age<=.3:raise RuntimeError('Contact-only feedback stale')
             save(folder/'contact_preflight.json',evidence_json(contact))
             result['contact_only_feedback_verified']=True
-        start('manager',['rosrun','super_px4_bridge','super_flight_manager_node','_known_goal_mode:=true','_auto_arm:=true',
-            '_takeoff_height:=.9','_hover_stable_time:=2.0','__name:=lio_hover_manager'])
+        if args.super_obstacle:
+            start('super_navigation',['roslaunch','super_px4_bridge','super_navigation.launch',
+                'start_flight_manager:=false','use_sensor_adapter:=false','planner_config:='+str(planner_config)])
+            planner_pub=rospy.Publisher('/planning/user_goal',PoseStamped,queue_size=1)
+        manager_command=['rosrun','super_px4_bridge','super_flight_manager_node','_auto_arm:=true',
+            '_takeoff_height:=.9','_hover_stable_time:=2.0','__name:=lio_hover_manager']
+        manager_command+=['_allow_terminal_known_handover:=true','_cloud_topic:=/cloud_registered','_map_warmup_time:=3.0'] if args.super_obstacle else ['_known_goal_mode:=true']
+        start('manager',manager_command)
         pub=rospy.Publisher('/grasp_demo/known_setpoint',KnownFlightSetpoint,queue_size=1)
-        route=None;origin=None;ready=None;held=None;last=-math.inf;goal=np.array([.3,0,.9]);begin=now
+        route=None;origin=None;ready=None;held=None;last=-math.inf;goal=observation_goal.copy();begin=now
         with (folder/'telemetry.jsonl').open('w') as log:
             while True:
                 health();now=rospy.Time.now().to_sec();odom=latest.get('odom');lio=latest.get('lio');state=latest.get('state');manager=latest.get('manager')
-                if now>(400 if args.grasp_lio else 320 if args.approach_lio else 170 if args.navigate_candidate else 110):raise RuntimeError('Simulation-time flight deadline')
-                if route is None and now-begin>30 and manager and manager.data!='HOVER_READY':
+                if now>((140 if args.super_obstacle else 0)+(400 if args.grasp_lio else 320 if args.approach_lio else 170 if args.navigate_candidate else 110)):raise RuntimeError('Simulation-time flight deadline')
+                if route is None and now-begin>30 and manager and manager.data not in ('HOVER_READY','WAIT_TRAJECTORY','TRACK_SUPER','SETTLE_HOVER','FINAL_HOVER'):
                     raise RuntimeError('Takeoff did not reach stable hover within 30 simulation seconds')
                 if odom is not None and args.approach_lio:
                     # Retain latest-source validation, then pair an actual past
@@ -441,12 +491,42 @@ def main():
                 if not -.02<=now-lio.header.stamp.to_sec()<.2:raise RuntimeError('LIO input stale')
                 if not -.02<=now-odom.header.stamp.to_sec()<.2:raise RuntimeError('EKF output stale')
                 p=odom.pose.pose;q=p.orientation;R=rotation([q.w,q.x,q.y,q.z]);xyz=np.array([p.position.x,p.position.y,p.position.z])
-                xmax,zmax=(2.,2.) if args.navigate_candidate else (1.2,1.5)
-                if not np.isfinite(xyz).all() or abs(xyz[0])>xmax or abs(xyz[1])>.8 or not -.2<xyz[2]<zmax or R[2,2]<math.cos(math.radians(15)):raise RuntimeError('Estimated flight envelope exceeded')
+                xmax,zmax=(5.5,2.) if args.super_obstacle else (2.,2.) if args.navigate_candidate else (1.2,1.5)
+                ymax=3.2 if args.super_obstacle else .8
+                if not np.isfinite(xyz).all() or abs(xyz[0])>xmax or abs(xyz[1])>ymax or not -.2<xyz[2]<zmax or R[2,2]<math.cos(math.radians(15)):raise RuntimeError('Estimated flight envelope exceeded')
                 v=odom.twist.twist.linear;speed_now=np.linalg.norm([v.x,v.y,v.z])
                 active=state.connected and state.armed and state.mode=='OFFBOARD' and -.02<=now-state.header.stamp.to_sec()<1.5
-                if manager.data in ('HOVER_READY','TRACK_KNOWN') and not active:raise RuntimeError('Active OFFBOARD state lost')
-                if manager.data=='HOVER_READY' and active and route is None:
+                armed_seen=armed_seen or state.armed
+                if armed_seen and not active:raise RuntimeError('Active OFFBOARD state lost')
+                if manager.data=='FAILSAFE_HOVER':raise RuntimeError('Manager input lease failed')
+                if args.super_obstacle and route is None:
+                    with tool_observer.lock:joint=tool_observer.joints[-1] if tool_observer.joints else None
+                    if joint is None or not -.02<=now-joint[0]<=.2:raise RuntimeError('Folded arm feedback stale during SUPER')
+                    if np.max(np.abs(np.asarray(joint[1])-[-.07,-1.175,1.45,1.3,-1.57,.3]))>.08:
+                        raise RuntimeError('Arm moved before SUPER terminal handover')
+                    if manager.data=='HOVER_READY' and 'sent_sim_s' not in navigation and planner_pub.get_num_connections():
+                        from lio_candidate_route import check_frame_agreement
+                        agreement=check_frame_agreement(odom_pose(lio),odom_pose(odom))
+                        if not agreement['valid']:raise RuntimeError('SUPER / LIO / EKF origins disagree')
+                        task=PoseStamped();task.header.stamp=rospy.Time.now();task.header.frame_id='map'
+                        task.pose.position.x,task.pose.position.y,task.pose.position.z=map(float,observation_goal);task.pose.orientation.w=1.
+                        planner_pub.publish(task)
+                        navigation.update(sent_sim_s=now,goal_map_m=observation_goal.tolist(),
+                            start_map_m=odom_pose(lio)[:3,3].tolist(),frame_agreement=agreement,
+                            frame_contract='LIO_MAP_NUMERIC_COORDINATES; legacy SUPER command label world only')
+                        save(folder/'super_navigation.json',navigation)
+                        print('SUPER goal sent: obstacle course -> observation area; arm stays folded',flush=True)
+                    if manager.data=='TRACK_SUPER':navigation['track_seen']=True
+                    if 'sent_sim_s' in navigation:
+                        if not navigation['track_seen'] and now-navigation['sent_sim_s']>8:raise RuntimeError('SUPER trajectory was not accepted')
+                        if now-navigation['sent_sim_s']>120:raise RuntimeError('SUPER navigation timeout')
+                        navigation_rows.append(dict(sim_s=now,manager=manager.data,body_map_m=odom_pose(lio)[:3,3].tolist()))
+                    if manager.data=='FINAL_HOVER' and navigation['track_seen']:
+                        navigation.update(completed=True,terminal_sim_s=now,terminal_map_m=odom_pose(lio)[:3,3].tolist())
+                        save(folder/'super_navigation.json',navigation)
+                        route=now;origin=odom_pose(lio)[:3,3]
+                        print('SUPER terminal hover accepted; existing LIO observation and bench grasp entry follows',flush=True)
+                if not args.super_obstacle and manager.data=='HOVER_READY' and active and route is None:
                     if ready is None:ready=now
                     elif now-ready>=5:
                         route=now;origin=odom_pose(lio)[:3,3] if args.approach_lio else xyz.copy()
@@ -715,6 +795,9 @@ def main():
         if tool_observer is not None:tool_observer.close()
         if tool_log is not None:tool_log.close()
         if pub:pub.unregister()
+        if planner_pub:planner_pub.unregister()
+        if args.super_obstacle:
+            save(folder/'super_navigation.json',navigation);save(folder/'super_navigation_samples.json',navigation_rows)
         if fcu_pub:fcu_pub.unregister()
         for sub in subs:sub.unregister()
         for p in reversed(procs):stop(p)
@@ -744,6 +827,12 @@ def main():
             result['payload_offline_score']=score_payload_recording(folder,result['lio_approach'])
             result['success']=result['success'] and result['payload_offline_score']['passed']
         except Exception as e:result['success']=False;result['payload_offline_score_error']=str(e)
+    if args.super_obstacle and result.get('target_observation_completed'):
+        source=json.loads((folder/'perceived_target_map.json').read_text())['source_observation']
+        navigation['observation_after_navigation']=source['observation_start_ns']*1e-9>navigation.get('terminal_sim_s',float('inf'))
+        if not navigation['observation_after_navigation']:result['success']=False
+    result['super_navigation']=navigation
+    if args.super_obstacle and not navigation.get('completed'):result['success']=False
     result['mechanically_supported_grasp']=bool(args.bench_grasp)
     result['airborne_grasp_validated']=bool(args.grasp_lio and not args.bench_grasp and result['success'])
     if args.bench_grasp and not bench_fixture.get('settled_sim_s'):result['success']=False
